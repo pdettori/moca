@@ -26,7 +26,9 @@ info:
         another session is a 400 session_mismatch, never silently resolved (MU1 §4.3).
       * AN AUTHENTICATED CALLER MAY NOT NAME A TENANT. The session token alone scopes the work
         (MI1 R7); tenant remains available only to unauthenticated deployments, where it
-        namespaces the session id.
+        namespaces the session id. Enforced on the two routes that accept a tenant — /v1/runs
+        (body) and /runs/status (query); /v1/turn reads only prompt and sessionId, so a tenant
+        field there is inert, not refused.
 
 security:
   - sessionToken: []
@@ -62,7 +64,8 @@ paths:
         Authenticated turns run on the caller's exchanged credential, with the session's
         config bundle and sandbox tier taken from the control plane — never from the request
         (ADR-0038) — and create the session if absent. Unauthenticated turns (SH_REQUIRE_AUTH
-        off, no token) run on the operator's ambient credential and 404 on an unknown session.
+        off, no token) run on the operator's ambient credential: a named session must already
+        exist (404 session_not_found otherwise), and an omitted sessionId starts a fresh one.
 
         `X-SH-Subject` is accepted only as a trusted-orchestrator convenience and REJECTED when
         it conflicts with the token's subject (spec §3.5) — a silent winner there is a
@@ -93,20 +96,25 @@ paths:
                 in-flight turn.
         '400':
           description: |
-            prompt_required (no prompt in the body) · invalid_json · session_mismatch (the
-            token names another session) · subject_conflict (X-SH-Subject contradicts the token)
+            prompt_required (no prompt in the body) · invalid_json · read_error (the body never
+            arrived whole) · session_mismatch (the token names another session) ·
+            subject_conflict (X-SH-Subject contradicts the token) · credential_required ·
+            credential_ambiguous · endpoint_unresolved (the control-plane exchange refused the
+            caller's credential or its endpoint)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: token_required (this deployment requires a token) · token_invalid
+          description: token_required (this deployment requires a token) · token_invalid · token_expired
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: |
             session_not_found — an unauthenticated turn named a session the backend does not
-            have. Authenticated turns create-or-resume instead and do not take this path.
+            have, or an authenticated turn's token names a session the control plane does not
+            know: the exchange refuses it before the harness's own create-or-resume ever runs.
+            credential_not_found — the token's subject has no resolvable credential there.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -117,9 +125,11 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            No sandbox capacity right now — every candidate is at its cap, none is present yet,
-            or the session's own sandbox is briefly absent. Retryable; the turn can succeed
-            unmodified on a retry.
+            Retryable, from either of two causes: no sandbox capacity right now (every candidate
+            is at its cap, none is present yet, or the session's own sandbox is briefly absent —
+            sandbox_unavailable), or the control-plane credential exchange failed
+            (credential_unavailable — the control plane is unreachable or its answer was
+            unusable). The turn can succeed unmodified on a retry.
           headers:
             Retry-After:
               schema: { type: integer }
@@ -176,28 +186,57 @@ paths:
             envelope_invalid (the body matches no run shape) · configRef_invalid (an empty
             configRef is a well-formed envelope making an unsatisfiable request, so the error
             names the field) · tenant_not_allowed (an authenticated caller named a tenant) ·
-            session_mismatch · subject_conflict
+            session_mismatch · subject_conflict · credential_required · credential_ambiguous ·
+            endpoint_unresolved (the control-plane exchange refused the caller's credential or
+            its endpoint)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: token_required · token_invalid
+          description: token_required · token_invalid · token_expired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            session_not_found / credential_not_found — the control-plane exchange refused the
+            token's session or subject. workload_not_found — the envelope named a workloadId the
+            caller does not own (the /workloads lifecycle it resolves through is out of scope
+            here).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '501':
           description: |
-            async_runs_unavailable — async: true with an authenticated caller (or on a
-            deployment that requires auth). Not a capability this deployment grants.
+            async_runs_unavailable — async: true with a token-bearing caller. Not a capability
+            this deployment grants. A token-less caller on a require-auth deployment never
+            reaches this: 401 token_required fires first.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: Still saturated after the bounded wait — retryable.
+          description: |
+            Retryable, from either of two causes — note the two body shapes. Saturation: still
+            no pool capacity after the bounded wait; the body is the LeafResult failed/saturated
+            branch, NOT an Error, and is never persisted. Or credential_unavailable — the
+            control-plane exchange failed (an Error body).
           headers:
             Retry-After:
               schema: { type: integer }
               description: seconds to wait before retrying
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    description: The saturated LeafResult branch — a 503 is "retry", not a terminal failure.
+                    required: [status, reason]
+                    properties:
+                      status: { type: string, enum: [failed] }
+                      reason: { type: string, enum: [saturated] }
+                  - $ref: '#/components/schemas/Error'
+        '500':
+          description: internal_error — not retryable as-is
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -233,12 +272,29 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/RunStatus' }
         '400':
-          description: sessionId_required · tenant_not_allowed · session_mismatch · subject_conflict
+          description: sessionId_required · tenant_not_allowed · session_mismatch (the token names another session)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: token_required · token_invalid
+          description: token_required · token_invalid · token_expired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            credential_unavailable — the token keyset became unusable under an already-serving
+            pod. No credential exchange runs on a status read, so this is the only 503 here; an
+            operator fix, not a retry, resolves it.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: seconds to wait before retrying
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: internal_error — not retryable as-is
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -251,7 +307,11 @@ components:
       description: |
         Ed25519 (`alg: EdDSA`) JWT minted by the control plane at `POST /v1/sessions/{id}/token`
         — scope `turn:write`, claim `sid` naming the session, 5-minute TTL. No credential
-        travels in the token; the data plane exchanges it with the control plane per turn.
+        travels in the token; the data plane exchanges it with the control plane per turn, and
+        that exchange can refuse the caller with the control plane's own codes (token_expired,
+        credential_*, endpoint_unresolved, session_not_found) or, for any other exchange fault
+        — control plane unreachable, an unusable answer — 503 credential_unavailable. The
+        per-route response lists name every code.
         Required on every route here when the deployment sets SH_REQUIRE_AUTH; verified, and
         refused if bad, whenever presented in either mode.
   schemas:
@@ -262,12 +322,15 @@ components:
         error:
           type: string
           description: |
-            A stable machine-readable code. The codes this document names in each response
-            description are the contract; anything else in this field is prose from a failure
-            the route could not classify, and a client should treat it as internal.
+            A stable machine-readable code; the codes this document names in each response
+            description are the contract. The routes never put exception text here — a failure
+            no route could classify answers internal_error, with its text in the server log only.
         message:
           type: string
-          description: Operator-facing detail; never parse it.
+          description: |
+            Operator-facing detail; never parse it. Absent on internal_error — an unclassified
+            failure's text can carry connection strings or credentials, and this body reaches an
+            arbitrary caller (the control-plane document's rule).
         sessionId:
           type: string
           description: Echoed when the request named a session.
@@ -281,9 +344,11 @@ components:
         sessionId:
           type: string
           description: |
-            The session to resume. When a token is presented this must be the token's `sid`
-            (400 session_mismatch otherwise) and may be omitted — the token alone names the
-            session. Unauthenticated callers must name the session they mean.
+            The session to run the turn in. When a token is presented this must be the token's
+            `sid` (400 session_mismatch otherwise) and may be omitted — the token alone names
+            the session. An unauthenticated caller may also omit it: a fresh session is then
+            created and its id minted. A supplied id must already exist — 404
+            session_not_found otherwise.
     TurnResult:
       type: object
       required: [sessionId, response, stopReason]
@@ -301,9 +366,9 @@ components:
             tier: { type: string }
             workspaceReset:
               type: object
+              description: Why the session's files moved — the tier is `sandbox.tier` above (and on the SSE frame).
               properties:
                 from: { type: string }
-                tier: { type: string }
                 reason: { type: string, enum: [detached, retiered] }
     LeafUsage:
       type: object
@@ -556,6 +621,11 @@ components:
           properties:
             status: { type: string, enum: [responded] }
             text: { type: string }
+        - type: object
+          required: [status]
+          description: A run whose execution was aborted — persisted, so it polls back like any other outcome.
+          properties:
+            status: { type: string, enum: [aborted] }
       description: |
         A status not in this list passes through verbatim as `{ status }` — the record's own
         status wins over an enum here, so a new server status reads as unknown, not as an error.
