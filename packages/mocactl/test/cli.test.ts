@@ -33,6 +33,22 @@ describe('main', () => {
     expect(o.outs.join('')).toContain(USAGE);
   });
 
+  it('prints the version for --version and -V, reading no config and no network', async () => {
+    for (const flag of ['--version', '-V']) {
+      const o = io();
+      const build = vi.fn(fakeBuild);
+      expect(await main([flag], {}, o, { buildRuntime: build })).toBe(0);
+      // Under vitest (as under tsx) no build defined MOCACTL_VERSION.
+      expect(o.outs.join('')).toBe('dev\n');
+      expect(o.errs).toEqual([]);
+      expect(build).not.toHaveBeenCalled();
+    }
+  });
+
+  it('lists --version in the usage', () => {
+    expect(USAGE).toContain('mocactl --version');
+  });
+
   it('rejects an unknown command and an unknown flag', async () => {
     expect(await main(['frobnicate'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);
     expect(await main(['--nope'], {}, io(), { buildRuntime: fakeBuild })).toBe(2);

@@ -17,9 +17,11 @@ import {
   type Io,
 } from './headless.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from './runtime.js';
+import { VERSION } from './version.js';
 
 export const USAGE = `usage:
   mocactl [--setup] [--no-animation]             interactive terminal UI
+  mocactl --version                              print this build's version (a release tag, edge-<sha> or dev)
   mocactl login                                  log in with the GitHub device flow
   mocactl logout [--all]                         end this login (--all: every login of yours)
   mocactl auth token [--json]                    print a valid API token, refreshing if needed
@@ -98,6 +100,7 @@ export async function main(
         'no-animation': { type: 'boolean' },
         'dry-run': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
+        version: { type: 'boolean', short: 'V' },
       },
     });
   } catch (err) {
@@ -105,6 +108,10 @@ export async function main(
     return 2;
   }
   const { values, positionals } = parsed;
+  if (values.version) {
+    io.out(VERSION + '\n');
+    return 0;
+  }
   if (values.help) {
     io.out(USAGE + '\n');
     return 0;

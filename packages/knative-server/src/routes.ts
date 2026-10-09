@@ -107,15 +107,16 @@ export const ROUTES: RouteSpec[] = [
     deprecated: true,
     summary: 'Deprecated pre-rename wire path for GET /runs/status',
   },
-  // Context-service workload lifecycle: served, but an operator/stack surface rather than a
-  // client contract — deliberately outside docs/api/harness-openapi.yaml.
+  // Workload lifecycle: served, but an operator/stack surface rather than a client contract —
+  // deliberately outside docs/api/harness-openapi.yaml. Currently 501-refused: Context Service
+  // no longer allocates sandbox pools for Moca (#455).
   {
     method: 'POST',
     path: '/workloads',
     operationId: 'createWorkload',
     auth: 'subject',
     surface: 'internal',
-    summary: 'Create a context-service workload',
+    summary: 'Create a workload (currently 501 workloads_unavailable)',
   },
   {
     method: 'GET',
@@ -123,7 +124,7 @@ export const ROUTES: RouteSpec[] = [
     operationId: 'getWorkload',
     auth: 'subject',
     surface: 'internal',
-    summary: 'Read a context-service workload',
+    summary: 'Read a workload (currently 501 workloads_unavailable)',
   },
   {
     method: 'DELETE',
@@ -131,6 +132,6 @@ export const ROUTES: RouteSpec[] = [
     operationId: 'deleteWorkload',
     auth: 'subject',
     surface: 'internal',
-    summary: 'Delete a context-service workload',
+    summary: 'Delete a workload (currently 501 workloads_unavailable)',
   },
 ];

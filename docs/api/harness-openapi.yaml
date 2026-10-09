@@ -5,8 +5,8 @@
 # degrades into documentation that lies (the control-plane spec §9.3 test 3 argument, verbatim).
 #
 # Scope, mirroring the control-plane document's own boundary note: only the client-facing
-# surface. The handler also serves the context-service workload lifecycle (/workloads) and the
-# pre-/v1 wire paths (/turn, /runs, /run-leaf*) — all listed in src/routes.ts as
+# surface. The handler also serves the workload lifecycle (/workloads — currently 501-refused,
+# #455) and the pre-/v1 wire paths (/turn, /runs, /run-leaf*) — all listed in src/routes.ts as
 # surface: 'internal' and deliberately not described here. /runs/status has no /v1 form; it is
 # the canonical path.
 openapi: 3.1.0
@@ -162,7 +162,9 @@ paths:
         would spend the operator's key for a user. Owned asynchronous runs are MU2's.
 
         `sandboxPoolSelector` is internal routing state and is deleted at the request boundary —
-        never settable by an external caller; a workload resolver may add one after it.
+        never settable by an external caller. A run naming a `workloadId` is refused with 501
+        workloads_unavailable rather than run on the default pool — Context Service no longer
+        allocates sandbox pools for Moca (#455).
       security:
         - sessionToken: []
       requestBody:
@@ -200,17 +202,16 @@ paths:
         '404':
           description: |
             session_not_found / credential_not_found — the control-plane exchange refused the
-            token's session or subject. workload_not_found — the envelope named a workloadId the
-            caller does not own (the /workloads lifecycle it resolves through is out of scope
-            here).
+            token's session or subject.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '501':
           description: |
             async_runs_unavailable — async: true with a token-bearing caller. Not a capability
-            this deployment grants. A token-less caller on a require-auth deployment never
-            reaches this: 401 token_required fires first.
+            this deployment grants; a token-less caller on a require-auth deployment never
+            reaches it (401 token_required fires first). workloads_unavailable — the envelope
+            named a workloadId, and the workload lifecycle is unavailable (#455).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
