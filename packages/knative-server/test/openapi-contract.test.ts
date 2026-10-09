@@ -128,8 +128,10 @@ describe('the table matches the handler', () => {
     base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   });
 
-  afterEach(() => {
-    server.close();
+  afterEach(async () => {
+    // Awaited: an un-awaited close() can leak the listening socket into the next test's start-up
+    // on a slow machine — the port is released asynchronously.
+    await new Promise<void>((r) => server.close(() => r()));
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
