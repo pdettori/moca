@@ -111,6 +111,26 @@ Chunk `data` comes back base64-encoded in grpcurl's JSON.
 MOCA's own TypeScript client is generated in `packages/k8s-sandbox/src/gen/`, and
 `GrpcRelayTransport` in the same package wraps it.
 
+## From a coding agent: the `sbx` CLI
+
+[`examples/sbx.py`](examples/sbx.py) wraps the example client into a command line for one
+workspace (`SBX_WORKSPACE_KEY`), so a local coding agent can work in the sandbox with nothing but
+its shell:
+
+| Command | Does |
+| --- | --- |
+| `sbx run [COMMAND…]` | runs `COMMAND`, or with no arguments the script on stdin, in `/workspace`; exits with its exit code (124 timeout, 125 sandbox failure) |
+| `sbx put PATH` | writes stdin to `PATH`, creating parent directories |
+| `sbx push [DIR]` | replaces `/workspace` with `DIR`'s git working tree and commits it as a baseline |
+| `sbx pull` | prints every change since the push as a git patch |
+
+Restrict the agent's shell to `sbx run` and `sbx put` (Claude Code: `--allowedTools 'Bash(sbx
+run:*)' 'Bash(sbx put:*)'` with the file tools disallowed; OpenCode: a `bash` permission map
+denying `*`). Then tell it in `CLAUDE.md`/`AGENTS.md` to use `sbx run <<'EOF' … EOF`. That
+allow-list is the only thing keeping commands off the laptop. Stock Claude Code and OpenCode
+solved SWE-bench issues this way about as well as running locally: see moca-experiments `sbx/`
+(E14).
+
 ## For the operator: issuing a client token
 
 Client tokens live in the relay's environment, `/etc/serverless-harness/relay.env` on the rig:
