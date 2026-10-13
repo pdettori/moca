@@ -146,6 +146,13 @@ describe('sandbox-mcp', () => {
     expect(missing.isError).toBe(true);
   });
 
+  it('logs what each call acted on, one line, truncated', () => {
+    expect(records.find((r) => r.op === 'read')?.detail).toBe('a.txt');
+    expect(records.find((r) => r.op === 'grep')?.detail).toBe('needle');
+    const long = records.find((r) => r.op === 'bash' && r.detail?.startsWith('mkdir'));
+    expect(long?.detail).toBe('mkdir -p __pycache__ && echo x > __pycache__/m.pyc');
+  });
+
   it('reports a missing file as a tool error', async () => {
     const r = await client.callTool({ name: 'read', arguments: { path: 'nope.txt' } });
     expect(r.isError).toBe(true);

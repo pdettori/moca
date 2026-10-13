@@ -16,6 +16,16 @@ export interface CallRecord {
   execs: number;
   ok: boolean;
   error?: string;
+  /** What the call acted on: the command, path or pattern, truncated. An audit trail, not a replay. */
+  detail?: string;
+}
+
+/** The argument that says what a tool call did, one line, at most 80 characters. */
+function detailOf(args: Record<string, unknown>): string | undefined {
+  const v = args.command ?? args.path ?? args.pattern;
+  if (typeof v !== 'string') return undefined;
+  const line = v.replace(/\s+/g, ' ').trim();
+  return line.length > 80 ? `${line.slice(0, 79)}…` : line;
 }
 
 export type Logger = (rec: CallRecord) => void;
@@ -65,18 +75,23 @@ export function createMcpServer(exec: ExecInPod, log: Logger): Server {
         content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
       };
     }
+    const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+    const detail = detailOf(args);
     const started = Date.now();
     try {
-      const r = await tool.execute(
-        `mcp-${String(extra.requestId)}`,
-        (req.params.arguments ?? {}) as Record<string, unknown>,
-        extra.signal,
-      );
-      log({ op: tool.name, ms: Date.now() - started, execs: c.count(), ok: true });
+      const r = await tool.execute(`mcp-${String(extra.requestId)}`, args, extra.signal);
+      log({ op: tool.name, ms: Date.now() - started, execs: c.count(), ok: true, detail });
       return { content: r.content as CallToolResult['content'] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      log({ op: tool.name, ms: Date.now() - started, execs: c.count(), ok: false, error: message });
+      log({
+        op: tool.name,
+        ms: Date.now() - started,
+        execs: c.count(),
+        ok: false,
+        error: message,
+        detail,
+      });
       return { isError: true, content: [{ type: 'text', text: message }] };
     }
   });
