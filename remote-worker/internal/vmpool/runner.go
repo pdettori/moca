@@ -25,7 +25,7 @@ type Runner struct {
 	Timing bool
 }
 
-// execLog is the per-Exec audit line: which workspace (the session id) and which VM. Always on --
+// execLog is the per-Exec audit line: which workspace (the session id), which kind and which VM. Always on --
 // it is the evidence that a session's commands ran in microVMs (#369) -- and deliberately without
 // the command, which can carry secrets. A variable so tests can capture it.
 var execLog = log.Printf
@@ -37,28 +37,29 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 	)
 	start := time.Now()
 	mode, err := specMode(s)
+	e := Exec{
+		ReqID:       s.ReqID,
+		Command:     s.Command,
+		Stdin:       s.Stdin,
+		TimeoutS:    s.TimeoutS,
+		Streaming:   s.Streaming,
+		Mode:        mode,
+		ModeEpoch:   s.ModeEpoch,
+		IdleTimeout: time.Duration(s.IdleTimeoutS) * time.Second,
+		Keepalive:   s.Keepalive,
+	}
 	if err == nil {
 		// ExecPhased, not Exec: Exec delegates to it with a throwaway Phases, so this costs
 		// nothing extra and makes the relayed path report the same decomposition vmpoolctl
 		// already gets. Without it the worker's hot path was unmeasurable (see diag.go).
-		res, err = r.Pool.ExecPhased(ctx, s.WorkspaceKey, Exec{
-			ReqID:       s.ReqID,
-			Command:     s.Command,
-			Stdin:       s.Stdin,
-			TimeoutS:    s.TimeoutS,
-			Streaming:   s.Streaming,
-			Mode:        mode,
-			ModeEpoch:   s.ModeEpoch,
-			IdleTimeout: time.Duration(s.IdleTimeoutS) * time.Second,
-			Keepalive:   s.Keepalive,
-		}, &sinkAdapter{sink: sink}, &ph)
+		res, err = r.Pool.ExecPhased(ctx, s.WorkspaceKey, e, &sinkAdapter{sink: sink}, &ph)
 	}
 	logPhases(&ph)
 	if r.Timing {
 		logExecTiming(s.ReqID, s.WorkspaceKey, start, time.Since(start), &ph, res.ExitCode, err)
 	}
-	execLog("vmpool: exec req=%d workspace_key=%q vm=%s cold=%q exit=%d err=%v",
-		s.ReqID, s.WorkspaceKey, ph.VMID, string(ph.Cold), res.ExitCode, err)
+	execLog("vmpool: exec req=%d workspace_key=%q kind=%s vm=%s cold=%q exit=%d err=%v",
+		s.ReqID, s.WorkspaceKey, e.Kind, ph.VMID, string(ph.Cold), res.ExitCode, err)
 
 	// Report dropped bytes even on a failure path: an aborted exec still delivered
 	// whatever the guest had already sent, and declaring that untruncated is a false
@@ -140,9 +141,10 @@ func (r Runner) deliverLeaseEvents(key string, sink wexec.Sink) {
 	}
 }
 
-// wireError gives the lease errors their wire strings (spec §4, §8.2), which a client
-// matches on: lease_ended(<reason>), stale_mode: <detail> and lease_unsupported:
-// <detail>. Every other error is returned unchanged.
+// wireError gives the lease errors their wire strings (spec §4, §7, §8.2), which a client
+// matches on: lease_ended(<reason>), stale_mode: <detail>, lease_unsupported: <detail> and
+// processes_not_enabled: <detail>. Every other error is returned unchanged, a
+// ProcessError included: its text is already the wire string.
 func wireError(err error) error {
 	var le *LeaseEndedError
 	if errors.As(err, &le) {
@@ -155,6 +157,8 @@ func wireError(err error) error {
 			return fmt.Errorf("stale_mode: %s", re.Detail)
 		case RefuseLeaseUnsupported:
 			return fmt.Errorf("lease_unsupported: %s", re.Detail)
+		case RefuseProcessesNotEnabled:
+			return fmt.Errorf("processes_not_enabled: %s", re.Detail)
 		}
 	}
 	return err
@@ -196,16 +200,23 @@ func (r Runner) LeaseControl(_ context.Context, key string, op pb.LeaseOp, mode 
 // are an invalid key and a closed pool, neither of which a keepalive can act on.
 func (r Runner) LeaseKeepalive(key string) { _ = r.Pool.Keepalive(key) }
 
+// leaseEventProto is ev on the wire. The tracked processes' ages are at the event (ev.At):
+// what they had run for when the lease ended.
 func leaseEventProto(ev *LeaseEvent) *pb.LeaseEvent {
 	return &pb.LeaseEvent{
-		State:    ev.State,
-		Reason:   string(ev.Reason),
-		AtUnixMs: ev.At.UnixMilli(),
-		Mode:     ev.Mode.Proto(),
-		AgeMs:    uint64(max(ev.Age.Milliseconds(), 0)),
+		State:     ev.State,
+		Reason:    string(ev.Reason),
+		AtUnixMs:  ev.At.UnixMilli(),
+		Mode:      ev.Mode.Proto(),
+		AgeMs:     uint64(max(ev.Age.Milliseconds(), 0)),
+		Processes: ev.Processes,
+		Tracked:   trackedProto(ev.Tracked, ev.At),
 	}
 }
 
+// leaseStatusProto is info on the wire: processes is the live lease's running tracked
+// processes, aged at info.At. stopped stays empty here: a set_mode downgrade's stop fills
+// it (plan 5, Task 6).
 func leaseStatusProto(info LeaseInfo) *pb.LeaseStatus {
 	st := &pb.LeaseStatus{
 		Mode:         info.Mode.Proto(),
@@ -213,11 +224,33 @@ func leaseStatusProto(info LeaseInfo) *pb.LeaseStatus {
 		State:        info.State,
 		AgeMs:        uint64(max(info.Age.Milliseconds(), 0)),
 		IdleTimeoutS: uint32(info.IdleTimeout / time.Second),
+		Processes:    trackedProto(info.Tracked, info.At),
 	}
 	if info.Pending != nil {
 		st.Pending = leaseEventProto(info.Pending)
 	}
 	return st
+}
+
+// trackedProto is ps on the wire, each process aged at at (0 for a start after it, as the
+// guest's clock may run a little ahead of the host's). nil for none.
+func trackedProto(ps []TrackedProcess, at time.Time) []*pb.TrackedProcess {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]*pb.TrackedProcess, len(ps))
+	for i, tp := range ps {
+		out[i] = &pb.TrackedProcess{
+			Id:          tp.ID,
+			Name:        tp.DisplayName(),
+			Pid:         uint32(max(tp.PID, 0)),
+			State:       tp.State,
+			Code:        int32(tp.Code),
+			AgeMs:       uint64(max(at.Sub(tp.Started).Milliseconds(), 0)),
+			MemoryBytes: uint64(max(tp.MemoryBytes, 0)),
+		}
+	}
+	return out
 }
 
 // sinkAdapter bridges vmpool.Sink to wexec.Sink.

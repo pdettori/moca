@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,6 +115,7 @@ func runOverConn(ctx context.Context, rw io.ReadWriteCloser, c Command, out Sink
 				DroppedStdout:  e.DroppedStdout,
 				DroppedStderr:  e.DroppedStderr,
 				TeardownFailed: e.TeardownFailed,
+				Tracked:        trackedFromGuest(e.Tracked),
 			}, nil
 		case ga.KindError:
 			return Result{}, &guestError{msg: string(payload)}
@@ -142,9 +144,10 @@ func guestTimedOut(err error) bool {
 	return errors.As(err, &ge) && ga.IsTimeoutMessage(ge.msg)
 }
 
-// guestRequest is the request frame's content for c.
+// guestRequest is the request frame's content for c. A command sets no kind, process or
+// max_processes key (all omitempty), so its request is byte-identical to an older host's.
 func guestRequest(c Command, capBytes int64, now time.Time) ga.Request {
-	return ga.Request{
+	req := ga.Request{
 		Command:            c.Command,
 		TimeoutS:           c.TimeoutS,
 		Streaming:          c.Streaming,
@@ -154,6 +157,44 @@ func guestRequest(c Command, capBytes int64, now time.Time) ga.Request {
 		Lease:              c.Lease,
 		NormaliseWorkspace: c.NormaliseWorkspace,
 	}
+	if c.Kind != ExecKindCommand {
+		a := c.Process
+		req.Kind = string(c.Kind)
+		req.Process = &ga.ProcessArgs{Name: a.Name, ID: a.ID, Cwd: a.Cwd, Tail: a.Tail, Signal: a.Signal}
+		req.MaxProcesses = c.MaxProcesses
+	}
+	return req
+}
+
+// trackedFromGuest is an End's tracked table as the pool keeps it, nil for none.
+func trackedFromGuest(ps []ga.TrackedProcess) []TrackedProcess {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]TrackedProcess, len(ps))
+	for i, p := range ps {
+		out[i] = TrackedProcess{ID: p.ID, Name: p.Name, PID: p.PID, State: p.State, Code: p.Code,
+			Started: time.UnixMilli(p.StartedUnixMs), MemoryBytes: p.MemoryBytes}
+	}
+	return out
+}
+
+// guestKeepsLease reports whether err is a guest refusal that leaves the VM as fit for
+// the next lease Exec as before (Task 3's carry): a process kind the guest refused before
+// running anything -- process_*: (not found, limit, name taken or invalid, cwd, signal),
+// processes_not_enabled:, or lease_unsupported: for a kind it does not serve. Its message
+// is the wire string the client matches on.
+func guestKeepsLease(err error) (msg string, ok bool) {
+	var ge *guestError
+	if !errors.As(err, &ge) {
+		return "", false
+	}
+	for _, prefix := range []string{"process_", "processes_not_enabled:", "lease_unsupported:"} {
+		if strings.HasPrefix(ge.msg, prefix) {
+			return ge.msg, true
+		}
+	}
+	return "", false
 }
 
 // sendRequest writes the encoded Request frame, then the stdin frames if any, then

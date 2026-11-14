@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pb "github.com/rossoctl/moca/gen/go/sandbox/v1"
+	ga "github.com/rossoctl/moca/remote-worker/internal/guestagent"
 )
 
 // Mode is how a sandbox's Execs use VMs (spec §3). The zero value is per-Exec, so an
@@ -109,12 +110,77 @@ const (
 
 // LeaseEvent is one lease start or end, as the worker reports it until acknowledged
 // (spec §5). State is "start" or "end"; Reason is set only for an end.
+//
+// Processes and Tracked are set on a level-2 end (plan 5): the tracked processes running
+// when the lease ended, from its mirror, as display strings ("<name> (pid <n>)") and in
+// their structured form.
 type LeaseEvent struct {
-	State  string
-	Reason LeaseEndReason
-	At     time.Time
-	Mode   Mode
-	Age    time.Duration
+	State     string
+	Reason    LeaseEndReason
+	At        time.Time
+	Mode      Mode
+	Age       time.Duration
+	Processes []string
+	Tracked   []TrackedProcess
+}
+
+// TrackedProcess is one entry of a lease guest's tracked-process table (plan 5), as the
+// guest's End reports it (guestagent.TrackedProcess). State is running, exited or killed;
+// Code is the exit code, or the signal number when killed. Started is the guest's clock,
+// which every lease request sets from the host's (Request.HostUnixNanos).
+type TrackedProcess struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name,omitempty"`
+	PID         int       `json:"pid"`
+	State       string    `json:"state"`
+	Code        int       `json:"code,omitempty"`
+	Started     time.Time `json:"started"`
+	MemoryBytes int64     `json:"memory_bytes,omitempty"`
+}
+
+// DisplayName is how the process is shown: its name, or p<id> when it has none (ruling
+// P5-R6). The guest already reports an unnamed process as p<id>; this is the same rule.
+func (tp TrackedProcess) DisplayName() string {
+	if tp.Name == "" {
+		return "p" + tp.ID
+	}
+	return tp.Name
+}
+
+// Display is the process as clients render it: "<name> (pid <n>)".
+func (tp TrackedProcess) Display() string {
+	return fmt.Sprintf("%s (pid %d)", tp.DisplayName(), tp.PID)
+}
+
+// stateText is the process's state as process_list spells it (spec §7): running,
+// exited(<code>) or killed(<signal>).
+func (tp TrackedProcess) stateText() string {
+	if tp.State == ga.TrackedRunning {
+		return tp.State
+	}
+	return fmt.Sprintf("%s(%d)", tp.State, tp.Code)
+}
+
+func (tp TrackedProcess) running() bool { return tp.State == ga.TrackedRunning }
+
+// runningTracked is the running entries of ps, nil when there are none.
+func runningTracked(ps []TrackedProcess) []TrackedProcess {
+	var out []TrackedProcess
+	for _, tp := range ps {
+		if tp.running() {
+			out = append(out, tp)
+		}
+	}
+	return out
+}
+
+// displays is each process's Display, nil for none.
+func displays(ps []TrackedProcess) []string {
+	var out []string
+	for _, tp := range ps {
+		out = append(out, tp.Display())
+	}
+	return out
 }
 
 // leaseEventAt is the At of an event minted at now: now to the millisecond (PR #763
@@ -124,15 +190,18 @@ func leaseEventAt(now time.Time) time.Time { return now.Truncate(time.Millisecon
 
 // leaseEventJSON is LeaseEvent's on-disk shape: Age in whole milliseconds as age_ms.
 type leaseEventJSON struct {
-	State  string         `json:"state"`
-	Reason LeaseEndReason `json:"reason,omitempty"`
-	At     time.Time      `json:"at"`
-	Mode   Mode           `json:"mode"`
-	AgeMS  int64          `json:"age_ms"`
+	State     string           `json:"state"`
+	Reason    LeaseEndReason   `json:"reason,omitempty"`
+	At        time.Time        `json:"at"`
+	Mode      Mode             `json:"mode"`
+	AgeMS     int64            `json:"age_ms"`
+	Processes []string         `json:"processes,omitempty"`
+	Tracked   []TrackedProcess `json:"tracked,omitempty"`
 }
 
 func (e LeaseEvent) MarshalJSON() ([]byte, error) {
-	return json.Marshal(leaseEventJSON{State: e.State, Reason: e.Reason, At: e.At, Mode: e.Mode, AgeMS: e.Age.Milliseconds()})
+	return json.Marshal(leaseEventJSON{State: e.State, Reason: e.Reason, At: e.At, Mode: e.Mode, AgeMS: e.Age.Milliseconds(),
+		Processes: e.Processes, Tracked: e.Tracked})
 }
 
 func (e *LeaseEvent) UnmarshalJSON(b []byte) error {
@@ -140,7 +209,8 @@ func (e *LeaseEvent) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &j); err != nil {
 		return err
 	}
-	*e = LeaseEvent{State: j.State, Reason: j.Reason, At: j.At, Mode: j.Mode, Age: time.Duration(j.AgeMS) * time.Millisecond}
+	*e = LeaseEvent{State: j.State, Reason: j.Reason, At: j.At, Mode: j.Mode, Age: time.Duration(j.AgeMS) * time.Millisecond,
+		Processes: j.Processes, Tracked: j.Tracked}
 	return nil
 }
 
@@ -149,6 +219,13 @@ func (e *LeaseEvent) UnmarshalJSON(b []byte) error {
 // Config.LeaseEnabled from it; the worker banner prints it from the same function.
 func LeaseSupported(cfg Config) bool {
 	return cfg.VMM == Firecracker && slices.Contains(cfg.ManifestFeatures, FeatureLeaseV1)
+}
+
+// LeaseProcessesSupported is the same rule for lease level 2's process kinds: lease mode,
+// and a snapshot advertising lease-processes-v1 (plan 5). An agent without it would run a
+// process kind as a plain command, so the pool refuses one before anything reaches it.
+func LeaseProcessesSupported(cfg Config) bool {
+	return LeaseSupported(cfg) && slices.Contains(cfg.ManifestFeatures, FeatureLeaseProcessesV1)
 }
 
 // leaseIdle resolves an Exec's idle timeout: 0 takes LeaseIdleDefault, and an owner's

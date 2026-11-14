@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	ga "github.com/rossoctl/moca/remote-worker/internal/guestagent"
 )
 
 // Exec is one command as the pool sees it: pb.Exec minus the wire types.
@@ -33,7 +35,58 @@ type Exec struct {
 	ModeEpoch   uint64
 	IdleTimeout time.Duration
 	Keepalive   bool
+
+	// Kind is what the Exec asks for (plan 5): a command (the zero value) or one of the
+	// tracked-process kinds, which need lease+processes and a snapshot with
+	// lease-processes-v1 (checkProcessKind, execLease). Process carries a process kind's arguments;
+	// for process_start the command stays in Command.
+	Kind    ExecKind
+	Process ProcessArgs
 }
+
+// ExecKind is an Exec's kind, in the guest protocol's spelling (guestagent.RequestKind*).
+// The zero value is a command, so every Exec that names no kind is today's.
+type ExecKind string
+
+const (
+	ExecKindCommand      ExecKind = ""
+	ExecKindProcessStart ExecKind = ga.RequestKindProcessStart
+	ExecKindProcessList  ExecKind = ga.RequestKindProcessList
+	ExecKindProcessLogs  ExecKind = ga.RequestKindProcessLogs
+	ExecKindProcessStop  ExecKind = ga.RequestKindProcessStop
+)
+
+// String is the kind as the audit lines spell it: the zero value is "command".
+func (k ExecKind) String() string {
+	if k == ExecKindCommand {
+		return ga.RequestKindCommand
+	}
+	return string(k)
+}
+
+// isProcess reports whether k is one of the tracked-process kinds.
+func (k ExecKind) isProcess() bool {
+	switch k {
+	case ExecKindProcessStart, ExecKindProcessList, ExecKindProcessLogs, ExecKindProcessStop:
+		return true
+	}
+	return false
+}
+
+// ProcessArgs are a process kind's arguments (spec §7): Name and Cwd for process_start,
+// ID or Name for logs and stop, Tail for logs, Signal for stop.
+type ProcessArgs struct {
+	Name   string
+	ID     string
+	Cwd    string
+	Tail   int
+	Signal string
+}
+
+// ProcessKindMinTimeoutS is the least timeout_s a process kind runs with: process_stop
+// may take about 20 s in the guest (TERM, 10 s, cgroup.kill, then the teardown bound), and
+// a host that gave up first would end the lease agent_dead under a guest doing its job.
+const ProcessKindMinTimeoutS uint32 = 30
 
 // Bounds on Exec.TimeoutS. Every Exec is bounded; there is no unbounded form.
 //
@@ -316,6 +369,14 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	if err := checkKey(key); err != nil {
 		return Result{}, p.countRefusal(err)
 	}
+	if e.Kind != ExecKindCommand {
+		// Before the lease guard: a process kind on a snapshot without
+		// lease-processes-v1 is lease_unsupported whatever its mode, and nothing of it
+		// reaches the guest (Review Focus 5).
+		if err := p.checkProcessKind(key, e); err != nil {
+			return Result{}, err
+		}
+	}
 	if e.Mode != ModePerExec && !p.cfg.LeaseEnabled {
 		return Result{}, p.refuse(RefuseLeaseUnsupported, "%s Exec for %q: %s", e.Mode, key, leaseUnsupportedDetail)
 	}
@@ -330,6 +391,9 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	// timeout_s is a plain proto3 field, so an Exec that simply omitted it was
 	// bounded by nothing on either side — see clampTimeoutS.
 	timeoutS, clamped := clampTimeoutS(e.TimeoutS)
+	if e.Kind.isProcess() && timeoutS < ProcessKindMinTimeoutS {
+		timeoutS = ProcessKindMinTimeoutS // not a clamp: the floor is the kind's, not the caller's mistake
+	}
 	if clamped {
 		p.counters.timeoutClamped()
 		p.clampLogged.Do(func() {
@@ -355,6 +419,14 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		mode, endFirst, err := p.routeExec(key, e)
 		if err != nil {
 			return Result{}, err
+		}
+		if e.Kind.isProcess() && mode == ModePerExec {
+			// Served per-exec (an unknown epoch, or a same-epoch downgrade): a process kind
+			// has no per-Exec form, and a lease it would end is not this refusal's to end.
+			if endFirst {
+				p.unpinKey(key)
+			}
+			return Result{}, p.processesNotEnabled(key, e.Kind, mode)
 		}
 		switch {
 		case mode != ModePerExec:

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -82,6 +83,10 @@ type vmLease struct {
 	// gone is closed when the lease leaves its run (detachLeaseLocked, or startLease's
 	// failure path): what endLeaseWaiting waits on once it has cut the lease.
 	gone chan struct{}
+	// tracked mirrors the guest's tracked-process table (plan 5): replaced from every
+	// lease End's Tracked (refreshTrackedLocked), never edited in place, so a copy of the
+	// slice header is a snapshot. Lease ends and LeaseStatus list it.
+	tracked []TrackedProcess
 }
 
 func newVMLease(vm VM) *vmLease { return &vmLease{vm: vm, gone: make(chan struct{})} }
@@ -156,6 +161,56 @@ func (p *pool) unpin(rp *runPool) {
 	p.mu.Lock()
 	rp.pinned--
 	p.mu.Unlock()
+}
+
+// unpinKey releases the pin routeExec took on key's run, which a pin keeps in p.runs.
+func (p *pool) unpinKey(key string) {
+	p.mu.Lock()
+	p.runs[key].pinned--
+	p.mu.Unlock()
+}
+
+// checkProcessKind is the up-front rule for an Exec of a kind other than a command (plan
+// 5): an unknown kind, or a process kind on a snapshot without lease-processes-v1, is
+// lease_unsupported -- never run as a command -- and a process kind at a mode below
+// lease+processes is processes_not_enabled. The served mode, which a same-epoch downgrade
+// may lower, is checked again under the gate (execLease).
+func (p *pool) checkProcessKind(key string, e Exec) error {
+	switch {
+	case !e.Kind.isProcess():
+		return p.refuse(RefuseLeaseUnsupported, "Exec for %q: unknown kind %q", key, string(e.Kind))
+	case !LeaseProcessesSupported(p.cfg):
+		return p.refuse(RefuseLeaseUnsupported, "%s for %q: %s", e.Kind, key, leaseProcessesUnsupportedDetail)
+	case e.Mode != ModeLeaseProcesses:
+		return p.processesNotEnabled(key, e.Kind, e.Mode)
+	}
+	return nil
+}
+
+// processesNotEnabled is the refusal of a process kind served at mode m (spec §7).
+func (p *pool) processesNotEnabled(key string, k ExecKind, m Mode) error {
+	return p.refuse(RefuseProcessesNotEnabled, "%s for %q: this sandbox's mode is %s", k, key, m)
+}
+
+const leaseProcessesUnsupportedDetail = "process kinds need the Firecracker arm and a snapshot with the " +
+	FeatureLeaseProcessesV1 + " feature"
+
+// answerWithoutLease answers process_list, process_logs and process_stop on a key with no
+// live lease, as the guest would with an empty table: an empty list, or process_not_found.
+// No lease starts for them; only process_start (or a command) has a reason to start one.
+func answerWithoutLease(e Exec, out Sink) (Result, error) {
+	if e.Kind == ExecKindProcessList {
+		out.Stdout([]byte("[]"))
+		return Result{}, nil
+	}
+	name := e.Process.ID
+	if name == "" {
+		name = e.Process.Name
+	}
+	if name == "" {
+		return Result{}, &ProcessError{Msg: "process_not_found: no id or name given"}
+	}
+	return Result{}, &ProcessError{Msg: "process_not_found: " + name}
 }
 
 // endLeaseForPerExec ends key's lease, if it still has one, under the run's gate, then
@@ -257,6 +312,10 @@ func (p *pool) cancelled(ctx context.Context, timedOut *atomic.Bool, timeoutS ui
 // result, a Run error, the host's deadline or an abort ends the lease; otherwise, the
 // guest's own timeout and ErrCommandTooLarge included (runLease), its lastEnd moves to
 // now and its footprint is sampled, both before the gate is released. deadline is when the Exec's budget ends.
+//
+// A process kind (plan 5) is refused processes_not_enabled unless lease+processes is
+// served, and process_list, process_logs and process_stop with no live lease are answered
+// here without starting one (answerWithoutLease).
 func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode Mode, out Sink, ph *Phases,
 	timedOut *atomic.Bool, timeoutS uint32, deadline time.Time, extend func() bool) (Result, error) {
 	p.mu.Lock()
@@ -288,6 +347,10 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 	if s := rp.state; s.Known && e.ModeEpoch == s.Epoch {
 		served = min(e.Mode, s.Mode)
 	}
+	// A process kind needs lease+processes served (spec §7). Refused after a level change
+	// its epoch carries, and after a same-epoch downgrade to per-exec ends the lease, as for
+	// a command; never served per-Exec.
+	processRefused := e.Kind.isProcess() && served != ModeLeaseProcesses
 	var v *leaseVictim
 	var cut LeaseEndReason
 	perExec := false
@@ -313,7 +376,9 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 		// before Run, so the grace check below and the sweep from now on use the new
 		// level's maximum duration (ruling R18).
 		p.relevelLeaseForExecLocked(rp, l, served)
-		if !p.clk.Now().Before(p.leaseGraceDeadline(l)) {
+		if processRefused {
+			// Refused below; the lease is untouched.
+		} else if !p.clk.Now().Before(p.leaseGraceDeadline(l)) {
 			// Past the grace limit, and the lease sweep has not run since: this Exec would
 			// run only to be cut at the next tick. The lease ends here, and the Exec starts
 			// a fresh one.
@@ -337,8 +402,14 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 	if cut != "" {
 		return Result{}, &LeaseEndedError{Reason: cut}
 	}
+	if processRefused {
+		return Result{}, p.processesNotEnabled(key, e.Kind, served)
+	}
 	if perExec {
 		return Result{}, errServePerExec // the deferred receive releases the gate
+	}
+	if l == nil && e.Kind.isProcess() && e.Kind != ExecKindProcessStart {
+		return answerWithoutLease(e, out)
 	}
 
 	var vm VM
@@ -559,7 +630,10 @@ func (p *pool) normaliseLease(ctx context.Context, rp *runPool, vm VM, ph *Phase
 // The guest's report that its own timeout fired (guestTimedOut) keeps the lease (ruling
 // R8b): the guest killed the Exec's cgroup and emptied it before answering, as after an
 // exit, so the Exec fails with the timeout and the next one runs in the same VM. So does
-// ErrCommandTooLarge: the command was refused before anything reached the guest. What
+// ErrCommandTooLarge: the command was refused before anything reached the guest. So does
+// the guest's refusal of a process kind (guestKeepsLease), which fails the Exec with the
+// guest's wire string (ProcessError). Every lease End refreshes the tracked mirror
+// (refreshTrackedLocked) before the lease is kept or ended. What
 // ends the lease is a guest that did not answer by the host's deadline, a transport
 // error, teardown_failed, or an abort (agent_dead in v1).
 func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec, out Sink, ph *Phases,
@@ -618,14 +692,20 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 	p.mu.Unlock()
 
 	t0 := p.clk.Now()
-	res, runErr := vm.Run(execCtx, Command{
+	c := Command{
 		Command:   e.Command,
 		Stdin:     e.Stdin,
 		TimeoutS:  leaseGuestTimeoutS(deadline, t0),
 		Streaming: e.Streaming,
 		CapBytes:  OutputCapBytes,
 		Lease:     true, // never NormaliseWorkspace: the lease's start took that step
-	}, out)
+		Kind:      e.Kind,
+		Process:   e.Process,
+	}
+	if e.Kind == ExecKindProcessStart {
+		c.MaxProcesses = p.cfg.LeaseMaxProcesses
+	}
+	res, runErr := vm.Run(execCtx, c, out)
 	if ph != nil {
 		ph.Run = p.clk.Now().Sub(t0)
 	}
@@ -635,12 +715,14 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 	// The command was refused as larger than the guest's one request frame: nothing was
 	// sent, so the guest ran nothing and its VM is as fit for the next Exec as before.
 	tooLarge := errors.Is(runErr, ErrCommandTooLarge)
+	// The guest refused a process kind before running anything (guestKeepsLease).
+	refusedMsg, refused := guestKeepsLease(runErr)
 
 	var reason LeaseEndReason
 	switch {
 	case res.TeardownFailed:
 		reason = LeaseEndTeardownFailed
-	case timedOut.Load(), runErr != nil && !guestTimeout && !tooLarge:
+	case timedOut.Load(), runErr != nil && !guestTimeout && !tooLarge && !refused:
 		// The host's deadline (the guest did not answer within the budget and the slack),
 		// a transport error, an abort, or a guest error: the agent may have survived, but
 		// a VM whose last Exec ended without its answer is not one to run the next in.
@@ -660,6 +742,10 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 		// The sweep cancelled this Run at the grace limit: that, not the Run error the
 		// cancellation produced, is why the lease ends.
 		reason = cut
+	}
+	if live && runErr == nil {
+		// Before any end below, so the end lists the table this End reported.
+		p.refreshTrackedLocked(rp, l, e, res.Tracked)
 	}
 	switch {
 	case !live:
@@ -704,6 +790,9 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 		// guest's own was kept apart: the caller's contract is unchanged.
 		return res, fmt.Errorf("%w:%d", ErrTimeout, timeoutS)
 	}
+	if refused {
+		return res, &ProcessError{Msg: refusedMsg} // the guest's wire string, unprefixed
+	}
 	return res, runErr
 }
 
@@ -729,7 +818,9 @@ func (p *pool) endLeaseLocked(rp *runPool, reason LeaseEndReason) *leaseVictim {
 	age := now.Sub(l.started)
 	s := p.leaseStateLocked(rp)
 	s.Open = nil
-	s.Pending = &LeaseEvent{State: leaseEventEnd, Reason: reason, At: leaseEventAt(now), Mode: l.mode, Age: age}
+	run := runningTracked(l.tracked)
+	s.Pending = &LeaseEvent{State: leaseEventEnd, Reason: reason, At: leaseEventAt(now), Mode: l.mode, Age: age,
+		Processes: displays(run), Tracked: run}
 	if s.Known && leaseStateFileGone(p.cfg.WorkspaceRoot, rp.key) {
 		// The janitor removed the file of a deleted sandbox while this lease was live (a
 		// janitor wait shorter than retireLeaseState's timing argument allows): as there,
@@ -745,9 +836,123 @@ func (p *pool) endLeaseLocked(rp *runPool, reason LeaseEndReason) *leaseVictim {
 	// Idle clocks (StandbyIdle, WorkspaceIdle) run from the lease's end, not its last
 	// Exec's start (Review Focus 5).
 	rp.lastExec = now
-	log.Printf("vmpool: lease end workspace_key=%q vm=%s mode=%s reason=%s age=%s",
-		rp.key, vmID(l.vm), l.mode, reason, age.Round(time.Millisecond))
+	log.Printf("vmpool: lease end workspace_key=%q vm=%s mode=%s reason=%s age=%s%s",
+		rp.key, vmID(l.vm), l.mode, reason, age.Round(time.Millisecond), trackedAuditField(l.tracked))
 	return v
+}
+
+// refreshTrackedLocked replaces l's tracked mirror with next, the table a lease End of
+// Exec e reported (plan 5): every lease End carries the whole table, so the mirror is
+// never stale, and an End without one (an empty table, or a level-1 agent) empties it. It
+// writes a lease_process record for each start, stop and exit the change shows
+// (auditTracked), and saves the mirror with the open lease when one did, so a
+// worker_restart end lists what was running (endLeasesOpenAtStart). A change in memory
+// alone is not saved: the file is fsynced under p.mu, and a worker_restart end has no use
+// for a footprint. Caller holds p.mu and rp's gate, with l live.
+func (p *pool) refreshTrackedLocked(rp *runPool, l *vmLease, e Exec, next []TrackedProcess) {
+	prev := l.tracked
+	l.tracked = next
+	if !auditTracked(rp.key, l.mode, e, prev, next) {
+		return
+	}
+	s := p.leaseStateLocked(rp)
+	if s.Open == nil {
+		return
+	}
+	o := *s.Open // copied, not written through: the cached state may share it
+	o.Tracked = next
+	s.Open = &o
+	if err := saveLeaseState(p.cfg.WorkspaceRoot, rp.key, s); err != nil {
+		// The open record only lets a worker_restart end list the processes: losing it
+		// loses that list, not safety (startLease's trade).
+		log.Printf("vmpool: lease tracked processes for %q: %v", rp.key, err)
+	}
+	rp.state = s
+}
+
+// auditTracked writes the lease_process records (spec §7) for the change from prev to next,
+// the mirror before and after Exec e's End, and reports whether the table changed in
+// anything but memory. A new entry is a start; an entry that left running is an exit, or
+// the stop when e is the process_stop that named it, which is recorded even when the
+// process had already exited (the stop still signals what its cgroup holds). A running
+// entry that vanished is an exit with state gone (the guest never drops a running one).
+// Each record carries the id, name, mode and workspace key, never the command text.
+func auditTracked(key string, mode Mode, e Exec, prev, next []TrackedProcess) bool {
+	rec := func(event string, tp TrackedProcess, state string) {
+		log.Printf("vmpool: lease_process event=%s workspace_key=%q mode=%s id=%s name=%q pid=%d state=%s code=%d",
+			event, key, mode, tp.ID, tp.DisplayName(), tp.PID, state, tp.Code)
+	}
+	stopped := -1
+	if e.Kind == ExecKindProcessStop {
+		stopped = findTracked(next, e.Process)
+	}
+	old := make(map[string]TrackedProcess, len(prev))
+	for _, tp := range prev {
+		old[tp.ID] = tp
+	}
+	changed := len(prev) != len(next)
+	for i, tp := range next {
+		was, ok := old[tp.ID]
+		delete(old, tp.ID)
+		if !ok {
+			changed = true
+			rec("start", tp, tp.State)
+		} else {
+			was.MemoryBytes, was.Started = tp.MemoryBytes, tp.Started
+			changed = changed || was != tp
+		}
+		switch {
+		case i == stopped:
+			rec("stop", tp, tp.State)
+		case !tp.running() && (!ok || was.running()):
+			rec("exit", tp, tp.State)
+		}
+	}
+	for _, tp := range prev {
+		if _, gone := old[tp.ID]; gone {
+			changed = true
+			if tp.running() {
+				rec("exit", tp, "gone")
+			}
+		}
+	}
+	return changed
+}
+
+// findTracked is the index in ps of the entry args names, as the guest finds it: by id when
+// one is given, else by name, an id winning over an equal name (ruling P5-R6); -1 if none.
+func findTracked(ps []TrackedProcess, args ProcessArgs) int {
+	key := args.ID
+	if key == "" {
+		key = args.Name
+	}
+	if key == "" {
+		return -1
+	}
+	for i, tp := range ps {
+		if tp.ID == key {
+			return i
+		}
+	}
+	for i, tp := range ps {
+		if tp.DisplayName() == key {
+			return i
+		}
+	}
+	return -1
+}
+
+// trackedAuditField is a lease end's audit field for its tracked processes (spec §4.1:
+// id, name and exit state), " processes=[<id>:<name>:<state> ...]", or "" for none.
+func trackedAuditField(ps []TrackedProcess) string {
+	if len(ps) == 0 {
+		return ""
+	}
+	parts := make([]string, len(ps))
+	for i, tp := range ps {
+		parts[i] = tp.ID + ":" + tp.DisplayName() + ":" + tp.stateText()
+	}
+	return " processes=[" + strings.Join(parts, " ") + "]"
 }
 
 // detachLeaseLocked takes rp's lease VM off the run without recording an end: the

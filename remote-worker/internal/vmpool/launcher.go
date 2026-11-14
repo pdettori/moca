@@ -43,6 +43,11 @@ type Command struct {
 	// Lease and NormaliseWorkspace are forwarded to the guest's Request flags.
 	Lease              bool
 	NormaliseWorkspace bool
+	// Kind, Process and MaxProcesses are forwarded to the guest's Request (plan 5).
+	// MaxProcesses is Config.LeaseMaxProcesses, set on process_start only.
+	Kind         ExecKind
+	Process      ProcessArgs
+	MaxProcesses int
 
 	// ctxDone is TEST-ONLY plumbing: the fake launcher fills it so a run hook can
 	// block until the run context ends, which is how the timeout and abort tests
@@ -71,6 +76,9 @@ type Result struct {
 	DroppedStderr int64
 	// TeardownFailed is the guest's End.TeardownFailed, passed through unchanged.
 	TeardownFailed bool
+	// Tracked is the guest's End.Tracked: its whole tracked-process table, on every lease
+	// End (plan 5). The lease's mirror is refreshed from it (runLease).
+	Tracked []TrackedProcess
 }
 
 // TruncatedStdout is what maps to End.truncated (spec §4.1, and the proto's own note

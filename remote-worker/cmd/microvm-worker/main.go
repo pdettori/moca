@@ -311,6 +311,13 @@ func leaseConfig(get func(string) string, cfg *vmpool.Config) error {
 	mib("SH_LEASE_START_MB", &cfg.LeaseStartBytes)
 	mib("SH_LEASE_PAGECACHE_MB", &cfg.LeasePageCacheBytes)
 	mib("SH_LEASE_RECLAIM_FREE_MB", &cfg.LeaseReclaimFreeBytes)
+	if get("SH_LEASE_MAX_PROCESSES") != "" {
+		// Level 2's cap on running tracked processes (spec §7), at most the tracked uids
+		// a level-2 image has.
+		if v, ok := read("SH_LEASE_MAX_PROCESSES", vmpool.MaxLeaseProcesses); ok {
+			cfg.LeaseMaxProcesses = int(v)
+		}
+	}
 	if v := get("SH_LEASE_HEADROOM"); v != "" {
 		h, e := strconv.ParseFloat(v, 64)
 		// !(h >= 1) rather than h < 1: it also refuses NaN, which compares false to everything.

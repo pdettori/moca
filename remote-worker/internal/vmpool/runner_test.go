@@ -192,7 +192,7 @@ func TestRunnerLogsTheWorkspaceKeyAndVMOfEveryExec(t *testing.T) {
 		t.Fatalf("got %d exec log lines, want exactly 1: %q", len(lines), lines)
 	}
 	l := lines[0]
-	for _, want := range []string{`req=9`, `workspace_key="sess-abc"`, "vm=" + restoredID, "exit=3", "err=<nil>"} {
+	for _, want := range []string{`req=9`, `workspace_key="sess-abc"`, "kind=command", "vm=" + restoredID, "exit=3", "err=<nil>"} {
 		if !strings.Contains(l, want) {
 			t.Fatalf("exec log %q lacks %q", l, want)
 		}

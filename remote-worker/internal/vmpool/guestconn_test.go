@@ -374,3 +374,54 @@ func TestLeaseRunCarriesHostClock(t *testing.T) {
 		}
 	}
 }
+
+// A process kind reaches the guest's Request with its arguments and the host's process cap;
+// a command's request carries no kind, process or max_processes key, byte-identical to an
+// older host's.
+func TestGuestRequestCarriesTheProcessKind(t *testing.T) {
+	req := guestRequest(Command{
+		Command: "npm run dev", Lease: true, Kind: ExecKindProcessStart,
+		Process: ProcessArgs{Name: "web", Cwd: "app", Tail: 5, Signal: "INT", ID: "7"}, MaxProcesses: 4,
+	}, OutputCapBytes, time.Now())
+	want := ga.ProcessArgs{Name: "web", Cwd: "app", Tail: 5, Signal: "INT", ID: "7"}
+	if req.Kind != ga.RequestKindProcessStart || req.Process == nil || *req.Process != want || req.MaxProcesses != 4 {
+		t.Fatalf("req = %+v (process %+v), want process_start with its args and max 4", req, req.Process)
+	}
+	b, err := json.Marshal(guestRequest(Command{Command: "true", Lease: true}, OutputCapBytes, time.Now()))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	for _, k := range []string{`"kind"`, `"process"`, `"max_processes"`} {
+		if bytes.Contains(b, []byte(k)) {
+			t.Fatalf("a command's request %s carries %s", b, k)
+		}
+	}
+}
+
+// End.Tracked becomes Result.Tracked, started_unix_ms as a time.
+func TestRunOverConnReturnsTheTrackedTable(t *testing.T) {
+	conn := fakeGuest(t, func(rw io.ReadWriteCloser, req ga.Request) {
+		_ = ga.WriteJSON(rw, ga.KindEnd, ga.End{Tracked: []ga.TrackedProcess{
+			{ID: "1", Name: "web", PID: 412, State: ga.TrackedRunning, StartedUnixMs: 1762940000123, MemoryBytes: 1 << 20},
+			{ID: "2", Name: "p2", PID: 413, State: ga.TrackedKilled, Code: 9, StartedUnixMs: 1762940000000},
+		}})
+	})
+	res, err := runOverConn(context.Background(), conn, Command{Command: "true", Lease: true, CapBytes: OutputCapBytes}, &capturingSink{}, time.Now())
+	if err != nil {
+		t.Fatalf("runOverConn: %v", err)
+	}
+	want := []TrackedProcess{
+		{ID: "1", Name: "web", PID: 412, State: "running", Started: time.UnixMilli(1762940000123), MemoryBytes: 1 << 20},
+		{ID: "2", Name: "p2", PID: 413, State: "killed", Code: 9, Started: time.UnixMilli(1762940000000)},
+	}
+	if len(res.Tracked) != 2 || !res.Tracked[0].Started.Equal(want[0].Started) {
+		t.Fatalf("tracked = %+v, want %+v", res.Tracked, want)
+	}
+	for i := range want {
+		g, w := res.Tracked[i], want[i]
+		g.Started, w.Started = time.Time{}, time.Time{}
+		if g != w || !res.Tracked[i].Started.Equal(want[i].Started) {
+			t.Fatalf("tracked[%d] = %+v, want %+v", i, res.Tracked[i], want[i])
+		}
+	}
+}

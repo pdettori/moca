@@ -26,6 +26,10 @@ type LeaseInfo struct {
 	IdleTimeout time.Duration
 	Pending     *LeaseEvent
 	Expiry      *LeaseExpiry // set only when State is LeaseExpiring
+	// Tracked is the live lease's running tracked processes, from its mirror (plan 5),
+	// and At is when the status was read: their ages count to it.
+	Tracked []TrackedProcess
+	At      time.Time
 }
 
 // LeaseExpiry is an expiring lease's notice (spec §5, plan 4): its level, when it passed
@@ -79,6 +83,7 @@ func (p *pool) LeaseStatus(key string) LeaseInfo {
 	if l := rp.lease; !l.started.IsZero() { // zero while startLease installs it
 		now := p.clk.Now()
 		info.Age, info.IdleTimeout = now.Sub(l.started), l.idle
+		info.Tracked, info.At = runningTracked(l.tracked), now
 		// Computed as well as read: the sweep sets expiring only on its next tick. l.expiring
 		// implies the maximum duration has passed (the sweep and setLeaseLevelLocked set it
 		// from the same comparison), so Since is never in the future.
@@ -250,14 +255,18 @@ func (p *pool) endLeasesOpenAtStart() {
 		}
 		age := now.Sub(o.Started)
 		s.Open = nil
-		s.Pending = &LeaseEvent{State: leaseEventEnd, Reason: LeaseEndWorkerRestart, At: leaseEventAt(now), Mode: o.Mode, Age: age}
+		// The processes running when the mirror was last saved (Review Focus 4): the
+		// guest died with this worker, so they are gone.
+		run := runningTracked(o.Tracked)
+		s.Pending = &LeaseEvent{State: leaseEventEnd, Reason: LeaseEndWorkerRestart, At: leaseEventAt(now), Mode: o.Mode, Age: age,
+			Processes: displays(run), Tracked: run}
 		if err := saveLeaseState(root, key, s); err != nil {
 			// The next lease start overwrites the open record: this notice is lost, not
 			// safety (the same trade as startLease's failed save).
 			log.Printf("vmpool: lease end for %q: %v", key, err)
 		}
 		p.counters.leaseEnded(LeaseEndWorkerRestart)
-		log.Printf("vmpool: lease end workspace_key=%q vm=%s mode=%s reason=%s age=%s",
-			key, o.VMID, o.Mode, LeaseEndWorkerRestart, age.Round(time.Millisecond))
+		log.Printf("vmpool: lease end workspace_key=%q vm=%s mode=%s reason=%s age=%s%s",
+			key, o.VMID, o.Mode, LeaseEndWorkerRestart, age.Round(time.Millisecond), trackedAuditField(o.Tracked))
 	}
 }
