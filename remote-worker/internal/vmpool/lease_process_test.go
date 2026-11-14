@@ -1213,7 +1213,9 @@ func TestDowngradeStopIsBoundedByTheGraceLimit(t *testing.T) {
 // tracked process writes between Execs, and process kinds are sent unwrapped (P5-R34), so
 // a level-2 lease's end syncs the guest before its VM is destroyed: every end whose guest
 // may still be alive, the closed pool's detach (worker_restart) included. A level-1 lease
-// needs none (nothing outlives an Exec's sync), nor does a guest the end found unfit.
+// needs none (nothing outlives an Exec's sync), nor does a guest whose teardown failed. An
+// agent_dead end still syncs (ruling P5-R36): it covers the host's own deadline and an abort,
+// where the guest usually lives, and a dead agent refuses at once.
 func TestLevel2LeaseEndSyncsBeforeDestroy(t *testing.T) {
 	started := time.Unix(1_700_000_000, 0)
 	for _, tc := range []struct {
@@ -1241,6 +1243,12 @@ func TestLevel2LeaseEndSyncsBeforeDestroy(t *testing.T) {
 			})
 			_, _ = p.Exec(t.Context(), "k", level2Exec("ls", 1), &capturingSink{})
 		}, false},
+		{"agent_dead (a guest error the agent may have survived)", true, func(t *testing.T, p *pool, lc *leaseLauncher, _ *fakeTable) {
+			lc.setRunFn(func(_ *fakeVM, c Command, _ Sink) (Result, error) {
+				return Result{}, errors.Join(ErrGuest, errors.New("the host's deadline passed"))
+			})
+			_, _ = p.Exec(t.Context(), "k", level2Exec("ls", 1), &capturingSink{})
+		}, true},
 		{"level 1 reset", false, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
 			if err := p.EndLease("k", LeaseEndReset); err != nil {
 				t.Fatalf("EndLease: %v", err)

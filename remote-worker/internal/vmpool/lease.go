@@ -853,9 +853,12 @@ func (p *pool) endLeaseLocked(rp *runPool, reason LeaseEndReason) *leaseVictim {
 		return nil
 	}
 	v.reason = reason
-	if reason == LeaseEndAgentDead || reason == LeaseEndTeardownFailed {
+	if reason == LeaseEndTeardownFailed {
 		v.sync = false // the guest is not fit to answer; the end does not wait on it
 	}
+	// agent_dead still syncs (ruling P5-R36): it also covers the host's own deadline and an
+	// abort, where the guest usually lives on with a tracked process's unsynced writes, and an
+	// agent that is really gone refuses the sync at once.
 	now := p.clk.Now()
 	age := now.Sub(l.started)
 	s := p.leaseStateLocked(rp)
