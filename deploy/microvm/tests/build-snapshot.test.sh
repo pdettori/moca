@@ -1911,9 +1911,10 @@ check "the without-flag manifest is valid JSON" \
   "$(python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$mw/without.json" && echo yes || echo no)" "yes"
 check "the manifest's kernel_release is the probed guest kernel" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["kernel_release"])' "$mw/without.json")" "6.1.155-guest"
-check "the Firecracker manifest's features are [lease-v1, balloon-fpr-v1]" \
-  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["features"])' "$mw/without.json")" "['lease-v1', 'balloon-fpr-v1']"
-# CHV cannot serve a lease: chvWrapCommand mounts the workspace inside every Run.
+check "the Firecracker manifest's features are [lease-v1, lease-processes-v1, balloon-fpr-v1]" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["features"])' "$mw/without.json")" "['lease-v1', 'lease-processes-v1', 'balloon-fpr-v1']"
+# CHV cannot serve a lease (chvWrapCommand mounts the workspace inside every Run), so it
+# advertises neither lease-v1 nor lease-processes-v1.
 check "the Cloud Hypervisor manifest's features are []" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["features"])' "$mw/chv.json")" "[]"
 check "the with-flag manifest is valid JSON" \
@@ -2031,6 +2032,19 @@ check "init leaves user namespaces enabled (the agent disables them for a lease)
   "$(awk -v s="$init_start" -v e="$init_end" 'NR>=s && NR<=e' "$SCRIPT" | grep -c 'max_user_namespaces')" "0"
 check "the agent exec carries --lease-cgroup-root /sys/fs/cgroup/moca-execs" \
   "$(printf '%s' "$exec_text" | grep -cF -- '--lease-cgroup-root /sys/fs/cgroup/moca-execs')" "1"
+# Level 2 (tracked processes): the agent's tracked uid range must be the one the image's
+# sbxp<n> passwd lines name.
+check "the agent exec carries --lease-tracked-uid-base 20000 --lease-tracked-uids 4" \
+  "$(printf '%s' "$exec_text" | grep -cF -- '--lease-tracked-uid-base 20000 --lease-tracked-uids 4')" "1"
+tracked_pw="$(eval "$(fn_body sbx_tracked_passwd)"; sbx_tracked_passwd 2>/dev/null)"
+check "sbx_tracked_passwd prints the four tracked identities, HOME /tmp/sbx-proc/<uid>" "$tracked_pw" \
+  "sbxp0:x:20000:7000::/tmp/sbx-proc/20000:/bin/bash
+sbxp1:x:20001:7000::/tmp/sbx-proc/20001:/bin/bash
+sbxp2:x:20002:7000::/tmp/sbx-proc/20002:/bin/bash
+sbxp3:x:20003:7000::/tmp/sbx-proc/20003:/bin/bash"
+check "the agent's tracked uid base and count match the passwd lines" \
+  "$(printf '%s\n' "$tracked_pw" | awk -F: 'NR==1{b=$3} END{print "--lease-tracked-uid-base " b " --lease-tracked-uids " NR}')" \
+  "--lease-tracked-uid-base 20000 --lease-tracked-uids 4"
 check "assemble_rootfs adds the sbx identity" \
   "$(fn_body assemble_rootfs | grep -c '^  add_sbx_identity$')" "1"
 check "the passwd entry is sbx:x:7000:7000::/tmp/sbx-home:/bin/bash" \
@@ -2065,6 +2079,7 @@ id_harness() { # $1 = work dir; the tree's etc/passwd and etc/group are already 
     echo "STAGE='$1/stage'"
     fn_body tree_dir_target
     fn_body tree_write_target
+    fn_body sbx_tracked_passwd
     fn_body add_sbx_identity
     echo 'add_sbx_identity'
   } >"$1/run.sh"
@@ -2087,6 +2102,22 @@ check "clean tree: group gains the sbx-ws line" \
 check "rerun is idempotent (exit 0)" "$(id_harness "$w")" "0"
 check "rerun is idempotent (one sbx line)" "$(grep -c '^sbx:' "$w/stage/rootfs-tree/etc/passwd")" "1"
 check "rerun is idempotent (one sbx-ws line)" "$(grep -c '^sbx-ws:' "$w/stage/rootfs-tree/etc/group")" "1"
+check "clean tree: passwd gains the four tracked lines" \
+  "$(grep -E '^sbxp' "$w/stage/rootfs-tree/etc/passwd")" "$tracked_pw"
+check "rerun is idempotent (four sbxp lines)" "$(grep -c '^sbxp' "$w/stage/rootfs-tree/etc/passwd")" "4"
+w="$LT/tuid"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nbuilder:x:20002:100::/home/b:/bin/sh\n' $'root:x:0:\n'
+check "tracked uid 20002 under another name: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "tracked uid 20002 under another name: the message names it" "$(grep -cF 'builder:x:20002:100' "$w/out")" "1"
+check "tracked uid 20002 under another name: passwd untouched" \
+  "$(grep -cE '^(sbx|sbxp[0-9]):' "$w/stage/rootfs-tree/etc/passwd")" "0"
+w="$LT/tname"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nsbxp1:x:3000:3000::/home/p:/bin/sh\n' $'root:x:0:\n'
+check "the name sbxp1 under another uid: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "the name sbxp1 under another uid: the message names it" "$(grep -cF 'sbxp1:x:3000:3000' "$w/out")" "1"
+w="$LT/tnum"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nzero:x:020001:100::/home/z:/bin/sh\n' $'root:x:0:\n'
+check "tracked uid written as 020001: refused (uids compare as numbers)" \
+  "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+w="$LT/tnear"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nnear:x:20004:100::/home/n:/bin/sh\n' $'root:x:0:\n'
+check "uid 20004, just past the range: accepted" "$(id_harness "$w")" "0"
 w="$LT/uid"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nother:x:7000:100::/home/o:/bin/sh\n' $'root:x:0:\n'
 check "uid 7000 under another name: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
 check "uid 7000 under another name: the message names it" "$(grep -cF 'other:x:7000:100' "$w/out")" "1"
@@ -2142,6 +2173,7 @@ ls_harness() { # $1 = work dir, $2 = what the guest prints
   chmod 0755 "$1/stage/guest_client"
   {
     echo "STAGE='$1/stage'"
+    fn_body sbx_tracked_passwd
     fn_body check_lease_support
     echo 'check_lease_support /uds'
   } >"$1/run.sh"
@@ -2149,18 +2181,32 @@ ls_harness() { # $1 = work dir, $2 = what the guest prints
   echo $?
 }
 sbx_pw='sbx:x:7000:7000::/tmp/sbx-home:/bin/bash'
-check "lease support: cg2, userns-ok, sbx, empty passes" "$(ls_harness "$LT/ok" "cg2
+# The guest prints, one line each: cgroup2, the userns sysctl, the sbx line, the cgroup.kill
+# probe, the tracked-range passwd entries (space-joined), the gid-7000 groups (space-joined),
+# then the first setuid file, if any.
+tracked_line="$(printf '%s\n' "$tracked_pw" | tr '\n' ' ')"
+grp_line='sbx-ws:x:7000: '
+check "lease support: cg2, userns-ok, sbx, kill-ok, tracked, sbx-ws, empty passes" "$(ls_harness "$LT/ok" "cg2
 userns-ok
 $sbx_pw
+kill-ok
+$tracked_line
+$grp_line
 ")" "0"
 check "lease support: no cgroup2 fails" "$([ "$(ls_harness "$LT/nocg" "no-cg2
 userns-ok
 $sbx_pw
+kill-ok
+$tracked_line
+$grp_line
 ")" != 0 ] && echo yes || echo no)" "yes"
 check "lease support: no cgroup2 is named" "$(grep -c 'cgroup2' "$LT/nocg/out")" "1"
 check "lease support: an unwritable userns sysctl fails" "$([ "$(ls_harness "$LT/userns" "cg2
 no-userns
 $sbx_pw
+kill-ok
+$tracked_line
+$grp_line
 ")" != 0 ] && echo yes || echo no)" "yes"
 check "lease support: an unwritable userns sysctl is named" "$(grep -c 'max_user_namespaces' "$LT/userns/out")" "1"
 check "lease support: no sbx account fails" "$([ "$(ls_harness "$LT/nosbx" $'cg2\nuserns-ok\nno-sbx\n')" != 0 ] && echo yes || echo no)" "yes"
@@ -2170,15 +2216,59 @@ check "lease support: the guest command greps passwd for sbx (no getent)" \
   "$(fn_body check_lease_support | grep -cF 'grep "^sbx:" /etc/passwd')" "1"
 check "lease support: the guest command checks the userns sysctl is writable" \
   "$(fn_body check_lease_support | grep -cF 'test -w /proc/sys/user/max_user_namespaces && echo userns-ok')" "1"
+# cgroup.kill (process_stop, every lease teardown) is never in the cgroup2 root, only in a child:
+# the probe makes one, looks, and removes it, so nothing reaches the snapshot.
+for k in no-kill no-mkdir probe-left; do
+  check "lease support: a cgroup.kill probe answering $k fails" "$([ "$(ls_harness "$LT/$k" "cg2
+userns-ok
+$sbx_pw
+$k
+$tracked_line
+$grp_line
+")" != 0 ] && echo yes || echo no)" "yes"
+  check "lease support: a cgroup.kill probe answering $k is named" "$(grep -c "cgroup.kill.*got '$k'" "$LT/$k/out")" "1"
+done
+# shellcheck disable=SC2016 # the guest command is literal
+check "lease support: the guest command probes cgroup.kill in a child cgroup it then removes" \
+  "$(fn_body check_lease_support | grep -cF 'd=/sys/fs/cgroup/moca-kill-probe; if mkdir "$d" 2>/dev/null; then k=no-kill; test -e "$d/cgroup.kill" && k=kill-ok; rmdir "$d" 2>/dev/null || k=probe-left; echo "$k"; else echo no-mkdir; fi')" "1"
+check "lease support: the guest command lists the tracked names and uids from sbx_tracked_passwd" \
+  "$(fn_body check_lease_support | grep -cF 'sbx_tracked_passwd | cut -d: -f3')" "1"
+check "lease support: a tracked uid held by another account fails" "$([ "$(ls_harness "$LT/tclash" "cg2
+userns-ok
+$sbx_pw
+kill-ok
+builder:x:20001:100::/home/b:/bin/sh $tracked_line
+$grp_line
+")" != 0 ] && echo yes || echo no)" "yes"
+check "lease support: the tracked clash is named" "$(grep -c 'builder:x:20001:100' "$LT/tclash/out")" "1"
+check "lease support: missing tracked lines fail" "$([ "$(ls_harness "$LT/tnone" "cg2
+userns-ok
+$sbx_pw
+kill-ok
+
+$grp_line
+")" != 0 ] && echo yes || echo no)" "yes"
+check "lease support: missing tracked lines are named" "$(grep -c 'lease-processes-v1: the guest /etc/passwd' "$LT/tnone/out")" "1"
+check "lease support: another gid-7000 group fails" "$([ "$(ls_harness "$LT/gclash" "cg2
+userns-ok
+$sbx_pw
+kill-ok
+$tracked_line
+staff7:x:7000: $grp_line
+")" != 0 ] && echo yes || echo no)" "yes"
+check "lease support: the group clash is named" "$(grep -c 'staff7:x:7000:' "$LT/gclash/out")" "1"
 check "lease support: a setuid binary fails" "$([ "$(ls_harness "$LT/suid" "cg2
 userns-ok
 $sbx_pw
+kill-ok
+$tracked_line
+$grp_line
 /usr/bin/su
 ")" != 0 ] && echo yes || echo no)" "yes"
 check "lease support: the setuid binary is named" "$(grep -c '/usr/bin/su' "$LT/suid/out")" "1"
 mkdir -p "$LT/fail/stage"; printf '#!/bin/sh\necho "guest_client: dial: refused" >&2\nexit 1\n' >"$LT/fail/stage/guest_client"
 chmod 0755 "$LT/fail/stage/guest_client"
-{ echo "STAGE='$LT/fail/stage'"; fn_body check_lease_support; echo 'check_lease_support /uds'; } >"$LT/fail/run.sh"
+{ echo "STAGE='$LT/fail/stage'"; fn_body sbx_tracked_passwd; fn_body check_lease_support; echo 'check_lease_support /uds'; } >"$LT/fail/run.sh"
 bash "$LT/fail/run.sh" >"$LT/fail/out" 2>&1; rc=$?
 check "lease support: a transport failure fails" "$([ "$rc" != 0 ] && echo yes || echo no)" "yes"
 check "lease support: a transport failure shows guest_client's diagnostics" "$(grep -c 'dial: refused' "$LT/fail/out")" "1"
