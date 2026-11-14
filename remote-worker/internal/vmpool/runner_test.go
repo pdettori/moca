@@ -566,49 +566,81 @@ func TestPerExecExecCarriesNoLeaseEvents(t *testing.T) {
 
 // The expiring notice names its reason and its deadline (plan 4): at_unix_ms is when the
 // lease passed its maximum duration, and ends_by_unix_ms is that plus LeaseGraceLimit, the
-// hard end a client counts its "restarts within <N> min" down to.
+// hard end a client counts its "restarts within <N> min" down to. age_ms is the lease's age
+// when the Exec's response is built, exactly, on the fake clock. Each level expires at its
+// own maximum duration (LeaseMaxDuration, LeaseMaxDurationProcesses), and the other one is
+// set far off, so a level reading the wrong one would not expire at all.
 func TestExpiringEventCarriesDeadline(t *testing.T) {
-	p, _, clk := leasePool(t, func(c *Config) {
-		c.LeaseMaxDuration = 10 * time.Second
-		c.LeaseGraceLimit = 60 * time.Second
-	})
-	r := Runner{Pool: p}
-	mustSetMode(t, p, "k", ModeLease, 1)
-	first := runLease(t, r, leaseSpec(1, 1))
-	if len(first) != 1 || first[0].GetState() != "start" {
-		t.Fatalf("first Exec's events = %v, want one lease start", first)
-	}
-	started := first[0].GetAtUnixMs()
+	for _, tc := range []struct {
+		mode  Mode
+		proto pb.SandboxMode
+		tweak func(*Config)
+	}{
+		{ModeLease, pb.SandboxMode_SANDBOX_MODE_LEASE, func(c *Config) {
+			c.LeaseMaxDuration, c.LeaseMaxDurationProcesses = 10*time.Second, time.Hour
+		}},
+		{ModeLeaseProcesses, pb.SandboxMode_SANDBOX_MODE_LEASE_PROCESSES, func(c *Config) {
+			c.LeaseMaxDuration, c.LeaseMaxDurationProcesses = time.Hour, 10*time.Second
+			c.ManifestFeatures = processFeatures
+		}},
+	} {
+		t.Run(tc.mode.String(), func(t *testing.T) {
+			p, _, clk := leasePool(t, func(c *Config) {
+				tc.tweak(c)
+				c.LeaseGraceLimit = 60 * time.Second
+			})
+			r := Runner{Pool: p}
+			spec := func(reqID uint64) wexec.Spec {
+				s := leaseSpec(reqID, 1)
+				s.Mode = tc.mode.String()
+				return s
+			}
+			mustSetMode(t, p, "k", tc.mode, 1)
+			first := runLease(t, r, spec(1))
+			if len(first) != 1 || first[0].GetState() != "start" || first[0].GetMode() != tc.proto {
+				t.Fatalf("first Exec's events = %v, want one lease start in mode %s", first, tc.mode)
+			}
+			started := first[0].GetAtUnixMs()
 
-	clk.Advance(10 * time.Second)
-	evs := runLease(t, r, leaseSpec(2, 1))
-	if len(evs) != 1 {
-		t.Fatalf("events after 10 s = %v, want exactly the expiring notice", evs)
-	}
-	ev := evs[0]
-	if ev.GetState() != "expiring" || ev.GetReason() != "max_duration" {
-		t.Fatalf("event = %v, want expiring/max_duration", ev)
-	}
-	if ev.GetMode() != pb.SandboxMode_SANDBOX_MODE_LEASE {
-		t.Errorf("mode = %v, want lease", ev.GetMode())
-	}
-	if ev.GetAgeMs() < 10_000 {
-		t.Errorf("age_ms = %d, want the lease's age (>= 10 000)", ev.GetAgeMs())
-	}
-	if want := started + 10_000; ev.GetAtUnixMs() != want {
-		t.Errorf("at_unix_ms = %d, want %d: when the lease passed its maximum duration", ev.GetAtUnixMs(), want)
-	}
-	if d := ev.GetEndsByUnixMs() - ev.GetAtUnixMs(); d != 60_000 {
-		t.Errorf("ends_by - at = %d ms, want 60 000 (the grace limit)", d)
-	}
+			clk.Advance(9 * time.Second)
+			if evs := runLease(t, r, spec(2)); len(evs) != 0 {
+				t.Fatalf("events after 9 s = %v, want none: the lease is not yet expiring", evs)
+			}
 
-	// Not acknowledged: the next lease Exec carries the same notice, at the same at_unix_ms,
-	// so a client deduping on it shows it once.
-	clk.Advance(time.Second)
-	again := runLease(t, r, leaseSpec(3, 1))
-	if len(again) != 1 || again[0].GetState() != "expiring" || again[0].GetAtUnixMs() != ev.GetAtUnixMs() ||
-		again[0].GetEndsByUnixMs() != ev.GetEndsByUnixMs() {
-		t.Fatalf("next Exec's events = %v, want the same expiring notice (%v)", again, ev)
+			clk.Advance(time.Second)
+			evs := runLease(t, r, spec(3))
+			if len(evs) != 1 {
+				t.Fatalf("events after 10 s = %v, want exactly the expiring notice", evs)
+			}
+			ev := evs[0]
+			if ev.GetState() != "expiring" || ev.GetReason() != "max_duration" {
+				t.Fatalf("event = %v, want expiring/max_duration", ev)
+			}
+			if ev.GetMode() != tc.proto {
+				t.Errorf("mode = %v, want %v", ev.GetMode(), tc.proto)
+			}
+			if ev.GetAgeMs() != 10_000 {
+				t.Errorf("age_ms = %d, want 10 000: the lease's age when the Exec answered", ev.GetAgeMs())
+			}
+			if want := started + 10_000; ev.GetAtUnixMs() != want {
+				t.Errorf("at_unix_ms = %d, want %d: when the lease passed its maximum duration", ev.GetAtUnixMs(), want)
+			}
+			if d := ev.GetEndsByUnixMs() - ev.GetAtUnixMs(); d != 60_000 {
+				t.Errorf("ends_by - at = %d ms, want 60 000 (the grace limit)", d)
+			}
+
+			// Not acknowledged: the next lease Exec carries the same notice, at the same
+			// at_unix_ms, so a client deduping on it shows it once. Its age_ms has moved on.
+			clk.Advance(1500 * time.Millisecond)
+			again := runLease(t, r, spec(4))
+			if len(again) != 1 || again[0].GetState() != "expiring" || again[0].GetAtUnixMs() != ev.GetAtUnixMs() ||
+				again[0].GetEndsByUnixMs() != ev.GetEndsByUnixMs() || again[0].GetMode() != tc.proto {
+				t.Fatalf("next Exec's events = %v, want the same expiring notice (%v)", again, ev)
+			}
+			if got := again[0].GetAgeMs(); got != 11_500 {
+				t.Errorf("the next notice's age_ms = %d, want 11 500: the age when that Exec answered", got)
+			}
+		})
 	}
 }
 
