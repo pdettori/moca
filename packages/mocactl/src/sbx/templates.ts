@@ -34,7 +34,9 @@ export const POLL_MS = 5000;
 /** `templates activate --wait`'s limit with no --timeout, in seconds: the floor of a sized one. */
 export const ACTIVATE_TIMEOUT_S = 1800;
 /** `templates retire --wait`'s limit with no --timeout, in seconds. */
-export const RETIRE_TIMEOUT_S = 300;
+// Past the 600 s a host keeps shipping an ended sandbox's egress before it may remove the build,
+// plus a few host polls.
+export const RETIRE_TIMEOUT_S = 900;
 /** The sized limit's ceiling: a host reporting an outlier start time never makes --wait sit longer. */
 export const ACTIVATE_TIMEOUT_CAP_S = 14_400;
 

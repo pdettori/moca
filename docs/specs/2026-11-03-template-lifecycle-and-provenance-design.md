@@ -363,7 +363,8 @@ from other subjects (a 404, as for an id that does not exist) and refuses their 
   template from one image share a worker id) reads `shared: true` and `capacity` null: its worker
   is kept running for that build and never stopped or removed for the retire, so `--wait` returns
   at once and says so.
-  Past `--timeout` (default 300 s) it exits 5; a holding host whose agent does not poll keeps the
+  Past `--timeout` (default 900 s: past the 600 s egress window before a removal, plus a few
+  host polls) it exits 5; a holding host whose agent does not poll keeps the
   build in `heldBy` until it does. A sandbox command refused `template_retired` says that the
   template or build is never served again.
 

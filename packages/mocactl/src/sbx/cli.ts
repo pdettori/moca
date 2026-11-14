@@ -138,7 +138,7 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  runs on it, not undone (a new build is the way
                                                  back). --reason: kept in its record (not with
                                                  --build). --wait: until its worker has stopped
-                                                 and every host has removed it (default 300 s;
+                                                 and every host has removed it (default 900 s;
                                                  exit 5 on a timeout), at once for a build no
                                                  host holds, or one whose worker a build not
                                                  retired uses

@@ -7,7 +7,12 @@ import { openSbxRuntime, sbxMain } from '../src/sbx/cli.js';
 import type { SbxHost } from '../src/sbx/api.js';
 import { refusalText, SBX_EXIT } from '../src/sbx/commands.js';
 import { dryRun } from '../src/sbx/dry-run.js';
-import { cmdActivate, cmdRetire, sizedActivateTimeoutS } from '../src/sbx/templates.js';
+import {
+  cmdActivate,
+  cmdRetire,
+  RETIRE_TIMEOUT_S,
+  sizedActivateTimeoutS,
+} from '../src/sbx/templates.js';
 import {
   cleanupTmp,
   fakeCp,
@@ -1692,5 +1697,11 @@ describe('templates create --dry-run', () => {
     expect(w.err()).toContain('would be refused by policy rule envelope');
     expect(w.err()).toContain('evil profile requires no gate record');
     expect(w.err()).not.toMatch(/[\u001b\u0007]/);
+  });
+});
+
+describe('retire --wait default', () => {
+  it("outlasts the 600 s a host keeps shipping an ended sandbox's egress before the removal", () => {
+    expect(RETIRE_TIMEOUT_S).toBeGreaterThan(600);
   });
 });
