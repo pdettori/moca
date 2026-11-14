@@ -750,21 +750,26 @@ sbx_tracked_passwd() {
 }
 
 # add_sbx_identity gives lease mode its exec identities: user sbx (uid 7000) in group
-# sbx-ws (gid 7000), HOME /tmp/sbx-home, and the tracked-process users sbxp0..sbxp3
-# (uids 20000..20003, sbx_tracked_passwd) in the same group. The agent's leasePrepare
+# sbx-ws (gid 7000), HOME /tmp/sbx-home, and, on a Firecracker build only (level 2,
+# lease-processes-v1, is Firecracker-only; ruling P5-R15), the tracked-process users
+# sbxp0..sbxp3 (uids 20000..20003, sbx_tracked_passwd) in the same group. A Cloud
+# Hypervisor build neither adds nor checks the tracked range. The agent's leasePrepare
 # creates those HOMEs (they are on the /tmp tmpfs), so only the passwd/group lines are
 # baked here. The entries are appended directly rather than via useradd: the build host
 # may not have it, and running the tree's own useradd under chroot would need more of the
 # tree than a base rootfs promises. It refuses, before writing anything, when the tree
-# already uses one of those uids (compared as numbers), gid 7000, or one of the names
+# already uses one of those uids or gid 7000 (compared as numbers), or one of the names
 # sbx/sbxp<n>/sbx-ws for something else, since a lease Exec or a tracked process would
 # then run as that other identity. The exact entries already present is a no-op, so a
 # rerun over the same tree is idempotent.
 add_sbx_identity() {
   local etc="$STAGE/rootfs-tree/etc"
   local gr_line='sbx-ws:x:7000:' pw_lines f clash line
-  pw_lines="sbx:x:7000:7000::/tmp/sbx-home:/bin/bash
+  pw_lines='sbx:x:7000:7000::/tmp/sbx-home:/bin/bash'
+  if [ "$VMM" = firecracker ]; then
+    pw_lines="$pw_lines
 $(sbx_tracked_passwd)"
+  fi
   for f in passwd group; do
     tree_write_target "etc/$f"
     [ -e "$etc/$f" ] || : >"$etc/$f"
@@ -777,10 +782,10 @@ $(sbx_tracked_passwd)"
     }
     (($1 in name) || ($3 ~ /^[0-9]+$/ && (($3 + 0) in uid))) && !($0 in ok)' "$etc/passwd")"
   if [ -n "$clash" ]; then
-    echo "build-snapshot.sh: the rootfs /etc/passwd already uses a lease identity's name or uid (sbx 7000, sbxp0..sbxp3 20000..20003) for another account; lease mode needs them as '$(printf '%s\n' "$pw_lines" | paste -sd' ' -)': $clash" >&2
+    echo "build-snapshot.sh: the rootfs /etc/passwd already uses a lease identity's name or uid for another account; lease mode needs them as '$(printf '%s\n' "$pw_lines" | paste -sd' ' -)': $clash" >&2
     exit 1
   fi
-  clash="$(awk -F: -v want="$gr_line" '($1 == "sbx-ws" || $3 == "7000") && $0 != want' "$etc/group")"
+  clash="$(awk -F: -v want="$gr_line" '($1 == "sbx-ws" || ($3 ~ /^[0-9]+$/ && $3 + 0 == 7000)) && $0 != want' "$etc/group")"
   if [ -n "$clash" ]; then
     echo "build-snapshot.sh: the rootfs /etc/group already uses the name sbx-ws or gid 7000 for another group; lease mode needs it as '$gr_line': $clash" >&2
     exit 1
@@ -1240,35 +1245,41 @@ probe_guest_kernel() {
   printf '%s\n' "$out"
 }
 
-# check_lease_support (lease-v1, lease-processes-v1): the image advertises both, so prove
-# in the booted guest what lease mode and its tracked processes rely on -- cgroup2 mounted
-# at /sys/fs/cgroup, a user-namespace sysctl the agent can write (it disables user
-# namespaces at the first lease request; per-Exec VMs keep them), the sbx identity in
-# /etc/passwd, cgroup.kill (process_stop and every lease teardown kill a cgroup through
-# it; guest kernel 5.14 or later), the tracked uid range held by exactly the sbxp<n>
-# lines (sbx_tracked_passwd), gid 7000 held by sbx-ws alone, no setuid/setgid file on the
-# rootfs -- rather than trusting that init and assemble_rootfs did it. ONE ordinary
-# per-Exec request, never `lease: true`: the first lease request sets the agent's lease
-# latch, and anything set before the snapshot is baked into every VM restored from it
-# (the old clockOK latch failure). It leaves nothing in the guest, so nothing reaches the
-# snapshot either: cgroup.kill exists only in a child cgroup, never in the root, so the
-# probe makes one and removes it, and answers probe-left if it could not. grep, not
-# getent: the guest image need not have getent.
+# check_lease_support (lease-v1, and lease-processes-v1 on Firecracker): prove in the
+# booted guest what lease mode relies on -- cgroup2 mounted at /sys/fs/cgroup, a
+# user-namespace sysctl the agent can write (it disables user namespaces at the first
+# lease request; per-Exec VMs keep them), the sbx identity in /etc/passwd, no
+# setuid/setgid file on the rootfs -- rather than trusting that init and assemble_rootfs
+# did it. On a Firecracker build, whose manifest also advertises lease-processes-v1, it
+# proves what tracked processes rely on too: cgroup.kill (process_stop and every lease
+# teardown kill a cgroup through it; guest kernel 5.14 or later), the tracked uid range
+# held by exactly the sbxp<n> lines (sbx_tracked_passwd, in any order), and gid 7000
+# held by sbx-ws alone (uids and gids compared as numbers). A Cloud Hypervisor build
+# asks only what it asked before (ruling P5-R15). ONE ordinary per-Exec request, never
+# `lease: true`: the first lease request sets the agent's lease latch, and anything set
+# before the snapshot is baked into every VM restored from it (the old clockOK latch
+# failure). It leaves nothing in the guest, so nothing reaches the snapshot either:
+# cgroup.kill exists only in a child cgroup, never in the root, so the probe makes one
+# and removes it, and answers probe-left if it could not. grep, not getent: the guest
+# image need not have getent.
 check_lease_support() {
   local uds="$1"
-  local out rc cg userns sbx kill tracked grp suid err="$STAGE/lease-check.err"
+  local out rc cg userns sbx kill tracked grp suid suid_line=4 err="$STAGE/lease-check.err"
   local cmd uids want_tracked
-  want_tracked="$(sbx_tracked_passwd | paste -sd' ' -)"
+  want_tracked="$(sbx_tracked_passwd | LC_ALL=C sort | paste -sd' ' -)"
   uids="$(sbx_tracked_passwd | cut -d: -f3 | paste -sd'|' -)"
   # stdout only is parsed, line by line; stderr goes aside so a stray diagnostic cannot
   # shift the answers, and is shown when the check could not run at all. Each probe
   # prints exactly one line, so a missing answer cannot shift the next into its place;
   # the setuid probe, which may print none, comes last.
   cmd='cat /sys/fs/cgroup/cgroup.controllers >/dev/null 2>&1 && echo cg2 || echo no-cg2; test -w /proc/sys/user/max_user_namespaces && echo userns-ok || echo no-userns; grep "^sbx:" /etc/passwd || echo no-sbx; '
-  # shellcheck disable=SC2016 # the guest expands $d and $k
-  cmd="$cmd"'d=/sys/fs/cgroup/moca-kill-probe; if mkdir "$d" 2>/dev/null; then k=no-kill; test -e "$d/cgroup.kill" && k=kill-ok; rmdir "$d" 2>/dev/null || k=probe-left; echo "$k"; else echo no-mkdir; fi; '
-  cmd="$cmd""grep -E '^sbxp|^[^:]*:[^:]*:($uids):' /etc/passwd | tr '\n' ' '; echo; "
-  cmd="$cmd""grep -E '^sbx-ws:|^[^:]*:[^:]*:7000:' /etc/group | tr '\n' ' '; echo; "
+  if [ "$VMM" = firecracker ]; then
+    # shellcheck disable=SC2016 # the guest expands $d and $k
+    cmd="$cmd"'d=/sys/fs/cgroup/moca-kill-probe; if mkdir "$d" 2>/dev/null; then k=no-kill; test -e "$d/cgroup.kill" && k=kill-ok; rmdir "$d" 2>/dev/null || k=probe-left; echo "$k"; else echo no-mkdir; fi; '
+    cmd="$cmd""grep -E '^sbxp|^[^:]*:[^:]*:0*($uids):' /etc/passwd | LC_ALL=C sort | tr '\n' ' '; echo; "
+    cmd="$cmd""grep -E '^sbx-ws:|^[^:]*:[^:]*:0*7000:' /etc/group | tr '\n' ' '; echo; "
+    suid_line=7
+  fi
   cmd="$cmd"'find / -xdev -type f -perm /6000 2>/dev/null | head -1'
   out="$("$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 60 -command "$cmd" \
     2>"$err")" && rc=0 || rc=$?
@@ -1279,10 +1290,7 @@ check_lease_support() {
   cg="$(printf '%s\n' "$out" | sed -n 1p)"
   userns="$(printf '%s\n' "$out" | sed -n 2p)"
   sbx="$(printf '%s\n' "$out" | sed -n 3p)"
-  kill="$(printf '%s\n' "$out" | sed -n 4p)"
-  tracked="$(printf '%s\n' "$out" | sed -n 5p | sed 's/ *$//')"
-  grp="$(printf '%s\n' "$out" | sed -n 6p | sed 's/ *$//')"
-  suid="$(printf '%s\n' "$out" | sed -n 7p)"
+  suid="$(printf '%s\n' "$out" | sed -n "${suid_line}p")"
   if [ "$cg" != cg2 ]; then
     echo "build-snapshot.sh: lease-v1: cgroup2 is not mounted at /sys/fs/cgroup in the guest (the init must mount it, and the guest kernel needs cgroup v2)" >&2
     exit 1
@@ -1295,17 +1303,22 @@ check_lease_support() {
     echo "build-snapshot.sh: lease-v1: the guest /etc/passwd has no 'sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' line (got '$sbx')" >&2
     exit 1
   fi
-  if [ "$kill" != kill-ok ]; then
-    echo "build-snapshot.sh: lease-v1: a child cgroup of /sys/fs/cgroup in the guest has no cgroup.kill (got '$kill'; no-mkdir: the probe cgroup could not be made, probe-left: it could not be removed; process_stop and every lease teardown kill a cgroup through it, and the guest kernel needs 5.14 or later)" >&2
-    exit 1
-  fi
-  if [ "$tracked" != "$want_tracked" ]; then
-    echo "build-snapshot.sh: lease-processes-v1: the guest /etc/passwd's tracked-process entries (names sbxp*, uids $uids) are not exactly '$want_tracked' (got '$tracked')" >&2
-    exit 1
-  fi
-  if [ "$grp" != 'sbx-ws:x:7000:' ]; then
-    echo "build-snapshot.sh: lease-v1: the guest /etc/group's sbx-ws and gid-7000 entries are not exactly 'sbx-ws:x:7000:' (got '$grp')" >&2
-    exit 1
+  if [ "$VMM" = firecracker ]; then
+    kill="$(printf '%s\n' "$out" | sed -n 4p)"
+    tracked="$(printf '%s\n' "$out" | sed -n 5p | sed 's/ *$//')"
+    grp="$(printf '%s\n' "$out" | sed -n 6p | sed 's/ *$//')"
+    if [ "$kill" != kill-ok ]; then
+      echo "build-snapshot.sh: lease-processes-v1: a child cgroup of /sys/fs/cgroup in the guest has no cgroup.kill (got '$kill'; no-mkdir: the probe cgroup could not be made, probe-left: it could not be removed; process_stop and every lease teardown kill a cgroup through it, and the guest kernel needs 5.14 or later)" >&2
+      exit 1
+    fi
+    if [ "$tracked" != "$want_tracked" ]; then
+      echo "build-snapshot.sh: lease-processes-v1: the guest /etc/passwd's tracked-process entries (names sbxp*, uids $uids) are not exactly '$want_tracked' (got '$tracked')" >&2
+      exit 1
+    fi
+    if [ "$grp" != 'sbx-ws:x:7000:' ]; then
+      echo "build-snapshot.sh: lease-processes-v1: the guest /etc/group's sbx-ws and gid-7000 entries are not exactly 'sbx-ws:x:7000:' (got '$grp')" >&2
+      exit 1
+    fi
   fi
   if [ -n "$suid" ]; then
     echo "build-snapshot.sh: lease-v1: the guest rootfs still has a setuid/setgid file: $suid" >&2
@@ -2279,8 +2292,8 @@ write_manifest() {
   # lease-v1 and lease-processes-v1 on the Firecracker arm only: Cloud Hypervisor's Run
   # mounts the virtiofs workspace inside every command (chvWrapCommand), which a lease
   # Exec, uid 7000 with no capabilities, cannot do, and a tracked process needs a lease.
-  # check_lease_support has proved both in the guest (it exits otherwise). balloon-fpr-v1 likewise: only boot_quiesce_snapshot_
-  # firecracker configures the reporting balloon.
+  # check_lease_support has proved both in the guest (it exits otherwise). balloon-fpr-v1
+  # likewise: only boot_quiesce_snapshot_firecracker configures the reporting balloon.
   features_json=""
   if [ "$VMM" = firecracker ]; then
     features_json='"lease-v1", "lease-processes-v1", "balloon-fpr-v1"'

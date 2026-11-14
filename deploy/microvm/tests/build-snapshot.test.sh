@@ -2074,9 +2074,9 @@ check "write_manifest advertises lease-v1 on the Firecracker arm only" \
 
 # add_sbx_identity, run for real against fake trees.
 LT="$(mktemp -d "${TMPDIR:-/tmp}/bs-lease-test.XXXXXX")"
-id_harness() { # $1 = work dir; the tree's etc/passwd and etc/group are already there
+id_harness() { # $1 = work dir (its tree's etc/passwd and etc/group already there), $2 = VMM
   {
-    echo "STAGE='$1/stage'"
+    echo "STAGE='$1/stage'; VMM='${2:-firecracker}'"
     fn_body tree_dir_target
     fn_body tree_write_target
     fn_body sbx_tracked_passwd
@@ -2118,6 +2118,20 @@ check "tracked uid written as 020001: refused (uids compare as numbers)" \
   "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
 w="$LT/tnear"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nnear:x:20004:100::/home/n:/bin/sh\n' $'root:x:0:\n'
 check "uid 20004, just past the range: accepted" "$(id_harness "$w")" "0"
+w="$LT/tgid0"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\n' $'root:x:0:\nstaff7:x:07000:\n'
+check "gid 7000 written as 07000 under another name: refused (gids compare as numbers)" \
+  "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+# Level 2 is Firecracker-only (ruling P5-R15): a Cloud Hypervisor build adds no tracked
+# identity and refuses nothing over the tracked range, exactly as before.
+w="$LT/chv-tuid"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nbuilder:x:20000:100::/home/b:/bin/sh\n' $'root:x:0:\n'
+check "cloud-hypervisor: an image holding uid 20000 builds" "$(id_harness "$w" cloud-hypervisor)" "0"
+check "cloud-hypervisor: no sbxp lines are added" "$(grep -c '^sbxp' "$w/stage/rootfs-tree/etc/passwd")" "0"
+check "cloud-hypervisor: the sbx line is still added" \
+  "$(grep -cFx 'sbx:x:7000:7000::/tmp/sbx-home:/bin/bash' "$w/stage/rootfs-tree/etc/passwd")" "1"
+check "cloud-hypervisor: the image's uid-20000 account is untouched" \
+  "$(grep -cFx 'builder:x:20000:100::/home/b:/bin/sh' "$w/stage/rootfs-tree/etc/passwd")" "1"
+w="$LT/fc-tuid"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nbuilder:x:20000:100::/home/b:/bin/sh\n' $'root:x:0:\n'
+check "firecracker: the same image is refused" "$([ "$(id_harness "$w" firecracker)" != 0 ] && echo yes || echo no)" "yes"
 w="$LT/uid"; id_tree "$w" $'root:x:0:0:root:/root:/bin/bash\nother:x:7000:100::/home/o:/bin/sh\n' $'root:x:0:\n'
 check "uid 7000 under another name: refused" "$([ "$(id_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
 check "uid 7000 under another name: the message names it" "$(grep -cF 'other:x:7000:100' "$w/out")" "1"
@@ -2167,12 +2181,12 @@ check "etc/gitconfig linked out of the tree: refused" "$([ "$(gc_harness "$w")" 
 check "etc/gitconfig linked out of the tree: the file outside is untouched" "$(cat "$w/outside")" "OUTSIDE"
 
 # check_lease_support, run against a stub guest_client printing each possible answer.
-ls_harness() { # $1 = work dir, $2 = what the guest prints
+ls_harness() { # $1 = work dir, $2 = what the guest prints, $3 = VMM (default firecracker)
   mkdir -p "$1/stage"
   printf '#!/bin/sh\nprintf "%%s" "%s"\n' "$2" >"$1/stage/guest_client"
   chmod 0755 "$1/stage/guest_client"
   {
-    echo "STAGE='$1/stage'"
+    echo "STAGE='$1/stage'; VMM='${3:-firecracker}'"
     fn_body sbx_tracked_passwd
     fn_body check_lease_support
     echo 'check_lease_support /uds'
@@ -2266,6 +2280,72 @@ $grp_line
 /usr/bin/su
 ")" != 0 ] && echo yes || echo no)" "yes"
 check "lease support: the setuid binary is named" "$(grep -c '/usr/bin/su' "$LT/suid/out")" "1"
+# Cloud Hypervisor (ruling P5-R15): the four answers of before, no cgroup.kill or tracked probe.
+check "lease support, cloud-hypervisor: cg2, userns-ok, sbx, empty passes (no cgroup.kill asked)" \
+  "$(ls_harness "$LT/chv-ok" "cg2
+userns-ok
+$sbx_pw
+" cloud-hypervisor)" "0"
+check "lease support, cloud-hypervisor: a setuid binary on line 4 still fails" "$([ "$(ls_harness "$LT/chv-suid" "cg2
+userns-ok
+$sbx_pw
+/usr/bin/su
+" cloud-hypervisor)" != 0 ] && echo yes || echo no)" "yes"
+check "lease support, cloud-hypervisor: the setuid binary is named" "$(grep -c '/usr/bin/su' "$LT/chv-suid/out")" "1"
+
+# The REAL guest command, run by /bin/sh against a fake guest tree: the stub rewrites the
+# guest's absolute paths into it, and emulates cgroupfs (a new child cgroup has cgroup.kill).
+rc_harness() { # $1 = work dir (its root/etc/passwd and root/etc/group already there), $2 = VMM
+  mkdir -p "$1/stage" "$1/cg"
+  : >"$1/cg/cgroup.controllers"
+  {
+    echo '#!/usr/bin/env bash'
+    echo "T='$1'"
+    cat <<'STUB'
+while [ $# -gt 0 ]; do [ "$1" = -command ] && c="$2"; shift; done
+printf '%s\n' "$c" >"$T/cmd"
+c="$(printf '%s' "$c" | sed -e "s|/etc/|$T/root/etc/|g" -e "s|/sys/fs/cgroup|$T/cg|g" \
+  -e "s|find / |find $T/root |" -e 's|test -w /proc/sys/user/max_user_namespaces|true|' \
+  -e 's|test -e "$d/cgroup.kill"|test -d "$d"|')"
+exec /bin/sh -c "$c"
+STUB
+  } >"$1/stage/guest_client"
+  chmod 0755 "$1/stage/guest_client"
+  {
+    echo "STAGE='$1/stage'; VMM='${2:-firecracker}'"
+    fn_body sbx_tracked_passwd
+    fn_body check_lease_support
+    echo 'check_lease_support /uds'
+  } >"$1/run.sh"
+  bash "$1/run.sh" >"$1/out" 2>&1
+  echo $?
+}
+rc_tree() { # $1 = work dir, $2 = extra passwd lines, $3 = the tracked lines, $4 = group body
+  mkdir -p "$1/root/etc"
+  printf 'root:x:0:0:root:/root:/bin/bash\n%s%s\n%s\n' "$2" "$sbx_pw" "$3" >"$1/root/etc/passwd"
+  printf '%s' "$4" >"$1/root/etc/group"
+}
+w="$LT/rc-ok"; rc_tree "$w" '' "$tracked_pw" $'root:x:0:\nsbx-ws:x:7000:\n'
+check "real guest command: a correct image passes" "$(rc_harness "$w")" "0"
+check "real guest command: the probe cgroup is removed" "$(find "$w/cg" -mindepth 1 -type d | wc -l | tr -d ' ')" "0"
+w="$LT/rc-rev"; rc_tree "$w" '' "$(printf '%s\n' "$tracked_pw" | tail -r 2>/dev/null || printf '%s\n' "$tracked_pw" | tac)" \
+  $'root:x:0:\nsbx-ws:x:7000:\n'
+check "real guest command: the fake tree holds the tracked lines out of order" \
+  "$(grep '^sbxp' "$w/root/etc/passwd" | head -1 | cut -d: -f1)" "sbxp3"
+check "real guest command: the exact tracked lines out of order pass" "$(rc_harness "$w")" "0"
+w="$LT/rc-uid0"; rc_tree "$w" $'zero:x:020001:100::/home/z:/bin/sh\n' "$tracked_pw" $'root:x:0:\nsbx-ws:x:7000:\n'
+check "real guest command: uid 020001 held by another account fails" "$([ "$(rc_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "real guest command: the uid 020001 account is named" "$(grep -c 'zero:x:020001' "$w/out")" "1"
+w="$LT/rc-gid0"; rc_tree "$w" '' "$tracked_pw" $'root:x:0:\nsbx-ws:x:7000:\nstaff7:x:07000:\n'
+check "real guest command: gid 07000 held by another group fails" "$([ "$(rc_harness "$w")" != 0 ] && echo yes || echo no)" "yes"
+check "real guest command: the gid 07000 group is named" "$(grep -c 'staff7:x:07000:' "$w/out")" "1"
+check "real guest command, firecracker: the command probes cgroup.kill and the tracked range" \
+  "$(grep -c 'moca-kill-probe' "$LT/rc-ok/cmd")$(grep -c 'sbxp' "$LT/rc-ok/cmd")" "11"
+w="$LT/rc-chv"; rc_tree "$w" $'builder:x:20000:100::/home/b:/bin/sh\n' '' $'root:x:0:\nsbx-ws:x:7000:\n'
+check "real guest command, cloud-hypervisor: no sbxp lines and uid 20000 taken still pass" \
+  "$(rc_harness "$w" cloud-hypervisor)" "0"
+check "real guest command, cloud-hypervisor: no cgroup.kill, tracked or group probe is sent" \
+  "$(grep -cE 'moca-kill-probe|sbxp|/etc/group' "$w/cmd")" "0"
 mkdir -p "$LT/fail/stage"; printf '#!/bin/sh\necho "guest_client: dial: refused" >&2\nexit 1\n' >"$LT/fail/stage/guest_client"
 chmod 0755 "$LT/fail/stage/guest_client"
 { echo "STAGE='$LT/fail/stage'"; fn_body sbx_tracked_passwd; fn_body check_lease_support; echo 'check_lease_support /uds'; } >"$LT/fail/run.sh"
