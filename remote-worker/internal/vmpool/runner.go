@@ -143,7 +143,10 @@ func specKind(s wexec.Spec) (ExecKind, error) {
 	case wexec.KindProcessStop:
 		return ExecKindProcessStop, nil
 	}
-	detail, _ := wexec.UnknownKind(s.Kind)
+	detail, ok := wexec.UnknownKind(s.Kind)
+	if !ok {
+		detail = fmt.Sprintf("exec kind %q not supported by this runner", s.Kind)
+	}
 	return ExecKindCommand, refusal(RefuseLeaseUnsupported, "%s", detail)
 }
 

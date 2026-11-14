@@ -702,7 +702,8 @@ func TestRunnerRefusesAnUnknownKind(t *testing.T) {
 				n := len(spy.got)
 				spy.mu.Unlock()
 				if n != 0 || lc.createdCount() != 0 || liveLease(p, "k") != nil {
-					t.Fatalf("mode %q: the pool saw %d Execs and restored %d VMs for an unknown kind", mode, n, lc.createdCount())
+					t.Fatalf("mode %q: the pool saw %d Execs, restored %d VMs and holds lease %v for an unknown kind",
+						mode, n, lc.createdCount(), liveLease(p, "k"))
 				}
 			}
 		})
