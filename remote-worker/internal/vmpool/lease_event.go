@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -26,7 +27,8 @@ type LeaseInfo struct {
 	IdleTimeout time.Duration
 	Pending     *LeaseEvent
 	Expiry      *LeaseExpiry // set only when State is LeaseExpiring
-	// Tracked is the live lease's running tracked processes, from its mirror (plan 5),
+	// Tracked is the live lease's full tracked table from its mirror, exited entries with
+	// their state and code included so a client can read why one died (plan 5, P5-R16),
 	// and At is when the status was read: their ages count to it.
 	Tracked []TrackedProcess
 	At      time.Time
@@ -83,7 +85,7 @@ func (p *pool) LeaseStatus(key string) LeaseInfo {
 	if l := rp.lease; !l.started.IsZero() { // zero while startLease installs it
 		now := p.clk.Now()
 		info.Age, info.IdleTimeout = now.Sub(l.started), l.idle
-		info.Tracked, info.At = runningTracked(l.tracked), now
+		info.Tracked, info.At = slices.Clone(l.tracked), now
 		// Computed as well as read: the sweep sets expiring only on its next tick. l.expiring
 		// implies the maximum duration has passed (the sweep and setLeaseLevelLocked set it
 		// from the same comparison), so Since is never in the future.

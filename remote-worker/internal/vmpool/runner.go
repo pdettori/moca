@@ -214,8 +214,8 @@ func leaseEventProto(ev *LeaseEvent) *pb.LeaseEvent {
 	}
 }
 
-// leaseStatusProto is info on the wire: processes is the live lease's running tracked
-// processes, aged at info.At. stopped stays empty here: a set_mode downgrade's stop fills
+// leaseStatusProto is info on the wire: processes is the live lease's full tracked table,
+// exited entries included, aged at info.At. stopped stays empty here: a set_mode downgrade's stop fills
 // it (plan 5, Task 6).
 func leaseStatusProto(info LeaseInfo) *pb.LeaseStatus {
 	st := &pb.LeaseStatus{

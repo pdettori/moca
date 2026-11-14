@@ -715,8 +715,13 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 	// The command was refused as larger than the guest's one request frame: nothing was
 	// sent, so the guest ran nothing and its VM is as fit for the next Exec as before.
 	tooLarge := errors.Is(runErr, ErrCommandTooLarge)
-	// The guest refused a process kind before running anything (guestKeepsLease).
-	refusedMsg, refused := guestKeepsLease(runErr)
+	// The guest refused a process kind before running anything (guestKeepsLease). A
+	// command's guest error never keeps the lease, whatever its prefix.
+	var refusedMsg string
+	var refused bool
+	if e.Kind.isProcess() {
+		refusedMsg, refused = guestKeepsLease(runErr)
+	}
 
 	var reason LeaseEndReason
 	switch {
@@ -903,6 +908,8 @@ func auditTracked(key string, mode Mode, e Exec, prev, next []TrackedProcess) bo
 		}
 		switch {
 		case i == stopped:
+			// Accepted (review minor 3): a guest that answers the stop before the process
+			// dies leaves it running here, and a later End then writes its exit as well.
 			rec("stop", tp, tp.State)
 		case !tp.running() && (!ok || was.running()):
 			rec("exit", tp, tp.State)

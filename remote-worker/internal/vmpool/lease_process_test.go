@@ -379,8 +379,9 @@ func TestWorkerRestartEndListsTrackedProcesses(t *testing.T) {
 	}
 }
 
-// LeaseStatus carries the live lease's running tracked processes, and the proto maps them
-// to LeaseStatus.processes with their age; stopped stays empty (Task 6 fills it).
+// LeaseStatus carries the live lease's full tracked table, exited entries with their state
+// and code included (P5-R16), and the proto maps it to LeaseStatus.processes with their
+// age; stopped stays empty (Task 6 fills it).
 func TestLeaseStatusCarriesTracked(t *testing.T) {
 	p, lc, clk := processPool(t)
 	tab := &fakeTable{}
@@ -395,15 +396,21 @@ func TestLeaseStatusCarriesTracked(t *testing.T) {
 	clk.Advance(5 * time.Second)
 
 	info := p.LeaseStatus("k")
-	if !trackedIDsEqual(info.Tracked, "1") {
-		t.Fatalf("status tracked = %+v, want the running web", info.Tracked)
+	if !trackedIDsEqual(info.Tracked, "1", "2") {
+		t.Fatalf("status tracked = %+v, want the full table: web and the exited build", info.Tracked)
 	}
 	st, err := Runner{Pool: p}.LeaseControl(context.Background(), "k", pb.LeaseOp_LEASE_OP_STATUS, 0, 0)
 	if err != nil {
 		t.Fatalf("LeaseControl status: %v", err)
 	}
-	if len(st.Processes) != 1 || st.Processes[0].Name != "web" || st.Processes[0].Pid != 412 || st.Processes[0].AgeMs != 5000 {
-		t.Fatalf("LeaseStatus.processes = %+v, want web, pid 412, 5 s old", st.Processes)
+	if len(st.Processes) != 2 {
+		t.Fatalf("LeaseStatus.processes = %+v, want web and build", st.Processes)
+	}
+	if web := st.Processes[0]; web.Name != "web" || web.Pid != 412 || web.State != "running" || web.AgeMs != 5000 {
+		t.Fatalf("LeaseStatus.processes[0] = %+v, want web, pid 412, running, 5 s old", web)
+	}
+	if build := st.Processes[1]; build.Name != "build" || build.State != "exited" || build.Code != 2 {
+		t.Fatalf("LeaseStatus.processes[1] = %+v, want build, exited, code 2", build)
 	}
 	if len(st.Stopped) != 0 {
 		t.Fatalf("LeaseStatus.stopped = %+v, want empty", st.Stopped)
@@ -500,6 +507,79 @@ func TestGuestProcessRefusalKeepsTheLease(t *testing.T) {
 	}
 	if ev := p.LeaseStatus("k").Pending; ev == nil || ev.Reason != LeaseEndAgentDead {
 		t.Fatalf("pending = %+v, want agent_dead", ev)
+	}
+}
+
+// Review minor 1: only a process kind's guest refusal keeps the lease. A command whose
+// guest error happens to start with a refusal prefix is a genuine failure: the lease ends
+// agent_dead, as for any other guest error.
+func TestCommandGuestErrorWithARefusalPrefixEndsTheLease(t *testing.T) {
+	p, lc, _ := processPool(t)
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	mustExec(t, p, "k", level2Exec("one", 1))
+	leaseAlive(t, p, "after the first Exec")
+	lc.setRunFn(func(_ *fakeVM, _ Command, _ Sink) (Result, error) {
+		return Result{}, &guestError{msg: "process_not_found: web"}
+	})
+	if _, err := p.Exec(t.Context(), "k", level2Exec("two", 1), &capturingSink{}); !errors.Is(err, ErrGuest) {
+		t.Fatalf("err = %v, want the guest error", err)
+	}
+	if l := liveLease(p, "k"); l != nil {
+		t.Fatal("the lease survived a command's guest error")
+	}
+	if ev := p.LeaseStatus("k").Pending; ev == nil || ev.Reason != LeaseEndAgentDead {
+		t.Fatalf("pending = %+v, want agent_dead", ev)
+	}
+}
+
+// Review minor 2: a process kind served per-exec by a same-epoch downgrade while a lease
+// is live (routeExec's endFirst case, which pins the run). The refusal releases that pin
+// and ends nothing: the lease stays until the downgrade's own SetMode ends it
+// (mode_change) after the Exec in flight.
+func TestProcessKindRefusedOnASameEpochDowngradeWithALiveLease(t *testing.T) {
+	p, lc, _ := processPool(t)
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	entered, release := blockRuns(lc)
+	first := execAsync(p, "k", level2Exec("one", 1))
+	recvWithin(t, entered, "the first Exec's Run")
+	vm := vmID(leaseAlive(t, p, "during the first Exec").vm)
+	setMode := make(chan error, 1)
+	go func() { setMode <- p.SetMode("k", ModePerExec, 1) }() // stored at once, then waits for the gate
+	waitFor(t, func() bool { return pinnedCount(p, "k") == 2 })
+
+	_, err := p.Exec(t.Context(), "k", processExec(ExecKindProcessList, ProcessArgs{}, 1), &capturingSink{})
+	if got := wire(err); !strings.HasPrefix(got, "processes_not_enabled: ") || !strings.Contains(got, "per-exec") {
+		t.Fatalf("err = %q, want processes_not_enabled at per-exec", got)
+	}
+	if n := pinnedCount(p, "k"); n != 2 {
+		t.Fatalf("pins after the refusal = %d, want 2: its own pin released", n)
+	}
+	if got := vmID(leaseAlive(t, p, "after the refusal").vm); got != vm {
+		t.Fatalf("lease VM = %s, want %s: the refusal ended nothing", got, vm)
+	}
+	if ev := p.LeaseStatus("k").Pending; ev != nil && ev.State == leaseEventEnd {
+		t.Fatalf("pending = %+v: the refusal ended the lease", ev)
+	}
+
+	close(release)
+	for _, errc := range []<-chan error{first, setMode} {
+		if err := recvWithin(t, errc, "the first Exec or the SetMode"); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}
+	if n := pinnedCount(p, "k"); n != 0 {
+		t.Fatalf("pins at the end = %d, want 0", n)
+	}
+	if ev := p.LeaseStatus("k").Pending; ev == nil || ev.Reason != LeaseEndModeChange {
+		t.Fatalf("pending = %+v, want the downgrade's mode_change", ev)
+	}
+	for _, c := range lc.commands() {
+		if c.Kind != ExecKindCommand {
+			t.Fatalf("a %s reached the guest", c.Kind)
+		}
+	}
+	if n := lc.count("run "); n != 1 {
+		t.Fatalf("runs = %d, want only the first command", n)
 	}
 }
 

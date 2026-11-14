@@ -242,7 +242,7 @@ message LeaseStatus {
   uint64      age_ms         = 4;
   uint32      idle_timeout_s = 5;
   LeaseEvent  pending        = 6;   // the last undelivered lease event (a start or an end), kept until acknowledged
-  repeated TrackedProcess processes = 7;   // the running tracked processes (plan 5)
+  repeated TrackedProcess processes = 7;   // the full tracked table, exited entries included (plan 5)
   // The processes a set_mode downgrade stopped, reported until acknowledged (plan 5).
   repeated TrackedProcess stopped   = 8;
 }

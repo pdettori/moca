@@ -183,7 +183,8 @@ func trackedFromGuest(ps []ga.TrackedProcess) []TrackedProcess {
 // the next lease Exec as before (Task 3's carry): a process kind the guest refused before
 // running anything -- process_*: (not found, limit, name taken or invalid, cwd, signal),
 // processes_not_enabled:, or lease_unsupported: for a kind it does not serve. Its message
-// is the wire string the client matches on.
+// is the wire string the client matches on. It applies to a process kind only (runLease):
+// a command's guest error is a genuine failure whatever its text.
 func guestKeepsLease(err error) (msg string, ok bool) {
 	var ge *guestError
 	if !errors.As(err, &ge) {

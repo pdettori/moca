@@ -519,7 +519,7 @@ export interface LeaseStatus {
   pending:
     | LeaseEvent
     | undefined;
-  /** the running tracked processes (plan 5) */
+  /** the full tracked table, exited entries included (plan 5) */
   processes: TrackedProcess[];
   /** The processes a set_mode downgrade stopped, reported until acknowledged (plan 5). */
   stopped: TrackedProcess[];

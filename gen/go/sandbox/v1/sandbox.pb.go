@@ -1724,7 +1724,7 @@ type LeaseStatus struct {
 	AgeMs        uint64                 `protobuf:"varint,4,opt,name=age_ms,json=ageMs,proto3" json:"age_ms,omitempty"`
 	IdleTimeoutS uint32                 `protobuf:"varint,5,opt,name=idle_timeout_s,json=idleTimeoutS,proto3" json:"idle_timeout_s,omitempty"`
 	Pending      *LeaseEvent            `protobuf:"bytes,6,opt,name=pending,proto3" json:"pending,omitempty"`     // the last undelivered lease event (a start or an end), kept until acknowledged
-	Processes    []*TrackedProcess      `protobuf:"bytes,7,rep,name=processes,proto3" json:"processes,omitempty"` // the running tracked processes (plan 5)
+	Processes    []*TrackedProcess      `protobuf:"bytes,7,rep,name=processes,proto3" json:"processes,omitempty"` // the full tracked table, exited entries included (plan 5)
 	// The processes a set_mode downgrade stopped, reported until acknowledged (plan 5).
 	Stopped       []*TrackedProcess `protobuf:"bytes,8,rep,name=stopped,proto3" json:"stopped,omitempty"`
 	unknownFields protoimpl.UnknownFields
