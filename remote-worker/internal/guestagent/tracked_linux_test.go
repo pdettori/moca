@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -230,7 +229,10 @@ func TestProcessStartRunsUnderItsOwnUIDAndCgroup(t *testing.T) {
 		t.Errorf("name %q, want probe", p.Name)
 	}
 	logs := waitLog(t, a, p.ID, "ready")
-	home := filepath.Join(trackedHomeParent, "sbx-proc-20000")
+	home := filepath.Join(trackedHomeParent, "20000")
+	if uid, gid, mode := statOwner(t, trackedHomeParent); uid != 0 || gid != 0 || mode&0o7777 != 0o711 {
+		t.Errorf("tracked homes %s: %d:%d %o, want root 0711 (ruling P5-R12)", trackedHomeParent, uid, gid, mode&0o7777)
+	}
 	for _, want := range []string{
 		"uid=20000 gid=7000 groups=7000\n", "home=" + home + " user=sbxp0\n", "umask=0002\n", "stdin=/dev/null\n",
 		fmt.Sprintf("pid=%d sid=%d\n", p.PID, p.PID), "cg=0::/" + filepath.Base(root) + "/tracked/p" + p.ID + "\n", "to-stderr\n",
@@ -536,8 +538,8 @@ func TestProcessStopTermThenKill(t *testing.T) {
 	if final := stopProc(t, a, ProcessArgs{ID: sig.ID, Signal: "INT"}); final.State != TrackedKilled || final.Code != int(syscall.SIGINT) {
 		t.Errorf("signal INT: final state %+v, want killed(2)", final)
 	}
-	if _, _, _, errMsg := drive(t, a, procReq(RequestKindProcessStop, ProcessArgs{ID: sig.ID, Signal: "NOPE"}), nil); !strings.Contains(errMsg, "unknown signal NOPE") {
-		t.Errorf("signal NOPE: %q, want an unknown signal refusal", errMsg)
+	if _, _, _, errMsg := drive(t, a, procReq(RequestKindProcessStop, ProcessArgs{ID: sig.ID, Signal: "NOPE"}), nil); errMsg != "process_signal: unknown signal NOPE" {
+		t.Errorf("signal NOPE: %q, want process_signal: unknown signal NOPE (ruling P5-R13)", errMsg)
 	}
 	if _, _, _, errMsg := drive(t, a, procReq(RequestKindProcessStop, ProcessArgs{Name: "ghost"}), nil); errMsg != "process_not_found: ghost" {
 		t.Errorf("stop ghost: %q, want process_not_found: ghost", errMsg)
@@ -549,17 +551,25 @@ func TestProcessStopTermThenKill(t *testing.T) {
 // them ignored, and a TERM that landed before the shim's exec would be dropped and the
 // stop would wait out the grace and kill. process_start answers only once the command
 // has replaced the shim (its exec barrier), and the shim resets what it inherited.
+//
+// The shim is started through a wrapper that ignores them, as a child of the guest's
+// agent inherits them, rather than by ignoring them in this test binary: signal.Reset
+// does not undo signal.Ignore, so that would leak into every later test.
 func TestProcessStopRightAfterStartDeliversTheSignal(t *testing.T) {
-	a, _ := newLeaseAgent(t)
-	// As cmd/guest-agent, and as TestAgentSurvivesTrapKillPPIDOnExit (Reset does not
-	// undo Ignore, so later tests in this binary run under it too, as in a guest).
-	signal.Ignore(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	t.Cleanup(func() { signal.Reset(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP) })
+	wrapper := filepath.Join(t.TempDir(), "ignoring-shim")
+	// The sleep holds the window open, so a stop 100 ms after a start that did not wait
+	// for the exec always lands in it.
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\ntrap '' TERM INT HUP\nsleep 0.3\nexec "+os.Args[0]+` "$@"`+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := newLeaseAgentWith(t, func(lo *LeaseOptions) { lo.ShimPath = wrapper })
 	orig := trackedStopGrace
 	trackedStopGrace = 3 * time.Second
 	t.Cleanup(func() { trackedStopGrace = orig })
-	for i := range 20 {
+	for i := range 5 {
 		p := startProc(t, a, "", `exec sleep 3100`, 0)
+		// Inside the wrapper's sleep, had process_start not waited for the exec.
+		time.Sleep(100 * time.Millisecond)
 		start := time.Now()
 		final := stopProc(t, a, ProcessArgs{ID: p.ID})
 		if el := time.Since(start); final.State != TrackedKilled || final.Code != int(syscall.SIGTERM) || el > 2*time.Second {
@@ -652,6 +662,13 @@ func TestProcessLogsAndNames(t *testing.T) {
 	}
 	if ps := listProcs(t, a); len(ps) != 1 || ps[0].Name != "p"+p.ID {
 		t.Errorf("process_list %+v, want the unnamed process shown as p%s", ps, p.ID)
+	}
+	// A tail longer than the stream's cap keeps the newest lines, cut at a line start.
+	req := procReq(RequestKindProcessLogs, ProcessArgs{ID: p.ID, Tail: 500})
+	req.CapBytes = 24
+	out, _, end, errMsg := drive(t, a, req, nil)
+	if errMsg != "" || out != "line499\nline500\noops\n" || end.DroppedStdout <= 0 {
+		t.Errorf("logs at a 24-byte cap: %q, dropped %d, err %q; want the newest lines and a drop count", out, end.DroppedStdout, errMsg)
 	}
 	if _, errMsg := procLogs(t, a, ProcessArgs{Name: "nope"}); errMsg != "process_not_found: nope" {
 		t.Errorf("logs of nope: %q", errMsg)
@@ -776,7 +793,7 @@ func TestLeaseUnknownKindIsRefusedNotRun(t *testing.T) {
 func TestProcessStartFailureReleasesItsUID(t *testing.T) {
 	a, root := newLeaseAgentWith(t, func(lo *LeaseOptions) { lo.MaxTrackedUIDs = 1 })
 	good := trackedHomeParent
-	trackedHomeParent = filepath.Join(t.TempDir(), "missing")
+	trackedHomeParent = filepath.Join(t.TempDir(), "no", "such")
 	_, errMsg := tryStartProc(t, a, ProcessArgs{Name: "x"}, `exec sleep 3090`, 0)
 	trackedHomeParent = good
 	if !strings.Contains(errMsg, "home") {
@@ -793,4 +810,40 @@ func TestProcessStartFailureReleasesItsUID(t *testing.T) {
 		t.Fatalf("the start after a failed one runs as %d, want 20000", uid)
 	}
 	stopProc(t, a, ProcessArgs{ID: p.ID})
+}
+
+// Task 3 review I1: the cwd is checked, then the process starts in it. A running tracked
+// process can write the (group-writable) workspace, so it can swap the directory for a
+// symlink in between. The start must then be refused or land inside the workspace,
+// never in the symlink's target: a root chdir there would hand the process a cwd its
+// uid could not reach.
+func TestProcessCwdSwapAfterTheCheckCannotLeaveTheWorkspace(t *testing.T) {
+	a, _ := newLeaseAgent(t)
+	sub := filepath.Join(a.WorkDir(), "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// /root is 0700 root: a cwd the tracked uid can never reach by itself.
+	trackedAfterCwdCheck = func() {
+		if err := os.Rename(sub, sub+".old"); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink("/root", sub); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { trackedAfterCwdCheck = nil })
+	p, errMsg := tryStartProc(t, a, ProcessArgs{Cwd: "sub"}, `pwd -P; ls >/dev/null 2>&1 && echo listed`, 0)
+	if errMsg != "" {
+		if !strings.HasPrefix(errMsg, "process_cwd: ") {
+			t.Fatalf("start after the swap: %q, want a process_cwd: refusal", errMsg)
+		}
+		t.Logf("refused: %s", errMsg)
+		return
+	}
+	waitProcExit(t, a, p.ID)
+	out, _ := procLogs(t, a, ProcessArgs{ID: p.ID})
+	if !strings.HasPrefix(out, a.WorkDir()+"/") {
+		t.Fatalf("the process started in %q, outside the workspace %s", out, a.WorkDir())
+	}
 }

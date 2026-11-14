@@ -651,6 +651,16 @@ func (w *frameWriter) notice(msg string) {
 	_ = WriteFrame(w.rw, KindStderr, []byte(msg))
 }
 
+// dropStdout counts n stdout bytes the agent cut before emitting, as dropped.
+func (w *frameWriter) dropStdout(n int64) {
+	if n <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.droppedStdout += n
+}
+
 func (w *frameWriter) stdoutWriter() io.Writer { return writerFunc(w.stdout) }
 func (w *frameWriter) stderrWriter() io.Writer { return writerFunc(w.stderr) }
 

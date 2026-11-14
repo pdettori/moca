@@ -25,13 +25,27 @@ const ShimArg = "lease-shim"
 // has happened (or that the shim died) from EOF on the read end.
 const ShimExecBarrierFD = 3
 
+// ShimCwdFD is the directory descriptor the shim changes into, after its privilege drop,
+// when its <cwd> argument is ShimCwdFromFD: an O_PATH descriptor the starter opened
+// beneath the workspace (process_start). The change happens as the dropped identity,
+// so no root chdir follows a path anyone else could rewrite. The shim closes it.
+const ShimCwdFD = 4
+
+// The shim's <cwd> argument: stay in the directory the starter gave the shim, or change
+// into ShimCwdFD after the drop.
+const (
+	ShimCwdInherited = "-"
+	ShimCwdFromFD    = "fd"
+)
+
 // ShimMain is the lease shim: it turns the root process it starts as into the
 // unprivileged exec identity, then execs the Exec's argv. In lease mode one VM serves
 // many Execs, so an Exec must not be able to defeat its own teardown (escape its cgroup,
 // trace the agent, regain root through a setuid binary).
 //
-// args are `<uid> <gid> <home> <user> -- <argv...>`; user is the identity's passwd
-// name (sbx for an Exec, sbxp<n> for a tracked process). It never returns: on a setup failure it
+// args are `<uid> <gid> <home> <user> <cwd> -- <argv...>`; user is the identity's
+// passwd name (sbx for an Exec, sbxp<n> for a tracked process), and cwd is
+// ShimCwdInherited or ShimCwdFromFD. It never returns: on a setup failure it
 // writes `guest-agent: lease-shim: <step>: <err>` to stderr and exits 127.
 //
 // The capability bounding set and no_new_privs are per-thread, and so is a seccomp
@@ -86,6 +100,16 @@ func ShimMain(args []string) {
 	}
 	if err := syscall.Setresuid(sa.uid, sa.uid, sa.uid); err != nil {
 		shimFail("setresuid", err)
+	}
+	// After the drop: the kernel checks the directory against the dropped identity,
+	// and the descriptor, not a path, names it.
+	if sa.cwdFromFD {
+		if err := unix.Fchdir(ShimCwdFD); err != nil {
+			shimFail("cwd", err)
+		}
+		if err := unix.Close(ShimCwdFD); err != nil {
+			shimFail("cwd", err)
+		}
 	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		shimFail("no_new_privs", err)
@@ -165,12 +189,13 @@ func shimFail(step string, err error) {
 type shimArgs struct {
 	uid, gid   int
 	home, user string
+	cwdFromFD  bool
 	argv       []string
 }
 
 func parseShimArgs(args []string) (shimArgs, error) {
-	if len(args) < 6 || args[4] != "--" {
-		return shimArgs{}, fmt.Errorf("want <uid> <gid> <home> <user> -- <argv...>, got %q", args)
+	if len(args) < 7 || args[5] != "--" {
+		return shimArgs{}, fmt.Errorf("want <uid> <gid> <home> <user> <cwd> -- <argv...>, got %q", args)
 	}
 	uid, err := strconv.Atoi(args[0])
 	if err != nil || uid <= 0 {
@@ -186,10 +211,13 @@ func parseShimArgs(args []string) (shimArgs, error) {
 	if args[3] == "" {
 		return shimArgs{}, errors.New("user is empty")
 	}
-	if args[5] == "" {
+	if args[4] != ShimCwdInherited && args[4] != ShimCwdFromFD {
+		return shimArgs{}, fmt.Errorf("cwd %q: want %s or %s", args[4], ShimCwdInherited, ShimCwdFromFD)
+	}
+	if args[6] == "" {
 		return shimArgs{}, errors.New("argv[0] is empty")
 	}
-	return shimArgs{uid: uid, gid: gid, home: args[2], user: args[3], argv: args[5:]}, nil
+	return shimArgs{uid: uid, gid: gid, home: args[2], user: args[3], cwdFromFD: args[4] == ShimCwdFromFD, argv: args[6:]}, nil
 }
 
 // shimEnv is env with HOME, USER and LOGNAME replaced by the identity's: home, and

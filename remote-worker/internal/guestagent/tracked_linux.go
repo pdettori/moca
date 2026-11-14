@@ -32,13 +32,21 @@ import (
 // The strict rule is that every process alive in the guest outside an Exec is visible
 // in process_list. A process's children stay in its cgroup when it exits; they are what
 // process_stop of the exited entry kills, and its uid is not reused until they are gone.
+// The entry stays exited meanwhile (ruling P5-R13): its memory_bytes, its cgroup's
+// memory.current, is what shows them.
 // When the table forgets an entry (eviction, or a new process taking an exited one's
 // name), whatever is left in its cgroup is killed.
 
-// trackedHomeParent is where each tracked uid's HOME, sbx-proc-<uid>, is made (the
-// image's passwd lines name /tmp/sbx-proc-<uid>). A package variable so the tests keep
-// their homes off the test host's /tmp.
-var trackedHomeParent = "/tmp"
+// trackedHomeParent holds each tracked uid's HOME, <parent>/<uid> (ruling P5-R12; the
+// image's passwd lines name /tmp/sbx-proc/<uid>). It is root-owned and 0711, made at
+// lease prepare, so no other uid can create, or squat, a tracked HOME. A package
+// variable so the tests keep their homes off the test host's /tmp.
+var trackedHomeParent = "/tmp/sbx-proc"
+
+// trackedAfterCwdCheck, when set, runs between process_start's cwd check and the
+// start: a test seam for a workspace changed in that window, as a running tracked
+// process (in the group-writable workspace) could change it. Nil outside tests.
+var trackedAfterCwdCheck func()
 
 // trackedStopGrace is how long process_stop waits after the signal before it kills the
 // cgroup (global constraints: TERM, then the cgroup is killed after 10 s). A package
@@ -80,6 +88,17 @@ func (a *Agent) processStart(req Request, w *frameWriter, r *reaper, shim string
 	if err != nil {
 		return End{}, err
 	}
+	if trackedAfterCwdCheck != nil {
+		trackedAfterCwdCheck()
+	}
+	// The process changes into this descriptor after its privilege drop (the shim's
+	// ShimCwdFD), never into a path: a running tracked process can rewrite the
+	// group-writable workspace, and a root chdir would follow whatever it put there.
+	cwdDir, err := openCwdBeneath(a.opts.WorkDir, cwd, args.Cwd)
+	if err != nil {
+		return End{}, err
+	}
+	defer cwdDir.Close()
 	if err := a.ensureTrackedRoot(); err != nil {
 		return End{}, err
 	}
@@ -88,7 +107,7 @@ func (a *Agent) processStart(req Request, w *frameWriter, r *reaper, shim string
 		maxRunning = defaultMaxProcesses
 	}
 	p, err := a.lease.procs.start(args.Name, maxRunning, func(id string, log *ring) (int, int, error) {
-		return a.launchTracked(id, log, req.Command, cwd, maxRunning, r, shim)
+		return a.launchTracked(id, log, req.Command, cwdDir, maxRunning, r, shim)
 	})
 	if err != nil {
 		return End{}, err
@@ -107,10 +126,42 @@ func (a *Agent) processStart(req Request, w *frameWriter, r *reaper, shim string
 	return End{}, nil
 }
 
+// openCwdBeneath opens cwd, which resolveProcessCwd has checked, as an O_PATH directory
+// descriptor resolved beneath the workspace: no symlink, no other mount, nothing above
+// it. A directory swapped for a symlink since the check is refused here; once open, the
+// descriptor names the directory itself, which cannot leave the workspace's mount.
+func openCwdBeneath(workDir, cwd, given string) (*os.File, error) {
+	fail := func(err error) (*os.File, error) {
+		return nil, fmt.Errorf("process_cwd: %s: changed while starting: %v", clip(given), err)
+	}
+	root, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		return fail(err)
+	}
+	rel, err := filepath.Rel(root, cwd)
+	if err != nil {
+		return fail(err)
+	}
+	rfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(err)
+	}
+	defer unix.Close(rfd)
+	fd, err := unix.Openat2(rfd, rel, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	return os.NewFile(uintptr(fd), cwd), nil
+}
+
 // launchTracked is trackedTable.start's launch for process id: it takes a uid, makes the
-// process's cgroup and HOME, and forks the shim into the cgroup. On an error nothing is
-// left: the uid is released and the cgroup removed.
-func (a *Agent) launchTracked(id string, log *ring, command, cwd string, maxRunning int, r *reaper, shim string) (int, int, error) {
+// process's cgroup and HOME, and forks the shim into the cgroup, with cwdDir as the
+// directory it changes into after its drop. On an error nothing is left: the uid is
+// released and the cgroup removed.
+func (a *Agent) launchTracked(id string, log *ring, command string, cwdDir *os.File, maxRunning int, r *reaper, shim string) (int, int, error) {
 	l := &a.lease
 	lo := a.opts.Lease
 	uid, err := l.uids.take(l.cgroups.populated)
@@ -157,16 +208,16 @@ func (a *Agent) launchTracked(id string, log *ring, command, cwd string, maxRunn
 	defer barR.Close()
 	l.exits.add(id)
 
-	argv := []string{shim, ShimArg, strconv.Itoa(uid), strconv.Itoa(lo.GID), home, l.uids.user(uid), "--", a.opts.Shell, "-c", command}
+	argv := []string{shim, ShimArg, strconv.Itoa(uid), strconv.Itoa(lo.GID), home, l.uids.user(uid), ShimCwdFromFD, "--", a.opts.Shell, "-c", command}
 	// As runLeaseCommand's fork: the agent's environment, CLONE_INTO_CGROUP so there is
 	// no moment outside the cgroup, and a session of its own. stdout and stderr share
 	// one pipe, so the ring keeps them in the order they were written. The shim's exec
-	// barrier is fd 3.
+	// barrier is fd 3 and its cwd fd 4. No Dir: the agent's root never changes into
+	// the cwd; the shim does, as the tracked uid.
 	r.expect()
 	pid, err := syscall.ForkExec(shim, argv, &syscall.ProcAttr{
-		Dir:   cwd,
 		Env:   os.Environ(),
-		Files: []uintptr{devNull.Fd(), logW.Fd(), logW.Fd(), barW.Fd()},
+		Files: []uintptr{devNull.Fd(), logW.Fd(), logW.Fd(), barW.Fd(), cwdDir.Fd()},
 		Sys:   &syscall.SysProcAttr{Setsid: true, UseCgroupFD: true, CgroupFD: c.fd()},
 	})
 	_ = logW.Close()
@@ -216,15 +267,47 @@ func (a *Agent) onTrackedExit(id string, uid int) func(syscall.WaitStatus) {
 	}
 }
 
-// prepareTrackedHome makes uid's HOME afresh: trackedHomeParent/sbx-proc-<uid>, 0700,
-// owned by uid and gid. Whatever was there is removed first, so nothing an earlier
-// process left (or anything planted in a world-writable parent) carries over. It is
-// made by root and then changed through a descriptor opened without following
+// ensureTrackedHomeParent makes trackedHomeParent, root-owned and 0711 (ruling P5-R12):
+// other uids may pass through it to their own HOME, but not list it or create in it.
+// One that exists must already be a root-owned directory, not a symlink. leasePrepare
+// calls it, and so does each process_start, which fails closed if it has changed.
+func ensureTrackedHomeParent() error {
+	dir := trackedHomeParent
+	fail := func(err error) error {
+		return fmt.Errorf("guest-agent: lease: tracked homes %s: %w", dir, err)
+	}
+	if err := unix.Mkdir(dir, 0o711); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fail(err)
+	}
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fail(err)
+	}
+	if st.Uid != 0 {
+		return fail(fmt.Errorf("owned by uid %d, want root", st.Uid))
+	}
+	if err := unix.Fchmod(fd, 0o711); err != nil {
+		return fail(err)
+	}
+	return nil
+}
+
+// prepareTrackedHome makes uid's HOME afresh: trackedHomeParent/<uid>, 0700, owned by
+// uid and gid. Whatever an earlier process of the uid left there is removed first. It
+// is made by root and then changed through a descriptor opened without following
 // symlinks, so the chown cannot be steered to another path.
 func prepareTrackedHome(uid, gid int) (string, error) {
-	home := filepath.Join(trackedHomeParent, "sbx-proc-"+strconv.Itoa(uid))
+	home := filepath.Join(trackedHomeParent, strconv.Itoa(uid))
 	fail := func(err error) (string, error) {
 		return "", fmt.Errorf("guest-agent: process_start: home %s: %w", home, err)
+	}
+	if err := ensureTrackedHomeParent(); err != nil {
+		return "", err
 	}
 	if err := os.RemoveAll(home); err != nil {
 		return fail(err)
@@ -272,7 +355,11 @@ func (a *Agent) processLogs(req Request, w *frameWriter) (End, error) {
 	if tail <= 0 {
 		tail = 200
 	}
-	emitChunked(w.stdout, e.Log.Tail(tail))
+	// The newest lines win: a tail longer than the stream's cap keeps its end, not its
+	// start, and the cut is counted as dropped.
+	out, dropped := newestWithin(e.Log.Tail(tail), w.cap)
+	w.dropStdout(dropped)
+	emitChunked(w.stdout, out)
 	return End{}, nil
 }
 
@@ -394,7 +481,7 @@ func parseStopSignal(s string) (syscall.Signal, error) {
 			return sig, nil
 		}
 	}
-	return 0, fmt.Errorf("guest-agent: process_stop: unknown signal %s", clip(s))
+	return 0, fmt.Errorf("process_signal: unknown signal %s", clip(s))
 }
 
 // stopCgroups stops every populated cgroup of paths at once: sig to each process in
@@ -438,6 +525,12 @@ func (a *Agent) stopCgroups(paths []string, sig syscall.Signal) error {
 // stops a unit: children and double-forked daemons included, not only the process
 // group. It re-reads cgroup.procs a few times for children forked meanwhile; the kill
 // after the grace covers any it misses.
+//
+// A pid read from cgroup.procs can exit, be reaped and be reused by another process
+// before the kill(2): the same race systemd accepts. A pidfd would close it only for
+// the main process, not for the cgroup's other members, so it is not used. Reuse needs
+// the guest's pid space (pid_max, 4194304 on 64-bit) to wrap inside that window, and
+// the signal is the polite one: the cgroup.kill that follows is race-free.
 func signalCgroup(path string, sig syscall.Signal) {
 	seen := map[int]bool{}
 	for range 10 {

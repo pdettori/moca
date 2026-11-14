@@ -47,7 +47,7 @@ func requireRootCgroupV2(t *testing.T) {
 // package directory need not be traversable by uid 7000.
 func runInShim(t *testing.T, home string, argv ...string) string {
 	t.Helper()
-	args := append([]string{ShimArg, testExecID, testExecID, home, "sbx", "--"}, argv...)
+	args := append([]string{ShimArg, testExecID, testExecID, home, "sbx", "-", "--"}, argv...)
 	cmd := exec.Command(os.Args[0], args...)
 	cmd.Dir = "/"
 	out, err := cmd.CombinedOutput()
@@ -102,7 +102,7 @@ func TestShimDropsToTheExecUserWithNoPrivileges(t *testing.T) {
 // execs the test binary, and root's execve keeps the inheritable set.
 func TestShimClearsAnInheritedCapabilitySet(t *testing.T) {
 	requireRootCgroupV2(t)
-	args := []string{ShimArg, testExecID, testExecID, t.TempDir(), "sbx", "--",
+	args := []string{ShimArg, testExecID, testExecID, t.TempDir(), "sbx", "-", "--",
 		"grep", "-E", "^(CapInh|CapAmb):", "/proc/self/status"}
 	cmd := exec.Command(os.Args[0], args...)
 	cmd.Dir = "/"
@@ -180,7 +180,7 @@ func TestShimResetsTheInheritedOomScoreAdj(t *testing.T) {
 	requireRootCgroupV2(t)
 	cmd := exec.Command("sh", "-c",
 		`echo -1000 > /proc/self/oom_score_adj && echo "pre=$(cat /proc/self/oom_score_adj)" && exec "$0" "$@"`,
-		os.Args[0], ShimArg, testExecID, testExecID, t.TempDir(), "sbx", "--",
+		os.Args[0], ShimArg, testExecID, testExecID, t.TempDir(), "sbx", "-", "--",
 		"sh", "-c", `cat /proc/self/oom_score_adj; { echo -1000 > /proc/self/oom_score_adj; } 2>/dev/null; echo rc=$?`)
 	cmd.Dir = "/"
 	out, err := cmd.CombinedOutput()
@@ -199,7 +199,7 @@ func TestShimResetsTheInheritedOomScoreAdj(t *testing.T) {
 func TestShimResetsInheritedIgnoredSignals(t *testing.T) {
 	requireRootCgroupV2(t)
 	cmd := exec.Command("sh", "-c", `trap '' HUP INT TERM PIPE USR1; exec "$0" "$@"`,
-		os.Args[0], ShimArg, testExecID, testExecID, t.TempDir(), "sbx", "--",
+		os.Args[0], ShimArg, testExecID, testExecID, t.TempDir(), "sbx", "-", "--",
 		"grep", "-E", "^Sig(Ign|Blk):", "/proc/self/status")
 	cmd.Dir = "/"
 	out, err := cmd.CombinedOutput()
@@ -283,27 +283,32 @@ func TestShimArgsRejectAnEmptyHomeOrCommand(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"empty home", []string{"7000", "7000", "", "sbx", "--", "true"}},
-		{"empty user", []string{"7000", "7000", "/tmp/sbx-home", "", "--", "true"}},
-		{"no user", []string{"7000", "7000", "/tmp/sbx-home", "--", "true"}},
-		{"empty argv[0]", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "--", ""}},
-		{"no argv", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "--"}},
-		{"root uid", []string{"0", "7000", "/tmp/sbx-home", "sbx", "--", "true"}},
-		{"no separator", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "true", "x"}},
+		{"empty home", []string{"7000", "7000", "", "sbx", "-", "--", "true"}},
+		{"empty user", []string{"7000", "7000", "/tmp/sbx-home", "", "-", "--", "true"}},
+		{"no user", []string{"7000", "7000", "/tmp/sbx-home", "-", "--", "true"}},
+		{"no cwd", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "--", "true"}},
+		{"bad cwd", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "/etc", "--", "true"}},
+		{"empty argv[0]", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "-", "--", ""}},
+		{"no argv", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "-", "--"}},
+		{"root uid", []string{"0", "7000", "/tmp/sbx-home", "sbx", "-", "--", "true"}},
+		{"no separator", []string{"7000", "7000", "/tmp/sbx-home", "sbx", "-", "true", "x"}},
 	} {
 		if _, err := parseShimArgs(tc.args); err == nil {
 			t.Errorf("%s: parseShimArgs(%q) accepted it", tc.name, tc.args)
 		}
 	}
-	got, err := parseShimArgs([]string{"20001", "7000", "/tmp/sbx-proc-20001", "sbxp1", "--", "true", "x"})
+	got, err := parseShimArgs([]string{"20001", "7000", "/tmp/sbx-proc/20001", "sbxp1", "fd", "--", "true", "x"})
 	if err != nil {
 		t.Errorf("valid args rejected: %v", err)
 	}
-	if got.uid != 20001 || got.gid != 7000 || got.home != "/tmp/sbx-proc-20001" || got.user != "sbxp1" || !slices.Equal(got.argv, []string{"true", "x"}) {
+	if got.uid != 20001 || got.gid != 7000 || got.home != "/tmp/sbx-proc/20001" || got.user != "sbxp1" || !got.cwdFromFD || !slices.Equal(got.argv, []string{"true", "x"}) {
 		t.Errorf("parseShimArgs = %+v", got)
 	}
+	if got, err := parseShimArgs([]string{"7000", "7000", "/tmp/sbx-home", "sbx", "-", "--", "true"}); err != nil || got.cwdFromFD {
+		t.Errorf("cwd -: %+v, %v; want the inherited cwd", got, err)
+	}
 	// The same check must be what the shim process does: step "args", exit 127.
-	cmd := exec.Command(os.Args[0], ShimArg, "7000", "7000", "", "sbx", "--", "true")
+	cmd := exec.Command(os.Args[0], ShimArg, "7000", "7000", "", "sbx", "-", "--", "true")
 	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) || ee.ExitCode() != 127 || !strings.Contains(string(out), "guest-agent: lease-shim: args: ") {
@@ -435,7 +440,7 @@ func newLeaseAgentWith(t *testing.T, opt func(*LeaseOptions)) (*Agent, string) {
 		t.Fatal(err)
 	}
 	origHomes := trackedHomeParent
-	trackedHomeParent = trackedHomes
+	trackedHomeParent = filepath.Join(trackedHomes, "sbx-proc") // leasePrepare makes it
 	t.Cleanup(func() { trackedHomeParent = origHomes })
 	id, _ := strconv.Atoi(testExecID)
 	lo := LeaseOptions{CgroupRoot: root, UID: id, GID: id, Home: filepath.Join(homeParent, "home"), ShimPath: os.Args[0]}

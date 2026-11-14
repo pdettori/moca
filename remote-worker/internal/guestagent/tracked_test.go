@@ -846,3 +846,54 @@ func TestTrackedCgroupsAndExitSignalsUnderRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestNewestWithinKeepsTheNewestLines(t *testing.T) {
+	b := []byte("one\ntwo\nthree\n")
+	for _, tc := range []struct {
+		max     int64
+		want    string
+		dropped int64
+	}{
+		{100, "one\ntwo\nthree\n", 0},
+		{int64(len(b)), "one\ntwo\nthree\n", 0},
+		{10, "two\nthree\n", 4}, // the cut is a line start: nothing more goes
+		{8, "three\n", 8},       // "o\nthree\n": moved on to the line start
+		{6, "three\n", 8},       // exactly the last line
+		{4, "ree\n", 10},        // a line longer than the cap: its raw end
+	} {
+		got, dropped := newestWithin(b, tc.max)
+		if string(got) != tc.want || dropped != tc.dropped {
+			t.Errorf("newestWithin(%d) = %q, %d; want %q, %d", tc.max, got, dropped, tc.want, tc.dropped)
+		}
+	}
+}
+
+// Task 3 review minor 2: a cwd error names the cwd clipped, and never the whole path
+// again through the underlying error, so the frame stays small whatever was sent.
+func TestResolveProcessCwdErrorsAreBounded(t *testing.T) {
+	work := t.TempDir()
+	long := strings.Repeat("d", 200) + "/" + strings.Repeat("e", 200)
+	if err := os.MkdirAll(filepath.Join(work, long), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, long, "f"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, cwd := range []string{long + "/f/x", long + "/nope", strings.Repeat("x/", MaxFrame/2)} {
+		_, err := resolveProcessCwd(work, cwd)
+		if err == nil || !strings.HasPrefix(err.Error(), "process_cwd: ") || len(err.Error()) > 200 {
+			t.Errorf("cwd of %d bytes: %d-byte error %.120q; want a process_cwd: refusal under 200 bytes", len(cwd), len(err.Error()), err)
+		}
+	}
+}
+
+func TestFrameWriterDropStdoutCountsTheCut(t *testing.T) {
+	var buf bytes.Buffer
+	w := &frameWriter{rw: &buf, cap: 1 << 20}
+	w.dropStdout(5)
+	w.dropStdout(0)
+	w.dropStdout(-3)
+	if w.droppedStdout != 5 {
+		t.Fatalf("droppedStdout = %d, want 5", w.droppedStdout)
+	}
+}

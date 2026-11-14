@@ -64,6 +64,9 @@ func (a *Agent) leasePrepare() error {
 		return fmt.Errorf("guest-agent: lease: tracked uids %d from %d: want a non-root range without the exec uid %d", lo.MaxTrackedUIDs, lo.TrackedUIDBase, lo.UID)
 	}
 	a.lease.uids = newUIDAllocator(lo.TrackedUIDBase, lo.MaxTrackedUIDs)
+	if err := ensureTrackedHomeParent(); err != nil {
+		return err
+	}
 	if err := os.Mkdir(lo.CgroupRoot, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("guest-agent: lease: cgroup root: %w", err)
 	}
@@ -313,7 +316,8 @@ func (a *Agent) runLeaseCommand(req Request, stdin []byte, w *frameWriter, conn 
 	}
 	stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW := pipes[0], pipes[1], pipes[2], pipes[3], pipes[4], pipes[5]
 
-	argv := []string{shim, ShimArg, strconv.Itoa(lo.UID), strconv.Itoa(lo.GID), lo.Home, leaseExecUser, "--", a.opts.Shell, "-c", req.Command}
+	// The cwd is the workspace's mount point, ForkExec's Dir: a path no Exec can rewrite.
+	argv := []string{shim, ShimArg, strconv.Itoa(lo.UID), strconv.Itoa(lo.GID), lo.Home, leaseExecUser, ShimCwdInherited, "--", a.opts.Shell, "-c", req.Command}
 	// Inherits the agent's environment on purpose; see forkShell for why R6's filter is
 	// absent here. CgroupFD places the child in its cgroup at clone time
 	// (CLONE_INTO_CGROUP), so there is no window in which it runs outside it.

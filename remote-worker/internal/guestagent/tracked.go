@@ -449,19 +449,46 @@ func resolveProcessCwd(workDir, cwd string) (string, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return "", fmt.Errorf("process_cwd: %s: no such directory", clip(cwd))
 		}
-		return "", fmt.Errorf("process_cwd: %s: %v", clip(cwd), err)
+		return "", fmt.Errorf("process_cwd: %s: %v", clip(cwd), pathErrCause(err))
 	}
 	if real != root && !strings.HasPrefix(real, root+string(filepath.Separator)) {
 		return "", fmt.Errorf("process_cwd: %s: outside the workspace", clip(cwd))
 	}
 	fi, err := os.Stat(real)
 	if err != nil {
-		return "", fmt.Errorf("process_cwd: %s: %v", clip(cwd), err)
+		return "", fmt.Errorf("process_cwd: %s: %v", clip(cwd), pathErrCause(err))
 	}
 	if !fi.IsDir() {
 		return "", fmt.Errorf("process_cwd: %s: not a directory", clip(cwd))
 	}
 	return real, nil
+}
+
+// pathErrCause is err without the path a *fs.PathError carries, which may be as long as
+// the request allowed: the caller names the path, clipped, itself.
+func pathErrCause(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
+}
+
+// newestWithin keeps the newest bytes of b that fit in max and returns them with the
+// count of bytes cut. A cut inside a line moves on to the next line start, when there is
+// one; a b that fits is returned whole.
+func newestWithin(b []byte, max int64) ([]byte, int64) {
+	if max <= 0 || int64(len(b)) <= max {
+		return b, 0
+	}
+	cut := int64(len(b)) - max
+	keep := b[cut:]
+	if b[cut-1] != '\n' {
+		if i := bytes.IndexByte(keep, '\n'); i >= 0 && i+1 < len(keep) {
+			keep = keep[i+1:]
+		}
+	}
+	return keep, int64(len(b) - len(keep))
 }
 
 // cgroupPopulated reads a cgroup's cgroup.events. A cgroup that no longer exists is
