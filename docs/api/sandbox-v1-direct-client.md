@@ -310,23 +310,28 @@ carries the same rows on the lease messages:
 **The refusals.** The relay's are a gRPC status; the worker's and the guest's arrive as an
 `error` event's message, as a lease error does. Nothing ran, and none of them ends the lease:
 
-| Answer                                                                                                      | Means                                                                                                                                |
-| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `FAILED_PRECONDITION` `processes_not_enabled: <detail>` from the relay, or the same `error` from the worker | the sandbox's mode is below `lease+processes`. Your token may predate an upgrade: mint a fresh one and retry once, as `mocactl` does |
-| `INVALID_ARGUMENT` `unknown exec kind <n>`                                                                  | the relay does not know the kind                                                                                                     |
-| `lease_unsupported: <detail>`                                                                               | the worker has no level 2: a container worker, a snapshot without `lease-processes-v1`, or a kind it does not know                   |
-| `process_not_found: <id or name>`                                                                           | no process by that id or name                                                                                                        |
-| `process_limit: <n> running (SH_LEASE_MAX_PROCESSES)`                                                       | the running cap is reached                                                                                                           |
-| `process_name_taken: <name>`                                                                                | a running process has that name                                                                                                      |
-| `process_name_invalid: <detail>`                                                                            | the name breaks the rule above                                                                                                       |
-| `process_cwd: <detail>`                                                                                     | the `cwd` is not a directory inside `/workspace`                                                                                     |
-| `process_signal: unknown signal <s>`                                                                        | `signal` is not a signal name (with or without `SIG`) or number                                                                      |
+| Answer                                                                                                             | Means                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `FAILED_PRECONDITION` `processes_not_enabled: <detail>` from the relay, or the same `error` from the worker        | the sandbox's mode is below `lease+processes`. Your token may predate an upgrade: mint a fresh one and retry once, as `mocactl` does |
+| `INVALID_ARGUMENT` `unknown exec kind <n>`                                                                         | the relay does not know the kind                                                                                                     |
+| `lease_unsupported: <detail>`                                                                                      | the worker has no level 2: a container worker, a snapshot without `lease-processes-v1`, or a kind it does not know                   |
+| `FAILED_PRECONDITION` `lease_unsupported: this sandbox's worker does not support tracked processes` from the relay | the worker does not advertise `sbx:lease-processes-v1` (below): nothing reached it                                                   |
+| `process_not_found: <id or name>`                                                                                  | no process by that id or name                                                                                                        |
+| `process_limit: <n> running (SH_LEASE_MAX_PROCESSES)`                                                              | the running cap is reached                                                                                                           |
+| `process_name_taken: <name>`                                                                                       | a running process has that name                                                                                                      |
+| `process_name_invalid: <detail>`                                                                                   | the name breaks the rule above                                                                                                       |
+| `process_cwd: <detail>`                                                                                            | the `cwd` is not a directory inside `/workspace`                                                                                     |
+| `process_signal: unknown signal <s>`                                                                               | `signal` is not a signal name (with or without `SIG`) or number                                                                      |
 
-Level 2 is off by default: only a deployment that allows `lease+processes` issues a token whose
-mode claim is `lease+processes`. A relay or worker that predates level 2 does not know
-`Exec.kind` and drops it, so it would run a `process_start`'s command as a plain command, which
-dies with its Exec. That is why a deployment allows level 2 only once its relay and every worker
-run the level-2 code ([the security review](../sbx/security-review.md) §7.5).
+**Mixed versions: a process kind is refused, never run as a command.** A worker that serves the
+process kinds says so in its Hello, with the capability `sbx:lease-processes-v1`: a microVM worker
+whose snapshot advertises `lease-processes-v1`. The relay forwards a process kind only to a worker
+that advertises it, and refuses it otherwise with `FAILED_PRECONDITION`
+`lease_unsupported: this sandbox's worker does not support tracked processes`, before anything
+reaches the worker. That covers a worker from before level 2, which does not know `Exec.kind` and
+would run a `process_start`'s command as a plain command. Nothing ran; retrying does not help until
+the operator upgrades the worker. Level 2 is off by default: only a deployment that allows
+`lease+processes` issues a token whose mode claim is `lease+processes`.
 
 ## Limits
 

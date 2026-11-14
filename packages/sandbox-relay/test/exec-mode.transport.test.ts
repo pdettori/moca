@@ -1,8 +1,9 @@
 import { status } from '@grpc/grpc-js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ExecKind, ProcessArgs, SandboxMode } from '@moca/k8s-sandbox';
 import { SANDBOX_TOKEN_TYP, type SandboxTokenClaims } from '@moca/control-plane';
 import { claimsToExecMode } from '../src/sandbox-caller.js';
+import { LEASE_PROCESSES_CAPABILITY, WORKER_WITHOUT_PROCESSES } from '../src/relay.js';
 import {
   HARNESS,
   K,
@@ -170,13 +171,19 @@ describe('Exec kinds (plan 5, level 2)', () => {
     kind: e.kind,
     process: e.process,
   });
+  /** A worker that serves the process kinds: it advertises the capability (P5-R37). */
+  const procWorker = (addr: string, mode: 'auto' | 'hold' = 'auto') =>
+    worker(addr, 'sbx_default', mode, 0, undefined, undefined, undefined, [
+      'bash',
+      LEASE_PROCESSES_CAPABILITY,
+    ]);
   type ExecLine = { audit: string; kind?: string; process?: string; cmd?: string };
   const execLines = (lines: string[]) =>
     lines.map((l) => JSON.parse(l) as ExecLine).filter((l) => l.audit === 'sandbox_exec');
 
   it('kind and process pass through on the sandbox path', async () => {
     const r = await relay();
-    const w = await worker(r.attach, 'sbx_default');
+    const w = await procWorker(r.attach);
     const started = await exec(r.exec, {
       token: PROCESSES,
       reqId: 1,
@@ -241,10 +248,63 @@ describe('Exec kinds (plan 5, level 2)', () => {
 
   it('lease+processes allows process_start', async () => {
     const r = await relay();
-    const w = await worker(r.attach, 'sbx_default');
+    const w = await procWorker(r.attach);
     const res = await exec(r.exec, { token: PROCESSES, reqId: 4, fields: START }).done;
     expect(res.code).toBe(status.OK);
     expect(w.execs).toHaveLength(1);
+  });
+
+  // P5-R37: a worker that does not advertise the capability (one from before plan 5 would
+  // decode the kind as an unknown field and run a process_start's command as a plain Exec, the
+  // container tier refuses it anyway) gets no process kind at all: the relay refuses it first.
+  it('a worker without the capability: every process kind is refused lease_unsupported, a command still runs', async () => {
+    const r = await relay();
+    const w = await worker(r.attach, 'sbx_default', 'auto', 0, undefined, undefined, undefined, [
+      'bash',
+    ]);
+    for (const kind of [
+      ExecKind.EXEC_KIND_PROCESS_START,
+      ExecKind.EXEC_KIND_PROCESS_LIST,
+      ExecKind.EXEC_KIND_PROCESS_LOGS,
+      ExecKind.EXEC_KIND_PROCESS_STOP,
+    ]) {
+      const res = await exec(r.exec, {
+        token: PROCESSES,
+        command: 'npm run dev',
+        fields: { ...START, kind },
+      }).done;
+      expect(res.code).toBe(status.FAILED_PRECONDITION);
+      expect(res.details).toBe(
+        "lease_unsupported: this sandbox's worker does not support tracked processes",
+      );
+    }
+    expect(w.execs).toEqual([]);
+    expect(execLines(r.lines).map((l) => [l.kind, (l as { outcome?: string }).outcome])).toEqual([
+      ['process_start', 'refused'],
+      ['process_list', 'refused'],
+      ['process_logs', 'refused'],
+      ['process_stop', 'refused'],
+    ]);
+    expect(reasons(r.lines).map((l) => l.reason)).toEqual(Array(4).fill(WORKER_WITHOUT_PROCESSES));
+    // A command is unaffected, on the same token and worker.
+    expect((await exec(r.exec, { token: PROCESSES, reqId: 7 }).done).code).toBe(status.OK);
+    expect(w.execs.map(kindOf)).toEqual([{ kind: ExecKind.EXEC_KIND_COMMAND, process: undefined }]);
+  });
+
+  it('the capability refusal takes no slot: it comes before the in-flight cap', async () => {
+    const r = await relay();
+    const w = await worker(r.attach, 'sbx_default', 'hold');
+    // Fill the sandbox's in-flight cap (2) with commands the worker never answers.
+    const held = [
+      exec(r.exec, { token: PROCESSES, reqId: 11 }),
+      exec(r.exec, { token: PROCESSES, reqId: 12 }),
+    ];
+    await vi.waitFor(() => expect(w.execs).toHaveLength(2));
+    const res = await exec(r.exec, { token: PROCESSES, reqId: 13, fields: START }).done;
+    expect(res.code).toBe(status.FAILED_PRECONDITION);
+    expect(res.details).toBe(WORKER_WITHOUT_PROCESSES);
+    expect(w.execs).toHaveLength(2);
+    for (const h of held) h.cancel();
   });
 
   it.each([5, 99, -1])('an unknown kind %d is refused INVALID_ARGUMENT', async (kind) => {
@@ -265,7 +325,7 @@ describe('Exec kinds (plan 5, level 2)', () => {
 
   it('the audit line has kind, and process as p<id> or the name, never its command', async () => {
     const r = await relay();
-    await worker(r.attach, 'sbx_default');
+    await procWorker(r.attach);
     const send = (reqId: number, fields: Parameters<typeof exec>[1]['fields'], command = '') =>
       exec(r.exec, { token: PROCESSES, reqId, command, fields }).done;
     await send(1, {}, 'true');
@@ -296,7 +356,7 @@ describe('Exec kinds (plan 5, level 2)', () => {
 
   it("cuts a caller-chosen process name to the audit line's 128 bytes", async () => {
     const r = await relay();
-    await worker(r.attach, 'sbx_default');
+    await procWorker(r.attach);
     await exec(r.exec, {
       token: PROCESSES,
       fields: {
@@ -309,7 +369,7 @@ describe('Exec kinds (plan 5, level 2)', () => {
 
   it("logs a process_start's command only under SH_SANDBOX_AUDIT_COMMANDS", async () => {
     const r = await relay({ SH_SANDBOX_AUDIT_COMMANDS: '1' });
-    await worker(r.attach, 'sbx_default');
+    await procWorker(r.attach);
     await exec(r.exec, { token: PROCESSES, reqId: 1, command: 'npm run dev', fields: START }).done;
     expect(execLines(r.lines)).toEqual([
       expect.objectContaining({ kind: 'process_start', process: 'web', cmd: 'npm run dev' }),

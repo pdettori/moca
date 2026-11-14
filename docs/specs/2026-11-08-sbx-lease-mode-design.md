@@ -918,17 +918,28 @@ for a refusal at the worker's own cap.
   answer only, §8.2).
 - **Compat first: every refusal is up front, and none runs the command.**
 
-  | Where              | When                                                                                         | Answer                                                                              |
-  | ------------------ | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-  | relay              | a kind it does not know                                                                      | `INVALID_ARGUMENT` `unknown exec kind <n>`                                          |
-  | relay              | a process kind on a token whose `mode` claim is not `lease+processes`, before any forwarding | `FAILED_PRECONDITION` `processes_not_enabled: this sandbox's mode is <m>`, audited  |
-  | relay              | the harness exec token                                                                       | the kind forced to `EXEC_KIND_COMMAND` and `process` dropped, with the lease fields |
-  | worker, both tiers | a kind it does not know, before any VM or lease work                                         | `lease_unsupported: unknown exec kind <n>` (P5-R22)                                 |
-  | container worker   | any kind but a command                                                                       | `lease_unsupported: <detail>`                                                       |
-  | microVM worker     | a process kind without the Firecracker arm and a snapshot advertising `lease-processes-v1`   | `lease_unsupported: process kinds need the Firecracker arm and a snapshot with ...` |
-  | microVM worker     | a process kind served below `lease+processes` (checked again under the run gate)             | `processes_not_enabled: <kind> for "<key>": this sandbox's mode is <m>`             |
-  | guest agent        | a kind it does not know                                                                      | `lease_unsupported: unknown kind <k>`                                               |
+  | Where              | When                                                                                                                                   | Answer                                                                                                       |
+  | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+  | relay              | a kind it does not know                                                                                                                | `INVALID_ARGUMENT` `unknown exec kind <n>`                                                                   |
+  | relay              | a process kind on a token whose `mode` claim is not `lease+processes`, before any forwarding                                           | `FAILED_PRECONDITION` `processes_not_enabled: this sandbox's mode is <m>`, audited                           |
+  | relay              | a process kind for a worker whose Hello lacks `sbx:lease-processes-v1`, before any slot or forwarding, and again at the write (P5-R37) | `FAILED_PRECONDITION` `lease_unsupported: this sandbox's worker does not support tracked processes`, audited |
+  | relay              | the harness exec token                                                                                                                 | the kind forced to `EXEC_KIND_COMMAND` and `process` dropped, with the lease fields                          |
+  | worker, both tiers | a kind it does not know, before any VM or lease work                                                                                   | `lease_unsupported: unknown exec kind <n>` (P5-R22)                                                          |
+  | container worker   | any kind but a command                                                                                                                 | `lease_unsupported: <detail>`                                                                                |
+  | microVM worker     | a process kind without the Firecracker arm and a snapshot advertising `lease-processes-v1`                                             | `lease_unsupported: process kinds need the Firecracker arm and a snapshot with ...`                          |
+  | microVM worker     | a process kind served below `lease+processes` (checked again under the run gate)                                                       | `processes_not_enabled: <kind> for "<key>": this sandbox's mode is <m>`                                      |
+  | guest agent        | a kind it does not know                                                                                                                | `lease_unsupported: unknown kind <k>`                                                                        |
 
+- **The worker capability (P5-R37).** A worker that predates level 2 decodes `Exec.kind` as an
+  unknown field and would run a `process_start`'s command as a plain Exec, so the far end must say
+  it understands the kinds. A microVM worker adds `sbx:lease-processes-v1` to its Hello
+  capabilities exactly when it serves them (`vmpool.HelloCapabilities`: the Firecracker arm and a
+  snapshot advertising `lease-v1` and `lease-processes-v1`); the container worker never does. The
+  relay keeps each worker's Hello capabilities and gates on them as the table says. The clients
+  show the refusal as `tracked processes are not available on this sandbox's worker yet`, with
+  `(ask the operator)` at a terminal, and never retry it. A relay older than level 2 would drop the
+  kind itself; it ships in one image with the control plane whose policy enables
+  `lease+processes`, so a supported rollout cannot pair them.
 - **The guest's process wire strings:** `process_not_found: <id or name>`,
   `process_limit: <n> running (SH_LEASE_MAX_PROCESSES)`, `process_name_taken: <name>`,
   `process_name_invalid: <detail>`, `process_cwd: <detail>` and `process_signal: <detail>`. A
@@ -1038,7 +1049,8 @@ reaches the cohort, and a level-2 section before level 2 is allowed by policy.
 needs the security owner's sign-off. Until then `lease+processes` stays out of
 `SH_SANDBOX_MODES_ALLOWED`, and plan 5 changes no default. Beside the bounds above, the relay
 checks ahead of the worker: it refuses a process kind on a token whose `mode` claim is not
-`lease+processes` before forwarding anything, and the worker refuses it again (§8.3).
+`lease+processes`, or for a worker that does not advertise `sbx:lease-processes-v1`, before
+forwarding anything, and the worker refuses it again (§8.3).
 
 ## 12. ADR
 

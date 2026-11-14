@@ -12,7 +12,12 @@ import {
   type ProcessArgs,
 } from '@moca/k8s-sandbox';
 import type { SandboxModeName, SandboxTokenClaims, SetModeClaims } from '@moca/control-plane';
-import type { Relay, RelayTimers } from './relay.js';
+import {
+  LEASE_PROCESSES_CAPABILITY,
+  WORKER_WITHOUT_PROCESSES,
+  type Relay,
+  type RelayTimers,
+} from './relay.js';
 import { workerReqId, type SetModeVerifier } from './sandbox-auth.js';
 import {
   failExecStream,
@@ -464,6 +469,16 @@ export function makeSandboxCaller(relay: Relay, opts: SandboxCallerOpts) {
       const why = `processes_not_enabled: this sandbox's mode is ${claims.mode}`;
       log({ outcome: 'refused', reason: why });
       failExecStream(call, grpcError(status.FAILED_PRECONDITION, why));
+      return;
+    }
+    // The worker gate (P5-R37), before any slot: a process kind goes only to a worker whose Hello
+    // advertises the capability, since one from before plan 5 would run it as a command. With no
+    // worker attached the Exec goes on to routeExec's own `no live worker`, and routeExec checks
+    // the capability again against the worker it writes to.
+    const caps = kind === 'command' ? undefined : relay.workerCapabilities(sandboxId);
+    if (caps !== undefined && !caps.includes(LEASE_PROCESSES_CAPABILITY)) {
+      log({ outcome: 'refused', reason: WORKER_WITHOUT_PROCESSES });
+      failExecStream(call, grpcError(status.FAILED_PRECONDITION, WORKER_WITHOUT_PROCESSES));
       return;
     }
     const key = ownKey(claims.sbx, e.reqId);

@@ -345,6 +345,15 @@ describe('mocactl sbx proc: refusals, failures, notices', () => {
         new ExecMachineryError('sandbox failure: worker unavailable'),
         'sbx: sandbox failure: worker unavailable',
       ],
+      [
+        // The relay's worker gate (P5-R37): the worker predates level 2.
+        new ProcessError(
+          'lease_unsupported',
+          "this sandbox's worker does not support tracked processes",
+          "lease_unsupported: this sandbox's worker does not support tracked processes",
+        ),
+        "sbx: tracked processes are not available on this sandbox's worker yet (ask the operator)",
+      ],
     ] as const) {
       const w = world({ answer: () => err });
       expect(await w.run(['proc', 'stop', 'web', SBX])).toBe(1);

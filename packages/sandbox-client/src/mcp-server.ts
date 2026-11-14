@@ -217,6 +217,13 @@ export function execFailureText(
 }
 
 /**
+ * The relay's `lease_unsupported:` detail when the sandbox's worker does not advertise the
+ * sbx:lease-processes-v1 capability (ruling P5-R37; packages/sandbox-relay WORKER_WITHOUT_PROCESSES,
+ * the same text): the worker predates level 2, so the relay sent nothing.
+ */
+const WORKER_WITHOUT_PROCESSES_DETAIL = "this sandbox's worker does not support tracked processes";
+
+/**
  * The text for a process call's wire refusal (spec §7): nothing ran. `processes_not_enabled`
  * is the §7 refusal, naming the sandbox (`<id>` when it is not known).
  */
@@ -246,6 +253,10 @@ function processFailureText(
     case 'process_signal':
       return `invalid signal: ${d}`;
     case 'lease_unsupported':
+      // Not something the user can change with a mode: the deployment's worker is too old.
+      if (d === WORKER_WITHOUT_PROCESSES_DETAIL) {
+        return `tracked processes are not available on this sandbox's worker yet (${o.audience === 'cli' ? 'ask the operator' : 'ask the user to tell the operator'})`;
+      }
       return `this sandbox's guest cannot run tracked processes: ${d}`;
     default:
       return `the sandbox refused the process call (${err.message})`;

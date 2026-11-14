@@ -745,8 +745,10 @@ create is an upgrade, which `mocactl` takes only from a terminal, so the step ru
 
 Step 9 (lease mode, level 2: tracked processes, [lease-mode spec](../../docs/specs/2026-11-08-sbx-lease-mode-design.md)
 §7) also runs alone with only user A's login. It needs a deployment that allows `lease+processes`,
-a relay and workers that run the level-2 code, and a template whose snapshot advertises `lease-v1`
-and `lease-processes-v1` and has `python3` and `curl`. Where `lease+processes` is not allowed (the
+and a template whose worker runs the level-2 code on a snapshot that advertises `lease-v1` and
+`lease-processes-v1` and has `python3` and `curl`. A worker without it (no `sbx:lease-processes-v1`
+in its Hello) makes `proc start` fail ("tracked processes are not available on this sandbox's worker
+yet"), a `not ok 9`. Where `lease+processes` is not allowed (the
 default) the create is refused with 403 `mode_not_allowed`, and the step is a SKIP
 (`# SKIP lease+processes not allowed`):
 

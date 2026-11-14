@@ -170,6 +170,31 @@ func LeaseProcessesSupported(cfg Config) bool {
 	return LeaseSupported(cfg) && slices.Contains(cfg.ManifestFeatures, FeatureLeaseProcessesV1)
 }
 
+// CapabilityLeaseProcessesV1 is the reserved Hello capability of a worker that serves
+// lease level 2's process kinds (ruling P5-R37). The relay refuses a process kind with
+// lease_unsupported, before forwarding anything, to a worker that does not advertise it:
+// a worker from before plan 5 decodes Exec.kind as an unknown field and would run a
+// process_start's command as a plain Exec. The relay matches this exact string
+// (packages/sandbox-relay, LEASE_PROCESSES_CAPABILITY).
+const CapabilityLeaseProcessesV1 = "sbx:lease-processes-v1"
+
+// HelloCapabilities is what a microVM worker advertises in Hello: the snapshot manifest's
+// probed capabilities, in order, with CapabilityLeaseProcessesV1 added when, and only
+// when, LeaseProcessesSupported(cfg). The manifest's own copy of the reserved name, if it
+// has one, is never passed on: only this rule advertises it.
+func HelloCapabilities(cfg Config, manifest []string) []string {
+	out := make([]string, 0, len(manifest)+1)
+	for _, c := range manifest {
+		if c != CapabilityLeaseProcessesV1 {
+			out = append(out, c)
+		}
+	}
+	if LeaseProcessesSupported(cfg) {
+		out = append(out, CapabilityLeaseProcessesV1)
+	}
+	return out
+}
+
 // leaseIdle resolves an Exec's idle timeout: 0 takes LeaseIdleDefault, and an owner's
 // value is clamped to [LeaseIdleMin, LeaseIdleCeiling] (spec §4). Called on a
 // normalized Config.

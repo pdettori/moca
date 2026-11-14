@@ -1406,6 +1406,26 @@ describe('SandboxExecConn process calls (plan 5, spec §7)', () => {
     expect(asks.map((a) => a.force)).toEqual([false, true]);
   });
 
+  it("maps the relay's worker-capability refusal (FAILED_PRECONDITION lease_unsupported, P5-R37) to a ProcessError, never retried", async () => {
+    const r = await fakeRelay(
+      fail(
+        status.FAILED_PRECONDITION,
+        "lease_unsupported: this sandbox's worker does not support tracked processes",
+      ),
+    );
+    const { c, asks } = conn(r.addr);
+    const e = await c.process('start', { command: 'sleep 9' }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ProcessError);
+    expect(e).toMatchObject({
+      code: 'lease_unsupported',
+      detail: "this sandbox's worker does not support tracked processes",
+      lease: [],
+    });
+    // Nothing ran, and a fresh token would not change the worker: one Exec, no re-mint.
+    expect(r.seen).toHaveLength(1);
+    expect(asks.map((a) => a.force)).toEqual([false]);
+  });
+
   it("re-mints once on the relay's processes_not_enabled and retries under a new req_id: an upgrade since the held token (P5-R29)", async () => {
     const r = await fakeRelay((call, n) =>
       n === 1

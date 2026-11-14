@@ -1294,6 +1294,15 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
         new ProcessError('lease_unsupported', 'the snapshot has no lease-processes-v1', ''),
         "this sandbox's guest cannot run tracked processes: the snapshot has no lease-processes-v1",
       ],
+      [
+        // The relay's worker gate (P5-R37): the worker predates level 2.
+        new ProcessError(
+          'lease_unsupported',
+          "this sandbox's worker does not support tracked processes",
+          "lease_unsupported: this sandbox's worker does not support tracked processes",
+        ),
+        "tracked processes are not available on this sandbox's worker yet (ask the user to tell the operator)",
+      ],
     ];
     for (const [e, want] of cases) {
       const { client } = await connect({
