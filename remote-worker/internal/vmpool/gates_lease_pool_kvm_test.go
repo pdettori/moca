@@ -416,8 +416,10 @@ func leaseEndDrivers() []leaseEndDriver {
 				return g
 			}},
 		{reason: LeaseEndGraceLimit,
+			// A 10 s grace, so that level 2's extra start steps (TestGateLeaseNotice/level2's
+			// process_start) fit before the cut; sleep 30 still outlasts it.
 			tweak: func(c *Config) {
-				c.LeaseMaxDuration, c.LeaseMaxDurationProcesses, c.LeaseGraceLimit = 2*time.Second, 2*time.Second, 3*time.Second
+				c.LeaseMaxDuration, c.LeaseMaxDurationProcesses, c.LeaseGraceLimit = 2*time.Second, 2*time.Second, 10*time.Second
 			},
 			end: func(t *testing.T, g *leaseGate, key string) *leaseGate {
 				t.Helper()
@@ -562,34 +564,38 @@ func TestGateLeaseTeardown(t *testing.T) {
 func TestGateLeaseNotice(t *testing.T) {
 	requireKVM(t)
 	requireLeaseSnapshot(t)
-	for _, d := range leaseEndDrivers() {
-		t.Run(string(d.reason), func(t *testing.T) {
-			const key = "lease-notice"
-			g := newLeaseGate(t, d.tweak)
-			d.startLease(t, g, key)
-			if ev := g.p.LeaseStatus(key).Pending; ev == nil || ev.State != leaseEventStart {
-				t.Fatalf("pending after the lease's first Exec = %+v, want the start", ev)
-			}
-			after := d.end(t, g, key)
+	// Each level a subtest of its own, so that a level-1 failure cannot hide the level-2
+	// half's result, and -run .../level2 runs that half alone.
+	t.Run("level1", func(t *testing.T) {
+		for _, d := range leaseEndDrivers() {
+			t.Run(string(d.reason), func(t *testing.T) {
+				const key = "lease-notice"
+				g := newLeaseGate(t, d.tweak)
+				d.startLease(t, g, key)
+				if ev := g.p.LeaseStatus(key).Pending; ev == nil || ev.State != leaseEventStart {
+					t.Fatalf("pending after the lease's first Exec = %+v, want the start", ev)
+				}
+				after := d.end(t, g, key)
 
-			info := after.p.LeaseStatus(key)
-			ev := info.Pending
-			if ev == nil || ev.State != leaseEventEnd || ev.Reason != d.reason || ev.Mode != ModeLease {
-				t.Fatalf("pending after the end = %+v, want end %s in mode lease", ev, d.reason)
-			}
-			if s := loadLeaseState(after.cfg.WorkspaceRoot, key); s.Pending == nil || !s.Pending.At.Equal(ev.At) ||
-				s.Pending.Reason != d.reason || s.Open != nil {
-				t.Fatalf("state file = %+v, want the pending end the status reports and no open lease", s)
-			}
-			if s := after.p.Stats(); leaseEndTotal(s) != 1 || s.LeaseEnds[d.reason] != 1 {
-				t.Fatalf("LeaseEnds = %v, want exactly one, %s", s.LeaseEnds, d.reason)
-			}
-			after.p.AckLeaseEvent(key, ev.At)
-			if got := after.p.LeaseStatus(key).Pending; got != nil {
-				t.Fatalf("pending after the acknowledgement = %+v, want none", got)
-			}
-		})
-	}
+				info := after.p.LeaseStatus(key)
+				ev := info.Pending
+				if ev == nil || ev.State != leaseEventEnd || ev.Reason != d.reason || ev.Mode != ModeLease {
+					t.Fatalf("pending after the end = %+v, want end %s in mode lease", ev, d.reason)
+				}
+				if s := loadLeaseState(after.cfg.WorkspaceRoot, key); s.Pending == nil || !s.Pending.At.Equal(ev.At) ||
+					s.Pending.Reason != d.reason || s.Open != nil {
+					t.Fatalf("state file = %+v, want the pending end the status reports and no open lease", s)
+				}
+				if s := after.p.Stats(); leaseEndTotal(s) != 1 || s.LeaseEnds[d.reason] != 1 {
+					t.Fatalf("LeaseEnds = %v, want exactly one, %s", s.LeaseEnds, d.reason)
+				}
+				after.p.AckLeaseEvent(key, ev.At)
+				if got := after.p.LeaseStatus(key).Pending; got != nil {
+					t.Fatalf("pending after the acknowledgement = %+v, want none", got)
+				}
+			})
+		}
+	})
 
 	// Level 2 (plan 5, spec §4.1): every end of a lease+processes lease lists the tracked
 	// processes it stopped -- here web, running when the lease ended -- in the event and in
@@ -631,6 +637,14 @@ func TestGateLeaseNotice(t *testing.T) {
 // a lease Exec runs per-Exec -- as root, in a fresh VM -- until SetMode restores the mode.
 func TestGateLeaseStaleEpoch(t *testing.T) {
 	requireKVM(t)
+	t.Run("level1", testLeaseStaleEpochLevel1)
+	t.Run("level2", testLeaseStaleEpochLevel2)
+}
+
+// testLeaseStaleEpochLevel1 is TestGateLeaseStaleEpoch's level-1 half. Each half is a
+// subtest, so a level-1 failure cannot hide the level-2 result, and -run .../level2
+// runs level 2 alone.
+func testLeaseStaleEpochLevel1(t *testing.T) {
 	g := newLeaseGate(t, nil)
 	const key = "lease-epoch"
 	mustSetMode(t, g.p, key, ModeLease, 5)
@@ -673,7 +687,6 @@ func TestGateLeaseStaleEpoch(t *testing.T) {
 		t.Fatalf("LeaseVMs = %d after SetMode and a lease Exec, want 1", s.LeaseVMs)
 	}
 
-	t.Run("level2", testLeaseStaleEpochLevel2)
 }
 
 // testLeaseStaleEpochLevel2 is TestGateLeaseStaleEpoch's level-2 half (spec §8.2, §9): a
@@ -1455,6 +1468,20 @@ exec python3 -m http.server 8080 --bind 127.0.0.1`, epoch)
 		}
 		if g.p.LeaseStatus(key).Tracked == nil {
 			t.Fatal("LeaseStatus carries no tracked table with web running")
+		}
+
+		// The command runs as given, in the cwd asked for (ruling P5-R34: no per-Exec
+		// wrapper, whose `cd /workspace` overrode it), and in /workspace by default.
+		g.run(t, key, gateLevel2("mkdir -p sub", epoch))
+		where := parseTrackedStart(t, g.run(t, key, gateProcess(ExecKindProcessStart,
+			ProcessArgs{Name: "where", Cwd: "sub"}, "pwd; exec sleep 600", epoch)))
+		here := g.startTracked(t, key, "here", "pwd; exec sleep 600", epoch)
+		leaseWaitPoolLogs(t, g, key, ProcessArgs{Name: "where"}, "/workspace/sub\n")
+		leaseWaitPoolLogs(t, g, key, ProcessArgs{Name: "here"}, "/workspace\n")
+		for _, p := range []gateTracked{where, here} {
+			if got := stop(t, key, ProcessArgs{ID: p.ID}); got.stateText() != "killed(15)" {
+				t.Fatalf("process_stop %s = %+v, want killed(15): its pid is the command's own, not a wrapper's", p.Name, got)
+			}
 		}
 
 		for _, c := range []struct {

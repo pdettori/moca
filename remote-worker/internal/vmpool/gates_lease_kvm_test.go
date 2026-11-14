@@ -281,6 +281,14 @@ time.sleep(300)
 // Exec in the same VM (spec §9).
 func TestGateLeaseExecKillsProcesses(t *testing.T) {
 	requireKVM(t)
+	t.Run("level1", testLeaseExecKillsProcessesLevel1)
+	t.Run("level2", testLeaseExecKillsProcessesLevel2)
+}
+
+// testLeaseExecKillsProcessesLevel1 is TestGateLeaseExecKillsProcesses's level-1 half.
+// Each half is a subtest, so a level-1 failure cannot hide the level-2 result, and
+// -run .../level2 runs level 2 alone.
+func testLeaseExecKillsProcessesLevel1(t *testing.T) {
 	run := leaseRunner(t, leaseGateVM(t, "vm-lkill"))
 
 	// Built from variables so that the Exec's own bash command line, which the /proc scan
@@ -303,7 +311,6 @@ python3 -c ` + shQuote(leaseDaemonScript) + ` "$m-marker"
 		t.Errorf("processes Run 1 started survived into Run 2:\n%s", got)
 	}
 
-	t.Run("level2", testLeaseExecKillsProcessesLevel2)
 }
 
 // TestGateLeaseFreshShell: no shell state crosses Execs -- not a variable, a directory, a
@@ -374,6 +381,14 @@ print("mountsys=" + ("ok" if r == 0 else errno.errorcode.get(e, str(e))))
 // would find it.
 func TestGateLeasePrivilege(t *testing.T) {
 	requireKVM(t)
+	t.Run("level1", testLeasePrivilegeLevel1)
+	t.Run("level2", testLeasePrivilegeLevel2)
+}
+
+// testLeasePrivilegeLevel1 is TestGateLeasePrivilege's level-1 half. Each half is a
+// subtest, so a level-1 failure cannot hide the level-2 result, and -run .../level2
+// runs level 2 alone.
+func testLeasePrivilegeLevel1(t *testing.T) {
 	run := leaseRunner(t, leaseGateVM(t, "vm-lpriv"))
 
 	const pattern = `[l]ease-priv-marker`
@@ -464,7 +479,6 @@ m=lease-priv; python3 -c 'import time; time.sleep(300)' "$m-marker" >/dev/null 2
 		t.Errorf("Run 2 found what Run 1 left behind (a marker here means a cgroup escape worked):\n%s", got)
 	}
 
-	t.Run("level2", testLeasePrivilegeLevel2)
 }
 
 // The level-2 halves (plan 5, spec §7, §9): tracked processes, driven through the launcher
