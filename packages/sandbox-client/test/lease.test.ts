@@ -253,4 +253,18 @@ describe('tracked processes as a client shows them (plan 5, spec §7)', () => {
       'processes',
     );
   });
+
+  it("carries a set_mode downgrade's stopped processes, and none when it is empty (plan 5 Task 10)", () => {
+    const s = LeaseStatus.fromPartial({
+      mode: SandboxMode.SANDBOX_MODE_LEASE,
+      state: 'active',
+      stopped: [tp({ state: 'killed', code: 15 })],
+    });
+    expect(leaseStatusView(s).stopped).toEqual([
+      trackedProcessView(tp({ state: 'killed', code: 15 })),
+    ]);
+    expect(leaseStatusView(LeaseStatus.fromPartial({ state: 'active' }))).not.toHaveProperty(
+      'stopped',
+    );
+  });
 });

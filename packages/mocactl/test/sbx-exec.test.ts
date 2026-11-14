@@ -42,6 +42,7 @@ import {
   TOKEN,
   TOKEN_IAT,
   fakeCp,
+  leaseEnd,
   sandbox,
   setup,
   URL_,
@@ -656,6 +657,31 @@ describe('mocactl sbx run lease notices (spec §5)', () => {
 });
 
 describe('mocactl sbx put (SBX0 §6.1)', () => {
+  it('put says the lease events its Exec carried, on stderr, a failure too (plan-4 M2)', async () => {
+    const end = leaseEnd({ reason: 'idle' });
+    const { home, env, io } = setup();
+    const ok = fakeExec(() =>
+      res({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), lease: [end] }),
+    );
+    const put = (factory: ReturnType<typeof fakeExec>['factory']) =>
+      sbxMain(['put', 'a.txt', '--sandbox', SBX], env, io, {
+        home,
+        fetchImpl: mint().fetchImpl,
+        execFactory: factory,
+        stdinIsTTY: false,
+        readStdinBytes: async () => Buffer.from('x'),
+      });
+    expect(await put(ok.factory)).toBe(0);
+    expect(io.errs).toEqual([leaseNotice(end, Date.now())]);
+    io.errs.length = 0;
+    const later = leaseEnd({ reason: 'memory_reclaim', atUnixMs: end.atUnixMs + 60_000 });
+    const boom = new ExecMachineryError('sandbox failure: lease_ended(memory_reclaim)');
+    boom.lease = [later];
+    expect(await put(fakeExec(() => boom).factory)).toBe(125);
+    expect(io.errs[0]).toBe(leaseNotice(later, Date.now()));
+    expect(io.errs[1]).toMatch(/^sbx: /);
+  });
+
   it('puts stdin, byte for byte, at a workspace path, with the atomic write command', async () => {
     const { home, env, io } = setup();
     const x = fakeExec(() => res({ stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));

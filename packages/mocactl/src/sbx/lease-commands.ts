@@ -1,8 +1,10 @@
 import {
   LeaseControlError,
+  processRow,
   type LeaseEvent,
   type LeaseStatusView,
   type SandboxModeName,
+  type TrackedProcessView,
 } from '@moca/sandbox-client';
 import { ApiError } from '../api/errors.js';
 import { describeError } from '../core/messages.js';
@@ -130,6 +132,14 @@ export async function cmdMode(
     if (own !== undefined && fresh.some((ev) => ev.atUnixMs === own)) {
       c.io.out('lease ended (mode_change)\n');
     }
+    // A downgrade from lease+processes keeps the lease and stops its tracked processes; only this
+    // call's answer lists them, and none when a racing lease Exec did the stop (P5-R21, P5-R30).
+    const stopped = r.status.stopped ?? [];
+    if (stopped.length > 0) {
+      c.io.out(
+        `stopped ${stopped.length} tracked processes: ${stopped.map(processDisplay).join(', ')}\n`,
+      );
+    }
     return SBX_EXIT.ok;
   } catch (err) {
     if (c.signal?.aborted) return pendingByCtrlC(c, s);
@@ -143,6 +153,10 @@ export async function cmdMode(
     x.close();
   }
 }
+
+/** A process as notices show it (spec §7): `<name> (pid <n>)`, `p<id>` when it has no name. */
+const processDisplay = (v: TrackedProcessView): string =>
+  `${sanitizeRemote(v.name || `p${v.id}`)} (pid ${v.pid})`;
 
 /** Ctrl-C during a set_mode: the mode is stored, as for a worker that could not be reached. */
 function pendingByCtrlC(c: SbxCtx, s: SbxSandbox): number {
@@ -272,6 +286,14 @@ export async function cmdGet(c: SbxCtx, id: string, factory?: ExecFactory): Prom
     ['idle timeout', s.idleTimeoutS > 0 ? `${s.idleTimeoutS} s` : 'worker default'],
     ['lease', leaseText(lease)],
   ];
+  // The tracked processes, exited ones included (P5-R16): at lease+processes, or whenever the
+  // worker has some; one per line, ids as `sbx proc` takes them (p<id>).
+  if (lease !== null && !('error' in lease) && (s.mode === 'lease+processes' || lease.processes)) {
+    const ps = (lease.processes ?? []).map((v) =>
+      sanitizeRemote(processRow({ ...v, id: `p${v.id}` })),
+    );
+    rows.push(['processes', ps.length ? ps.join(`\n${' '.repeat(14)}`) : 'none']);
+  }
   for (const [k, v] of rows) c.io.out(`${k.padEnd(14)}${v}\n`);
   return code;
 }

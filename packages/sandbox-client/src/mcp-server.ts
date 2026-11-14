@@ -232,10 +232,11 @@ function processFailureText(
         ? `processes not enabled for this sandbox; run: mocactl sbx mode ${id} lease+processes`
         : processesNotEnabledText(id);
     }
+    // A person at a terminal has the sbx proc commands, not the model's tools.
     case 'process_not_found':
-      return `no tracked process ${d}; process_list shows them`;
+      return `no tracked process ${d}; ${o.audience === 'cli' ? 'mocactl sbx proc ls' : 'process_list'} shows them`;
     case 'process_limit':
-      return `too many tracked processes: ${d}; stop one with process_stop first`;
+      return `too many tracked processes: ${d}; stop one with ${o.audience === 'cli' ? 'mocactl sbx proc stop' : 'process_stop'} first`;
     case 'process_name_taken':
       return `a running process is already named ${d}; choose another name, or stop it first`;
     case 'process_cwd':

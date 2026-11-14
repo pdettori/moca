@@ -43,6 +43,11 @@ export interface LeaseStatusView {
   pending?: LeaseEvent;
   /** The full tracked-process table, exited entries included (plan 5); absent when empty. */
   processes?: TrackedProcessView[];
+  /**
+   * The processes this set_mode call's downgrade stopped (plan 5): only in that call's own answer
+   * (P5-R19), and empty when a racing lease Exec did the stop (P5-R21); absent when empty.
+   */
+  stopped?: TrackedProcessView[];
 }
 
 /**
@@ -104,6 +109,7 @@ export function leaseStatusView(s: LeaseStatus | undefined): LeaseStatusView {
     idleTimeoutS: s?.idleTimeoutS ?? 0,
     ...(s?.pending ? { pending: s.pending } : {}),
     ...(s?.processes.length ? { processes: s.processes.map(trackedProcessView) } : {}),
+    ...(s?.stopped.length ? { stopped: s.stopped.map(trackedProcessView) } : {}),
   };
 }
 

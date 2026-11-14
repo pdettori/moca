@@ -1683,6 +1683,21 @@ describe('execFailureText for a process refusal', () => {
       'processes not enabled for this sandbox; run: mocactl sbx mode <id> lease+processes',
     );
   });
+
+  it('points a person at the sbx proc commands, not the model tools (plan 5 Task 10)', () => {
+    const nf = new ProcessError('process_not_found', 'web', '');
+    expect(execFailureText(nf, { audience: 'cli' })).toBe(
+      'no tracked process web; mocactl sbx proc ls shows them',
+    );
+    expect(execFailureText(nf)).toBe('no tracked process web; process_list shows them');
+    const lim = new ProcessError('process_limit', '4 running (SH_LEASE_MAX_PROCESSES)', '');
+    expect(execFailureText(lim, { audience: 'cli' })).toBe(
+      'too many tracked processes: 4 running (SH_LEASE_MAX_PROCESSES); stop one with mocactl sbx proc stop first',
+    );
+    expect(execFailureText(lim)).toBe(
+      'too many tracked processes: 4 running (SH_LEASE_MAX_PROCESSES); stop one with process_stop first',
+    );
+  });
 });
 
 describe("a failed re-mint's carried events (Minor 1)", () => {
