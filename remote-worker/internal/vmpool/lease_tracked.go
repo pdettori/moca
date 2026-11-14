@@ -134,7 +134,7 @@ func auditTracked(key string, mode Mode, e Exec, prev, next []TrackedProcess) bo
 		}
 		switch {
 		case i == stopped:
-			// Accepted (review minor 3): a guest that answers the stop before the process
+			// A guest that answers the stop before the process
 			// dies leaves it running here, and a later End then writes its exit as well.
 			rec("stop", tp, tp.State)
 		case !tp.running() && (!ok || was.running()):
