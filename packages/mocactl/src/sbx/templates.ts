@@ -34,7 +34,9 @@ export const POLL_MS = 5000;
 /** `templates activate --wait`'s limit with no --timeout, in seconds: the floor of a sized one. */
 export const ACTIVATE_TIMEOUT_S = 1800;
 /** `templates retire --wait`'s limit with no --timeout, in seconds. */
-export const RETIRE_TIMEOUT_S = 300;
+// Past the 600 s a host keeps shipping an ended sandbox's egress before it may remove the build,
+// plus a few host polls.
+export const RETIRE_TIMEOUT_S = 900;
 /** The sized limit's ceiling: a host reporting an outlier start time never makes --wait sit longer. */
 export const ACTIVATE_TIMEOUT_CAP_S = 14_400;
 
@@ -815,17 +817,17 @@ export async function cmdDeactivate(c: SbxCtx, id: string, stopNow = false): Pro
 /**
  * `templates retire ID [--build B] [--reason T] [--wait [--timeout S]]` (§5.1): retire the template
  * (every build of it) or build B, and print each build retired. With --wait, then read each build
- * until it is `retired` and its worker no longer runs (`capacity` null: the host stopped it, after
- * the wanted state's `stop`), saying so while it still runs; `running` null, presence unreadable,
- * is waited out too, never taken as stopped. Only a host agent that holds the build stops its
- * worker (the wanted state's `stop` lists the builds a host holds), so a build no host holds has
- * nothing to wait for: `heldBy` null (no host agents; or absent, from an older control plane) or
- * empty (no host holds it, such as an imported template whose worker an operator runs). Then a
- * worker that still runs is said to be not host-managed, to be stopped where it runs. Nor does a
- * `shared` build (its snapshot or worker serves a build that is not retired): its worker is kept
- * running for that build, and that is said. A wait past
- * --timeout (default RETIRE_TIMEOUT_S) exits 5. Waiting for the snapshot's removal from every host
- * comes with the host's removal step (#743).
+ * until it is `retired`, its worker no longer runs (`capacity` null: the host stopped it, after
+ * the wanted state's `stop`) and no host holds it any more (`heldBy` empty: each holding host has
+ * removed its worker and snapshot, §6.1 step 7), saying so, once per change, while it waits;
+ * `running` null, presence unreadable, is waited out too, never taken as stopped. Only a host agent
+ * that holds the build stops and removes its worker (the wanted state lists the builds a host
+ * holds), so a build no host holds has nothing to wait for: `heldBy` null (no host agents; or
+ * absent, from an older control plane), or empty from the first read (no host holds it, such as an
+ * imported template whose worker an operator runs). Then a worker that still runs is said to be not
+ * host-managed, to be stopped where it runs. A wait past --timeout (default RETIRE_TIMEOUT_S) exits
+ * 5. Nor does a `shared` build (its snapshot or worker serves a build that is not retired): its
+ * worker is kept running for that build and never removed, and that is said at once.
  */
 export async function cmdRetire(
   c: SbxCtx,
@@ -850,6 +852,7 @@ export async function cmdRetire(
     const end = c.rt.now() + timeoutS * 1000;
     for (const { build } of builds) {
       let said = '';
+      let wasHeld = false;
       for (;;) {
         let b: SbxBuild | undefined;
         try {
@@ -857,6 +860,8 @@ export async function cmdRetire(
         } catch (err) {
           if (!transient(err)) throw err;
         }
+        const held = b?.heldBy ?? [];
+        if (held.length > 0) wasHeld = true;
         // Its worker serves a build that is not retired too: kept running for it, never stopped.
         if (b && b.status === 'retired' && b.shared === true) {
           c.io.err(
@@ -865,17 +870,22 @@ export async function cmdRetire(
           );
           break;
         }
-        if (b && b.status === 'retired' && b.capacity === null) {
+        // No host holds it (heldBy null or absent: no host agents; empty from the first read: none
+        // holds this build): no host agent will stop or remove its worker, so it is done at once.
+        if (b && b.status === 'retired' && (b.heldBy == null || (held.length === 0 && !wasHeld))) {
           c.io.err(
-            `${sanitizeRemote(r.templateId)} ${sanitizeRemote(build)}: retired, its worker stopped`,
+            `${sanitizeRemote(r.templateId)} ${sanitizeRemote(build)}: retired` +
+              (b.capacity === null
+                ? ', its worker stopped'
+                : '; no host agent holds it, so its worker is not host-managed: stop it where it runs'),
           );
           break;
         }
-        // No host holds it (heldBy null, absent or empty): no host agent will stop its worker.
-        if (b && b.status === 'retired' && (b.heldBy ?? []).length === 0) {
+        // Held by a host when the wait began: done once its worker stopped and every host removed it.
+        if (b && b.status === 'retired' && b.capacity === null && held.length === 0) {
           c.io.err(
-            `${sanitizeRemote(r.templateId)} ${sanitizeRemote(build)}: retired; no host agent ` +
-              'holds it, so its worker is not host-managed: stop it where it runs',
+            `${sanitizeRemote(r.templateId)} ${sanitizeRemote(build)}: retired, ` +
+              'its worker stopped and removed from every host',
           );
           break;
         }
@@ -886,13 +896,20 @@ export async function cmdRetire(
               ? sanitizeRemote(b.status)
               : b.capacity?.running === null
                 ? "retired, its worker's state cannot be read; still waiting"
-                : `retired, its worker still runs${typeof inUse === 'number' ? ` (${inUse} in use)` : ''}`;
+                : b.capacity === null
+                  ? `retired, its worker stopped; still held by ${held.map(sanitizeRemote).join(', ')}`
+                  : `retired, its worker still runs${typeof inUse === 'number' ? ` (${inUse} in use)` : ''}`;
           if (why !== said)
             c.io.err(`${sanitizeRemote(r.templateId)} ${sanitizeRemote(build)}: ${why}`);
           said = why;
         }
         const left = end - c.rt.now();
-        if (left <= 0) return timedOut(c, `${r.templateId} ${build} to stop its worker`, timeoutS);
+        if (left <= 0)
+          return timedOut(
+            c,
+            `${r.templateId} ${build} to stop its worker and be removed from every host`,
+            timeoutS,
+          );
         await c.rt.sleep(Math.min(POLL_MS, left), c.signal);
         if (c.signal?.aborted) return SBX_EXIT.failed;
       }

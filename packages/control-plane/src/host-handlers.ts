@@ -1,7 +1,7 @@
 import { CpError } from './errors.js';
 import { asRecord, seconds } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
-import { recordDigest } from './provenance.js';
+import { buildRecordOf, recordDigest } from './provenance.js';
 import { LOG_MAX, type TemplateBuild, type TemplateDoc } from './template-catalog.js';
 import { activationLock } from './activation-lock.js';
 import {
@@ -46,8 +46,11 @@ import {
  *                                            it, first leased first), those it holds that it should
  *                                            stop (no lease left, no live sandbox), of `run` those
  *                                            not attached yet (`starting`, for the start limit),
- *                                            and those kept in its idle grace (`graced`)
- *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached, reason?}
+ *                                            those kept in its idle grace (`graced`), and the
+ *                                            retired ones it should remove (worker and snapshot,
+ *                                            no live sandbox)
+ *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached |
+ *                                            removed, reason?}
  *   POST /v1/hosts/{host}/egress             {events, cursor}: the egress proxy's audit events, as it
  *                                            wrote them, into each sandbox's egress log
  *
@@ -472,9 +475,10 @@ const REPORTABLE = new Set<TemplateBuild['status']>(['building', 'probing', 'bui
 /**
  * The build ids and workers of every build that is not retired, in every template. A retired build
  * that shares either with one (the same snapshot built again, a twin in another template, a worker
- * id two builds from one image share) names a snapshot or worker still needed: it is never stopped
- * for the retire (that build's own entries decide whether the worker runs), and it reports no
- * capacity to wait out (sandbox-handlers.ts buildBody).
+ * id reused, or one worker id two builds from one image share) names a snapshot or worker still
+ * needed: it is never stopped or removed for the retire (that build's own entries decide whether
+ * the worker runs), its `removed` is refused, and it reports no capacity to wait out
+ * (sandbox-handlers.ts buildBody).
  */
 export function liveSnapshots(docs: { builds: TemplateBuild[] }[]): (b: TemplateBuild) => boolean {
   const ids = new Set<string>();
@@ -597,8 +601,9 @@ export const HOST_HANDLERS: Record<string, Handler> = {
    * (§5.1: no longer wanted, never run again), except one whose snapshot or worker a build that is
    * not retired shares (liveSnapshots): that build's entries decide. A worker in `run` for one build
    * is never in `stop` for another that shares its worker id. A worker is never stopped under a
-   * live sandbox: it drains first, so a build with one is in no stop list. Removing a retired
-   * build's worker and snapshot from the host is not asked here. A build imported from
+   * live sandbox: it drains first, so a build with one is in no stop list. `remove` (§6.1 step 7):
+   * the retired builds it holds with no live sandbox, listed in `stop` too, so the agent stops a
+   * running worker before it uninstalls it and deletes the snapshot. A build imported from
    * SH_SANDBOX_TEMPLATES (not hostManaged) is in no list, retired or not: the deployment runs its
    * worker.
    * `egressSids`: the workspace keys of the sandboxes whose egress events the agent ships
@@ -620,29 +625,50 @@ export const HOST_HANDLERS: Record<string, Handler> = {
    * installed, or the start failed) or stopped (`detached`), for a registered build this host
    * holds (`detached` also for a retired one, whose worker `stop` lists): an `activate` or
    * `deactivate` record by the host, except a refusal repeating the host's last one for a build
-   * still in its `run` (answered `recorded: null`). Readiness still comes from the relay.
+   * still in its `run` (answered `recorded: null`). Or a retired build's worker and snapshot removed
+   * from the host (`removed`, §6.1 step 7): a `retire` record by the host citing the build record,
+   * and the host no longer holds it (its `heldBy` drops the host at once; the next inventory says
+   * the same). Readiness still comes from the relay.
    */
   hostWorkerReport: async (ctx, deps) => {
     const host = hostOf(ctx);
     const { cat, prov } = catalogOf(deps);
     const b = asRecord(ctx.body);
     const event = b.event;
-    if (event !== 'attached' && event !== 'refused' && event !== 'detached') {
-      throw new CpError('invalid_request', 'event must be attached, refused or detached');
+    if (
+      event !== 'attached' &&
+      event !== 'refused' &&
+      event !== 'detached' &&
+      event !== 'removed'
+    ) {
+      throw new CpError('invalid_request', 'event must be attached, refused, detached or removed');
     }
     const buildId = typeof b.buildId === 'string' ? b.buildId : '';
-    // A retired build's worker is stopped (§5.1), so `detached` is taken for one too.
+    // A retired build's worker is stopped (§5.1), so `detached` is taken for one too; `removed` is
+    // taken for a retired build only.
     const ok = (x: { status: string }) =>
-      x.status === 'registered' || (event === 'detached' && x.status === 'retired');
-    const doc = (await cat.list()).find((d) =>
-      d.builds.some((x) => x.buildId === buildId && ok(x)),
-    );
+      event === 'removed'
+        ? x.status === 'retired'
+        : x.status === 'registered' || (event === 'detached' && x.status === 'retired');
+    const docs = await cat.list();
+    const doc = docs.find((d) => d.builds.some((x) => x.buildId === buildId && ok(x)));
     if (!doc || deps.hosts?.get(host)?.holds[buildId] === undefined) {
       throw new CpError(
         'not_found',
-        event === 'detached'
-          ? 'no registered or retired build this host holds'
-          : 'no registered build this host holds',
+        event === 'removed'
+          ? 'no retired build this host holds'
+          : event === 'detached'
+            ? 'no registered or retired build this host holds'
+            : 'no registered build this host holds',
+      );
+    }
+    const target = doc.builds.find((x) => x.buildId === buildId && ok(x))!;
+    // The wanted state never asks for this one's removal; a report of it would drop the live
+    // build's host from its heldBy.
+    if (event === 'removed' && liveSnapshots(docs)(target)) {
+      throw new CpError(
+        'build_in_use',
+        'a build that is not retired shares this snapshot or worker; it is not removed',
       );
     }
     const reason = typeof b.reason === 'string' ? b.reason.slice(0, 1024) : undefined;
@@ -667,10 +693,26 @@ export const HOST_HANDLERS: Record<string, Handler> = {
     }
     await prov.append({
       stream: `template/${doc.id}`,
-      kind: event === 'detached' ? 'deactivate' : 'activate',
+      kind: event === 'removed' ? 'retire' : event === 'detached' ? 'deactivate' : 'activate',
       subject: `host:${host}`,
-      body: { buildId, event, ...(reason ? { reason } : {}) },
+      body: {
+        buildId,
+        event,
+        ...(event === 'removed'
+          ? {
+              buildRecord: await buildRecordOf(prov, doc.id, target),
+            }
+          : {}),
+        ...(reason ? { reason } : {}),
+      },
     });
+    // The snapshot is gone from the host: it no longer holds the build, so `heldBy` drops it now
+    // rather than at the agent's next inventory.
+    if (event === 'removed') {
+      const holds = { ...st.holds };
+      delete holds[buildId];
+      st.holds = holds;
+    }
     return { status: 200, body: { recorded: event } };
   },
 
@@ -906,7 +948,12 @@ export const HOST_HANDLERS: Record<string, Handler> = {
           ? {
               rule: 'T.unique',
               passed: false,
-              message: `another build of this template (${twin.handle ?? twin.buildId}, ${twin.status}) already has this manifest hash`,
+              // A retired twin is the host's "already built" short cut reporting a snapshot that
+              // removal has not reached (or keeps, being shared): say how to get a new build.
+              message:
+                twin.status === 'retired'
+                  ? `the same snapshot as retired build ${twin.handle ?? twin.buildId}: change the spec, or create again after its snapshot is removed from the host`
+                  : `another build of this template (${twin.handle ?? twin.buildId}, ${twin.status}) already has this manifest hash`,
             }
           : { rule: 'T.unique', passed: true },
       );
@@ -951,7 +998,8 @@ export const HOST_HANDLERS: Record<string, Handler> = {
 
 /**
  * The wanted answer (§6.3), for GET /v1/hosts/{host}/wanted: `run` in the wanted order (first
- * leased first, the order the agent starts them in), `stop`, and `starting` (§6.5). `grace`: the
+ * leased first, the order the agent starts them in), `stop`, `starting` (§6.5) and `remove`
+ * (§6.1 step 7). `grace`: the
  * host has an idle grace (§6.5): its graced builds stay in `run` and are listed in `graced`, and a
  * graced worker displaced for a wanted build is re-checked for a lease at stop time, under the
  * activation lock (so a lease being taken is written, or not yet begun).
@@ -973,21 +1021,35 @@ async function wantedAnswer(
   const p = place(docs, views, nowS, busy);
   const run: Record<string, unknown>[] = [];
   const stop: Record<string, unknown>[] = [];
+  const remove: Record<string, unknown>[] = [];
   // The unleased builds this host keeps running in its idle grace, after `run`'s wanted ones (the
   // agent starts nothing for them: their units run).
   const keep: Record<string, unknown>[] = [];
   const displaced: Record<string, unknown>[] = [];
   const shared = liveSnapshots(docs);
+  // The workers with a sandbox whose egress events this host may still ship (live, or ended less
+  // than EGRESS_GRACE_S ago: egressAccepts). A retired build's worker among them is stopped but not
+  // yet removed: its `removed` drops the build from the host's holds, and with it the host's right
+  // to ship those sandboxes' last events (hostSandboxes), which the agent sends after the removal.
+  const egressOpen = new Set(
+    egressAccepts(await hostSandboxes(deps, host, nowS), nowS).map((r) => r.worker),
+  );
   for (const d of docs) {
     for (const b of d.builds) {
       if (!mine || mine.holds[b.buildId] === undefined || !hostManaged(b)) continue;
       const entry = { template: d.id, buildId: b.buildId, worker: b.worker };
-      // A retired build has no lease and is never placed or graced: its worker stops once idle.
+      // A retired build has no lease and is never placed or graced: once its worker is idle (no
+      // live sandbox, no pinned session's hold) it is stopped, then removed from the host with its
+      // snapshot.
       if (b.status === 'retired') {
-        // Its snapshot or worker serves a build that is not retired: left alone.
+        // Its snapshot or worker serves a build that is not retired: left alone (that build's
+        // own entries decide whether its worker runs).
         if (shared(b)) continue;
         if (mine.refused) delete mine.refused[b.buildId];
-        if (b.worker && !busy.has(b.worker)) stop.push(entry);
+        if (b.worker && !busy.has(b.worker)) {
+          stop.push(entry);
+          if (!egressOpen.has(b.worker)) remove.push(entry);
+        }
         continue;
       }
       if (b.status !== 'registered') continue;
@@ -1044,7 +1106,7 @@ async function wantedAnswer(
   run.push(...keep);
   // One worker id can serve two builds (two builds of one template from one image): a worker in
   // `run` for one (wanted or graced) is never in `stop` for the other, or every poll would stop and
-  // restart it.
+  // restart it. A retired build in `remove` shares no worker with a build in `run` (liveSnapshots).
   const runs = new Set(run.map((e) => e.worker));
   const stops = stop.filter((e) => !runs.has(e.worker));
   // Of `run`, the builds whose worker is not attached to the relay (its presence, as readiness
@@ -1068,6 +1130,7 @@ async function wantedAnswer(
     body: {
       run,
       stop: stops,
+      remove,
       ...(starting ? { starting } : {}),
       ...(grace ? { graced: keep.map((x) => x.buildId as string) } : {}),
     },

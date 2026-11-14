@@ -12,8 +12,9 @@
 # memory.stat, under SBX_SYS_ROOT) and a memory file of the wrong size is reported and never started;
 # at most SBX_START_CONCURRENCY workers start at once, never waited on, and the measured start time is
 # reported; a graced build is kept running, never started; the egress step (journalctl mocked) ships
-# only this host's sandboxes' proxy events, as written, never acting on moca-egress; and the agent
-# refuses its own bad settings before it calls anything.
+# only this host's sandboxes' proxy events, as written, never acting on moca-egress; a retired build
+# is removed only when named and matched by this host's own record, never under a running worker;
+# and the agent refuses its own bad settings before it calls anything.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 TMP="$(mktemp -d)"
@@ -106,6 +107,13 @@ cat >"$TMP/bin/flock" <<'MOCK'
 #!/usr/bin/env bash
 [[ ! -e "$MOCK_STATE/locked" && ! -e "$MOCK_STATE/locked-${!#}" ]]
 MOCK
+# install-host.sh: logs its argv; --uninstall removes the worker's env file, as the real one does.
+cat >"$TMP/bin/install-host" <<'MOCK'
+#!/usr/bin/env bash
+printf 'install-host %s\n' "$*" >>"$MOCK_LOG"
+[[ -z "${MOCK_UNINSTALL_FAIL:-}" ]] || { echo '==> stopping'; echo 'install-host.sh: the unit would not stop' >&2; exit 1; }
+[[ "$1" == --uninstall ]] && rm -f "$SBX_ENV_DIR/workers/$2.env"
+MOCK
 # journalctl: logs its argv; answers -o json entries from $MOCK_STATE/journal (one JSON entry a line,
 # each with __CURSOR), from --cursor or after --after-cursor when given. As journalctl (257) does: a
 # cursor it cannot parse (here: one with no digit) is "Failed to seek to cursor" and exit 1; a
@@ -131,7 +139,7 @@ elif [[ -n "$at" ]]; then awk -v c="$c" 'index($0, "\"__CURSOR\":\"" c "\"") { s
 else awk -v c="$c" 'seen { print } index($0, "\"__CURSOR\":\"" c "\"") { seen = 1 }' "$MOCK_STATE/journal" | full "$@"
 fi
 MOCK
-chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock" "$TMP/bin/journalctl"
+chmod +x "$TMP/bin/curl" "$TMP/bin/template-build" "$TMP/bin/systemctl" "$TMP/bin/flock" "$TMP/bin/journalctl" "$TMP/bin/install-host"
 printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
 mkdir -p "$TMP/workers"
 : >"$TMP/kernel"
@@ -139,6 +147,7 @@ mkdir -p "$TMP/workers"
 export PATH="$TMP/bin:$PATH" MOCK_LOG="$TMP/log" MOCK_STATE="$TMP/state" MOCK_TOKEN_FILE="$TMP/token" MOCK_GATE="$GATE"
 export SBX_API_URL=https://cp.example.invalid SBX_HOST_ID=host-1 SBX_HOST_TOKEN_FILE="$TMP/token" SBX_KERNEL="$TMP/kernel"
 export SBX_SRV="$TMP/srv" SBX_ENV_DIR="$TMP" SBX_TEMPLATE_BUILD="$TMP/bin/template-build" SBX_DISK_FLOOR_GB=0
+export SBX_INSTALL_HOST="$TMP/bin/install-host"
 # The system root /proc and /sys/fs/cgroup are read from: a host of 16 GiB, 12 free.
 SYS="$TMP/sys"
 mkdir -p "$SYS/proc/pressure" "$SYS/sys/fs/cgroup/sbx.slice"
@@ -164,7 +173,7 @@ run() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --once >"$TMP/out" 
 # 1. A good build: claimed, built, reported with both files; the token only in a header file.
 job "$GATE_SHA"
 run || fail 'a good poll failed'
-grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"started":0,"stopped":0,"errors":0' "$TMP/out" || fail 'summary'
+grep -q '"agent":"summary","claimed":1,"built":1,"failed":0,"started":0,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'summary'
 R="$TMP/state/POST_v1_hosts_host-1_builds_b-0123456789abcdef0123456789_report"
 jq -e '.event == "built" and (.templateRecord | fromjson | .manifest_hash == "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
   and (.manifest | fromjson | .hash_version == 2)' "$R" >/dev/null || fail 'the built report does not carry T and S as files'
@@ -196,7 +205,7 @@ grep -q '^build ' "$MOCK_LOG" && fail 'built with a gate record that does not ma
 grep -q 'does not match its digest' "$TMP/out" || fail 'the mismatch was not reported'
 jq -e '.event == "failed" and .step == "gate" and .message == "agent_error: the gate record does not match its digest"' "$R" >/dev/null ||
   fail 'the claimed build was not reported failed on a gate digest mismatch'
-grep -q '"agent":"summary","claimed":1,"built":0,"failed":1,"started":0,"stopped":0,"errors":0' "$TMP/out" || fail 'summary of a gate mismatch'
+grep -q '"agent":"summary","claimed":1,"built":0,"failed":1,"started":0,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'summary of a gate mismatch'
 pass 'a gate record is checked against its digest before any build, and the claimed build reported failed'
 
 # 5. Below the disk floor, nothing is claimed.
@@ -321,7 +330,7 @@ chmod +x "$TMP/bin/template-build"
 run || fail 'a build with an empty log failed the poll'
 jq -e '.event == "failed" and .step == "build" and (.message | startswith("build_failed: template-build.sh exit 137"))' "$R" >/dev/null ||
   fail 'a build with an empty log is not reported failed'
-grep -q '"agent":"summary","claimed":1,"built":0,"failed":1,"started":0,"stopped":0,"errors":0' "$TMP/out" || fail 'no summary after an empty build log'
+grep -q '"agent":"summary","claimed":1,"built":0,"failed":1,"started":0,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'no summary after an empty build log'
 pass 'a build that dies with no output is reported failed, and the poll ends with its summary'
 
 # 12. Every way out short of `built` after a claim reports the build failed (agent_error), so it
@@ -357,7 +366,7 @@ chmod +x "$TMP/bin/template-build"
 run || fail 'a poll whose record is not JSON ended early'
 jq -e '.event == "failed" and .message == "agent_error: the template record names no snapshot"' "$R" >/dev/null ||
   fail 'a build with a record that is not JSON was not reported failed'
-grep -q '"agent":"summary","claimed":1,"built":0,"failed":1,"started":0,"stopped":0,"errors":0' "$TMP/out" || fail 'no summary after a record that is not JSON'
+grep -q '"agent":"summary","claimed":1,"built":0,"failed":1,"started":0,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'no summary after a record that is not JSON'
 rm -f "$TMP/srv/templates/"*.json
 pass 'a claimed build is reported failed (agent_error) on a failed gate fetch, a missing record, or a record that is not JSON'
 
@@ -418,7 +427,7 @@ grep -q 'builds/claim' "$MOCK_LOG" && fail 'the wanted-only run claimed a build'
 grep -q '^build ' "$MOCK_LOG" && fail 'the wanted-only run built'
 grep -q 'hosts/host-1/inventory' "$MOCK_LOG" || fail 'the wanted-only run did not report the inventory'
 grep -q 'systemctl start sbx-worker@sbx_t2.service' "$MOCK_LOG" || fail 'the wanted-only run did not start the wanted worker'
-grep -q '"agent":"summary","claimed":0,"built":0,"failed":0,"started":1,"stopped":0,"errors":0' "$TMP/out" || fail 'the wanted-only summary'
+grep -q '"agent":"summary","claimed":0,"built":0,"failed":0,"started":1,"stopped":0,"removed":0,"errors":0' "$TMP/out" || fail 'the wanted-only summary'
 rm -f "$TMP/state/active-sbx-worker@sbx_t2.service"; touch "$TMP/state/locked"; : >"$MOCK_LOG"
 bash "$A" --wanted-only >"$TMP/out" 2>&1 || fail 'the locked run failed'
 grep -q 'systemctl start' "$MOCK_LOG" && fail 'started a worker while another run held the lock'
@@ -923,5 +932,99 @@ jq -e '.cursor == "c3006" and (.events | length) == 999' "$TMP/state/egress-post
 grep -q 'EGRESS_BUDGET_S=120$' "$A" || fail 'the shipped budget is not 120 s'
 rm -f "$TMP/state/active-moca-egress.service"
 pass 'stops starting batches after the time budget, the cursor at the last batch taken; the next run goes on'
+
+# 27. Removal of retired builds (§6.1 step 7): only a build the control plane names AND this host's
+#     own record matches (manifest hash and worker), never a running worker, nothing else deleted;
+#     a worker in `stop` beside `remove` is stopped, then removed, in one run.
+#     The snapshots are well-formed (snapfiles), so the memory report says nothing of them.
+rm -rf "$TMP/srv/templates" "$TMP/srv/snapshots"; mkdir -p "$TMP/srv/templates" "$TMP/srv/snapshots"
+rm -f "$TMP/state/active-"*
+H="sha256:$(printf 'e%.0s' {1..64})" W=sbx_ret_1 OTHER="sha256:$(printf 'f%.0s' {1..64})"
+snapfiles "$TMP/srv/snapshots/ret-1" 4096; snapfiles "$TMP/srv/snapshots/keep-1" 4096
+jq -n --arg h "$H" --arg w "$W" '{schema: "moca-sbx-template/1", id: "ret", worker: $w, snapshot: "ret-1", manifest_hash: $h}' >"$TMP/srv/templates/ret-1.json"
+jq -n --arg h "$OTHER" '{schema: "moca-sbx-template/1", id: "keep", worker: "sbx_keep_1", snapshot: "keep-1", manifest_hash: $h}' >"$TMP/srv/templates/keep-1.json"
+: >"$TMP/workers/$W.env"
+wo() { : >"$MOCK_LOG"; rm -f "$TMP/state/POST_"*; bash "$A" --wanted-only >"$TMP/out" 2>&1; }
+# A running worker the control plane names only in `remove` is not removed.
+touch "$TMP/state/active-sbx-worker@$W.service"
+jq -n --arg h "$H" --arg w "$W" '{run: [], stop: [], remove: [{template: "ret", buildId: $h, worker: $w}]}' >"$TMP/state/wanted-answer"
+wo || fail 'the removal run failed'
+grep -q 'still running' "$TMP/out" || fail 'a running worker was not skipped'
+[[ -d "$TMP/srv/snapshots/ret-1" ]] || fail 'removed the snapshot of a running worker'
+grep -q 'install-host --uninstall' "$MOCK_LOG" && fail 'uninstalled a running worker'
+# In `stop` too: stopped, uninstalled, its snapshot and record gone, reported removed; the other untouched.
+jq -n --arg h "$H" --arg w "$W" '{run: [], stop: [{template: "ret", buildId: $h, worker: $w}],
+  remove: [{template: "ret", buildId: $h, worker: $w}]}' >"$TMP/state/wanted-answer"
+wo || fail 'the removal run failed'
+grep -q "\"agent\":\"stopped\",\"worker\":\"$W\"" "$TMP/out" || fail 'a retired worker was not stopped before its removal'
+grep -q "\"agent\":\"removed\",\"worker\":\"$W\"" "$TMP/out" || fail 'a retired worker was not removed in the run that stopped it'
+grep -qx "install-host --uninstall $W --keep-shared" "$MOCK_LOG" || fail 'the worker was not uninstalled alone (--keep-shared)'
+[[ ! -e "$TMP/srv/snapshots/ret-1" && ! -e "$TMP/srv/templates/ret-1.json" ]] || fail 'the snapshot or its record is still there'
+[[ -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] || fail 'removed a build it was not asked to'
+jq -e --arg h "$H" '.buildId == $h and .event == "removed"' "$TMP/state/POST_v1_hosts_host-1_workers_report" >/dev/null || fail 'the removal was not reported'
+grep -q '"stopped":1,"removed":1,"errors":0' "$TMP/out" || fail 'the summary does not count the removal'
+# A name this host's records do not match (a held build, another worker) deletes nothing; nor a malformed one.
+jq -n --arg h "$OTHER" '{run: [], stop: [], remove: [{template: "keep", buildId: $h, worker: "sbx_wrong_1"}]}' >"$TMP/state/wanted-answer"
+wo || fail 'the mismatched removal run failed'
+[[ -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] || fail 'removed a build whose worker did not match'
+grep -q 'no template record here' "$TMP/out" || fail 'a mismatched removal does not say why'
+grep -q 'workers/report' "$MOCK_LOG" && fail 'a mismatched removal was reported'
+jq -n '{run: [], stop: [], remove: [{template: "x", buildId: "../../etc", worker: "sbx_x"}]}' >"$TMP/state/wanted-answer"
+wo || fail 'the malformed removal run failed'
+grep -q 'build id to remove is malformed' "$TMP/out" || fail 'a malformed build id was not refused'
+# The name check before the delete: a record that matches but names no plain entry under snapshots/
+# (a parent, a hidden entry, a path, an empty or missing name, a non-string) deletes nothing and
+# reports nothing.
+H2="sha256:$(printf 'd%.0s' {1..64})" W2=sbx_bad_1
+mkdir -p "$TMP/srv/snapshots/.hidden" "$TMP/srv/snapshots/a/b" "$TMP/srv/snapshots/null"
+rm_wanted() { jq -n --arg h "$1" --arg w "$2" '{run: [], stop: [], remove: [{template: "x", buildId: $h, worker: $w}]}' >"$TMP/state/wanted-answer"; }
+rm_wanted "$H2" "$W2"
+for name in '".."' '".hidden"' '"a/b"' '""' 'null' '42' '["x"]' '{}' 'absent'; do
+  if [[ "$name" == absent ]]; then
+    jq -n --arg h "$H2" --arg w "$W2" '{schema: "moca-sbx-template/1", worker: $w, manifest_hash: $h}'
+  else
+    jq -n --arg h "$H2" --arg w "$W2" --argjson n "$name" '{schema: "moca-sbx-template/1", worker: $w, snapshot: $n, manifest_hash: $h}'
+  fi >"$TMP/srv/templates/bad-1.json"
+  wo || fail "the removal run with snapshot $name failed"
+  grep -q 'a template record names a bad snapshot' "$TMP/out" || fail "a record naming snapshot $name was not refused"
+  [[ -f "$TMP/srv/templates/bad-1.json" && -d "$TMP/srv/snapshots/.hidden" && -d "$TMP/srv/snapshots/a/b" &&
+    -d "$TMP/srv/snapshots/null" && -d "$TMP/srv/snapshots/keep-1" && -f "$TMP/srv/templates/keep-1.json" ]] ||
+    fail "a record naming snapshot $name deleted something"
+  ! grep -q 'install-host\|workers/report' "$MOCK_LOG" || fail "a record naming snapshot $name was uninstalled or reported"
+done
+rm -f "$TMP/srv/templates/bad-1.json"
+# An uninstall that fails keeps the snapshot and its record, sends no report, and says why (its last
+# lines: the log goes with the run's work directory). No install-host.sh at SBX_INSTALL_HOST, the same.
+H3="sha256:$(printf 'c%.0s' {1..64})" W3=sbx_unin_1
+snapfiles "$TMP/srv/snapshots/unin-1" 4096
+jq -n --arg h "$H3" --arg w "$W3" '{schema: "moca-sbx-template/1", worker: $w, snapshot: "unin-1", manifest_hash: $h}' >"$TMP/srv/templates/unin-1.json"
+: >"$TMP/workers/$W3.env"
+rm_wanted "$H3" "$W3"
+MOCK_UNINSTALL_FAIL=1 wo || fail 'the run with a failing uninstall failed'
+grep -q "install-host.sh --uninstall $W3 failed: ==> stopping install-host.sh: the unit would not stop" "$TMP/out" ||
+  fail 'a failed uninstall does not carry its last lines'
+[[ -f "$TMP/srv/snapshots/unin-1/manifest.json" && -f "$TMP/srv/templates/unin-1.json" ]] || fail 'a failed uninstall lost the snapshot or its record'
+! grep -q 'workers/report' "$MOCK_LOG" || fail 'a failed uninstall was reported'
+SBX_INSTALL_HOST="$TMP/no-such-install-host" wo || fail 'the run with no install-host.sh failed'
+grep -q "no install-host.sh at $TMP/no-such-install-host" "$TMP/out" || fail 'a missing install-host.sh is not named'
+[[ -f "$TMP/srv/snapshots/unin-1/manifest.json" && -f "$TMP/srv/templates/unin-1.json" ]] || fail 'a missing install-host.sh lost the snapshot or its record'
+! grep -q 'workers/report' "$MOCK_LOG" || fail 'a removal with no install-host.sh was reported'
+# A snapshot that cannot be deleted keeps its record (the next run retries) and is not reported;
+# once it can be, it goes. Skipped as root, whom a read-only directory does not stop.
+if [[ "$(id -u)" != 0 ]]; then
+  chmod 0555 "$TMP/srv/snapshots"
+  wo || { chmod 0755 "$TMP/srv/snapshots"; fail 'the run with an undeletable snapshot failed'; }
+  chmod 0755 "$TMP/srv/snapshots"
+  grep -q 'could not delete snapshot unin-1: kept its record' "$TMP/out" || fail 'a failed delete does not say so'
+  [[ -f "$TMP/srv/templates/unin-1.json" ]] || fail 'a failed delete dropped the record'
+  ! grep -q 'workers/report' "$MOCK_LOG" || fail 'a failed delete was reported'
+fi
+wo || fail 'the retried removal failed'
+[[ ! -e "$TMP/srv/snapshots/unin-1" && ! -e "$TMP/srv/templates/unin-1.json" ]] || fail 'the retried removal left the snapshot or its record'
+jq -e --arg h "$H3" '.event == "removed" and .buildId == $h' "$TMP/state/POST_v1_hosts_host-1_workers_report" >/dev/null || fail 'the retried removal was not reported'
+printf '{"run":[],"stop":[]}' >"$TMP/state/wanted-answer"
+wo || fail 'a wanted state without remove failed'
+grep -q '"removed":0,"errors":0' "$TMP/out" || fail 'a wanted state without remove (an older control plane) is not taken'
+pass 'removes a retired build only when named and matched by its own record, never a running worker or a bad snapshot name; a failed uninstall or delete keeps the record and is not reported'
 
 echo 'all host-agent.sh tests passed'

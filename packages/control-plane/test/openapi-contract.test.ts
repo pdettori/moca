@@ -279,3 +279,15 @@ describe('§9.3 test 3 — contract drift', () => {
     expect([...enumerated].sort()).toEqual([...TURN_STATES].sort());
   });
 });
+
+describe('the contract version', () => {
+  it("info.version is the changelog's newest section, and change-policy names it", () => {
+    const changelog = readFileSync(resolve(REPO_ROOT, 'docs/api/CHANGELOG.md'), 'utf8');
+    const top = /^## (\d+\.\d+\.\d+)$/m.exec(changelog)?.[1];
+    expect(top).toBeDefined();
+    expect(doc().info.version).toBe(top);
+    const policy = readFileSync(resolve(REPO_ROOT, 'docs/reference/change-policy.md'), 'utf8');
+    expect(policy).toContain(`says \`version: ${top}\``);
+    expect(policy).toContain(`(control plane ${top},`);
+  });
+});

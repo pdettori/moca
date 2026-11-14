@@ -2,8 +2,10 @@
 # deploy/sbx/host-agent.sh -- sbx-host-agent, a KVM host's template agent
 # (docs/specs/2026-11-03-template-lifecycle-and-provenance-design.md §6.1). One run is one poll:
 # report the inventory, claim queued builds, build each with template-build.sh, report the outcome;
-# then start and stop installed workers as the control plane wants (§6.3). The control plane
-# registers or rejects a built build by policy (§8.2) and decides what runs; nothing here does.
+# then start and stop installed workers as the control plane wants (§6.3), and remove the retired
+# builds it names (§6.1 step 7: the worker uninstalled, the snapshot and its record deleted). The
+# control plane registers or rejects a built build by policy (§8.2) and decides what runs; nothing
+# here does.
 #
 # It installs no worker: a registered build's worker is installed by an operator (install-host.sh,
 # from the template record template-build.sh wrote, with its relay token from setup.sh). A wanted
@@ -18,8 +20,11 @@
 # The wanted state (GET /v1/hosts/<id>/wanted): `run` lists the leased builds placed on this host,
 # `stop` the ones it holds with no lease and no live sandbox (or that another host is placed on). The
 # agent stops each `stop` worker whose unit is active, then starts each `run` worker whose
-# sbx-worker@<id> unit is installed and not active, reporting each start (`attached`), refusal (`refused`, with why) and stop (`detached`) to POST
-# /v1/hosts/<id>/workers/report. Readiness is the relay's attached record, never these reports. A
+# sbx-worker@<id> unit is installed and not active, reporting each start (`attached`), refusal
+# (`refused`, with why) and stop (`detached`) to POST /v1/hosts/<id>/workers/report. `remove` lists
+# the retired builds it holds with no live sandbox (each also in `stop`, so a running worker is
+# stopped first): see removal(), reported `removed`. Readiness is the relay's attached record, never
+# these reports. A
 # lock ($SBX_SRV/.activation.lock, flock) keeps a build poll and a --wanted-only run from applying
 # the wanted state at once: the one that does not get it skips, saying so.
 #
@@ -111,6 +116,8 @@
 #                            of seconds, at most 86400 (a day), without a leading zero. Reported in the
 #                            inventory's limits (idleGraceSeconds); the control plane decides the grace
 #   SBX_TEMPLATE_BUILD       default <repo>/deploy/sbx/template-onboarding/template-build.sh (a test seam)
+#   SBX_INSTALL_HOST         default <repo>/deploy/sbx/install-host.sh: the retired builds' removal runs
+#                            its --uninstall (the units set it to /srv/sbx/src/..., as SBX_TEMPLATE_BUILD)
 #   SBX_REGISTRY             optional; template-build.sh --registry. With it set, no build is claimed
 #                            until REGISTRY_AUTH_FILE (default /run/containers/0/auth.json) holds a
 #                            login for it
@@ -177,7 +184,7 @@
 #
 # The token never reaches argv or a log: curl reads it from a 0600 header file, and no egress event is
 # printed. Output: one JSON line per action, then one summary line {"agent":"summary","claimed","built",
-# "failed","started","stopped","errors"}, in a --wanted-only run followed by "egress":"on"|"off" and
+# "failed","started","stopped","removed","errors"}, in a --wanted-only run followed by "egress":"on"|"off" and
 # "egressRead","egressAccepted","egressRefused","egressSkipped","egressRejected","egressNotOurs"; then,
 # when there is something to say about memory, "psi":"absent", "sliceUnread":[<worker id>...] and
 # "memfileMismatch":<n>; then "startQueued":<n> when the start limit left wanted workers for a later
@@ -187,6 +194,7 @@ export LC_ALL=C
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 : "${SBX_TEMPLATE_BUILD:=$REPO_ROOT/deploy/sbx/template-onboarding/template-build.sh}"
+: "${SBX_INSTALL_HOST:=$REPO_ROOT/deploy/sbx/install-host.sh}"
 HOST_ID_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 HANDLE_RE='^b-[0-9a-f]{26}$'
 WORKER_RE='^[A-Za-z_][A-Za-z0-9_]*$'
@@ -195,7 +203,7 @@ DIGEST_RE='^sha256:[0-9a-f]{64}$'
 
 say() { printf '%s\n' "$*"; }
 refuse() { echo "sbx-host-agent: $*" >&2; exit 2; }
-CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0
+CLAIMED=0 BUILT=0 FAILED=0 ERRORS=0 STARTED=0 STOPPED=0 REMOVED=0
 : "${SBX_SYS_ROOT:=/}" # a test seam: /proc, /sys
 MEM_SUMMARY='' START_SUMMARY='' GRACE_SUMMARY='' INFLIGHT=0
 BUILD_ID_RE='^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$'
@@ -663,7 +671,54 @@ activation() {
     say "{\"agent\":\"queued\",\"workers\":$queued,\"why\":\"$INFLIGHT starting, SBX_START_CONCURRENCY $SBX_START_CONCURRENCY: started in a later run\"}"
   fi
   ((graced == 0)) || GRACE_SUMMARY=",\"graced\":$graced"
+  # A control plane older than API 1.19.0 sends no `remove`.
+  [[ "$(jq -r '.remove | type' <<<"$wanted")" != array ]] || removal "$wanted"
   exec 9>&-
+}
+
+# The retired builds the control plane names for removal (§6.1 step 7), after `stop` in the same run.
+# The snapshot is found from this host's own template record whose manifest hash is the build id AND
+# whose worker is the one named, never from a path the control plane sends; nothing else is deleted,
+# and a name no record matches deletes nothing. A running worker is not removed (the control plane
+# leaves out one with a live sandbox, and this checks again): it is skipped until it is stopped. The
+# worker is uninstalled first (install-host.sh --uninstall --keep-shared: its own files only, so
+# the last worker's removal leaves the shared units, moca-egress and its credential injection for
+# the next one; its workspace data stays for the janitor), then the snapshot directory and its
+# record go. Each removal is reported `removed`.
+removal() {
+  local w b f rec snap
+  while IFS=$'\t' read -r w b; do
+    [[ "$w" =~ $WORKER_RE ]] || { error 'a worker id to remove is malformed'; continue; }
+    [[ "$b" =~ $DIGEST_RE ]] || { error 'a build id to remove is malformed'; continue; }
+    rec=''
+    for f in "$SBX_SRV"/templates/*.json; do
+      [[ -f "$f" ]] || continue
+      jq -e --arg b "$b" --arg w "$w" '.schema == "moca-sbx-template/1" and .manifest_hash == $b and .worker == $w' "$f" >/dev/null 2>&1 &&
+        { rec="$f"; break; }
+    done
+    [[ -n "$rec" ]] || { error "no template record here for build $b of worker $w"; continue; }
+    # A string only: a missing or non-string `snapshot` is empty (never the word null), and refused.
+    snap="$(jq -r '.snapshot | strings' "$rec" 2>/dev/null)" || snap=''
+    # One plain entry under snapshots/: no slash, and no leading dot (no ., .. or hidden entry).
+    [[ "$snap" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { error 'a template record names a bad snapshot'; continue; }
+    if systemctl is-active --quiet "sbx-worker@$w.service"; then
+      say "{\"agent\":\"skipped\",\"worker\":\"$w\",\"why\":\"still running: removed once it is stopped\"}"
+      continue
+    fi
+    if [[ -f "$SBX_ENV_DIR/workers/$w.env" ]]; then
+      # A unit from before SBX_INSTALL_HOST was set points nowhere: say where, every run, until fixed.
+      [[ -x "$SBX_INSTALL_HOST" ]] || { error "no install-host.sh at $SBX_INSTALL_HOST (set SBX_INSTALL_HOST): worker $w not removed"; continue; }
+      # $WORK goes at exit: the uninstall's last lines go with the error, to the journal.
+      "$SBX_INSTALL_HOST" --uninstall "$w" --keep-shared >"$WORK/uninstall-$w.log" 2>&1 ||
+        { error "install-host.sh --uninstall $w failed: $(tail -n 3 "$WORK/uninstall-$w.log" | tr '\n' ' ')"; continue; }
+    fi
+    # The record goes only once the snapshot is gone, so a failed delete is retried next run and the
+    # snapshot is never left on disk with no record to find it by.
+    rm -rf -- "${SBX_SRV:?}/snapshots/$snap" && [[ ! -e "$SBX_SRV/snapshots/$snap" ]] ||
+      { error "could not delete snapshot $snap: kept its record, retried next run"; continue; }
+    rm -f -- "$rec" || { error "could not delete the template record of $snap"; continue; }
+    REMOVED=$((REMOVED + 1)); worker_report "$b" removed; say "{\"agent\":\"removed\",\"worker\":\"$w\"}"
+  done < <(jq -r '.remove[] | [.worker, .buildId] | @tsv' <<<"$1")
 }
 
 # The egress post, with curl's status rather than -f's failure, so a 400 can be told from a 503: the
@@ -863,7 +918,7 @@ egress() {
 }
 
 summary() { # summary [MORE]: MORE follows "errors" in the line (the egress counts)
-  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"errors\":$ERRORS${1:-}$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
+  say "{\"agent\":\"summary\",\"claimed\":$CLAIMED,\"built\":$BUILT,\"failed\":$FAILED,\"started\":$STARTED,\"stopped\":$STOPPED,\"removed\":$REMOVED,\"errors\":$ERRORS${1:-}$MEM_SUMMARY$START_SUMMARY$GRACE_SUMMARY}"
 }
 
 main() {

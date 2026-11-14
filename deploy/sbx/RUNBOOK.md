@@ -913,7 +913,8 @@ The self-serve template build of the
 §6.1, and the activation of §6.3. `deploy/sbx/host-agent.sh --once` is one poll of a KVM host's
 agent: it reports what the host holds, claims queued template builds (clients create them with
 `POST /v1/templates`), runs `template-build.sh` on each with its gate record, and reports the
-result; then it starts and stops installed workers by the host's wanted state. The control plane
+result; then it starts and stops installed workers by the host's wanted state, and removes the
+retired builds it is told to (worker and snapshot). The control plane
 registers or rejects each built build by policy; nobody approves it. It needs:
 
 - on the control plane, the template store and this host's bearer: run `setup.sh` with
@@ -934,8 +935,8 @@ registers or rejects each built build by policy; nobody approves it. It needs:
   `sbx-host-agent.service` with its timer (every 2 minutes) and `sbx-host-agent-wanted.service`
   with its timer (every 15 s, the wanted state alone); then `systemctl daemon-reload` and
   `systemctl enable --now sbx-host-agent.timer sbx-host-agent-wanted.timer`. The unit sets
-  `SBX_TEMPLATE_BUILD` to the checkout at `/srv/sbx/src` (the agent cannot find it from
-  `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's
+  `SBX_TEMPLATE_BUILD` and `SBX_INSTALL_HOST` to the checkout at `/srv/sbx/src` (the agent cannot
+  find them from `/usr/local/libexec`) and `REGISTRY_AUTH_FILE=/run/containers/0/auth.json` (it hides root's
   home): log root's podman in with `--authfile /run/containers/0/auth.json`. With `SBX_REGISTRY`
   set, no build is claimed until that file holds a login for it. The unit also gives Go a home and
   caches under `/srv/sbx` (`build-snapshot.sh` compiles the guest agent): run
@@ -947,7 +948,7 @@ It never claims a build below `SBX_DISK_FLOOR_GB` of free disk (default 60), cla
 `SBX_BUILD_CONCURRENCY` builds a poll (default 1, at most 4), and checks a gate record's bytes
 against their sha256 before building with it. The token stays in a 0600 header file, never in argv
 or the log. A bad setting is refused (exit 2) before any call. Each run ends with one summary line,
-`{"agent":"summary","claimed","built","failed","started","stopped","errors"}`, in the unit's
+`{"agent":"summary","claimed","built","failed","started","stopped","removed","errors"}`, in the unit's
 journal, with `"psi":"absent"`, `"sliceUnread":[...]` and `"memfileMismatch":<n>` when there is
 something to say about memory, `"startQueued":<n>` when the start limit left wanted workers for a
 later run, and `"graced":<n>` when the idle grace keeps any.
@@ -1159,6 +1160,26 @@ while, so a template used again soon is warm (no memory-file read at all).
   and stops released workers as before; the agent then just applies `stop`. **Roll out the control
   plane before setting `SBX_IDLE_GRACE_S` on a host**: the order is the control plane, then the
   agent, then the setting.
+
+**Retired builds are removed by the agent.** Once a client retires a template or a build (`POST
+/v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`, or `mocactl sbx templates
+retire`), each host holding it gets it in its wanted state's `stop` and `remove` as soon as no live
+sandbox runs on its worker and no pinned session's hold keeps it; a worker whose sandbox ended less
+than 600 s ago is in `stop` only until then, so the host still ships that sandbox's last egress
+events (`retire --wait`'s default `--timeout`, 900 s, covers that window). In the same run the agent stops the worker, runs `install-host.sh
+--uninstall <worker> --keep-shared` (`SBX_INSTALL_HOST`), deletes the snapshot directory and its template record
+under `/srv/sbx`, and reports `removed`: the template's provenance gains a `retire` record by
+`host:<id>`, and the build's `heldBy` (`GET /v1/templates/{id}/builds/{build}`) no longer lists the
+host. It deletes only what its own template record names for that build id and worker, never a
+running worker's; a name no record matches is an `error` line and deletes nothing. The worker's
+workspace data stays for the janitor, as with any uninstall. `--keep-shared` removes the worker's own
+files only: even the host's last worker leaves the shared units (`sbx-worker@.service`, `sbx.slice`),
+`moca-egress` and its credential injection in place for the next worker, so a client's retire never
+undoes an operator's `--egress`. To remove them from a host with no worker left, run `install-host.sh
+--uninstall <that worker>` again without it (§12). Also re-run `setup.sh` without the
+worker's id in `SBX_WORKERS` (§5) to revoke its relay token. `mocactl sbx templates retire ID
+--wait` returns once the worker has stopped and every holding host has removed it; a host that is
+down removes it at its next poll.
 
 **A registered build's worker is still installed by an operator.** The agent builds, reports, and
 starts and stops installed workers; it installs none, and a wanted build whose worker is not
