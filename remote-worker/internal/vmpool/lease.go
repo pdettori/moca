@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -111,6 +112,13 @@ type leaseVictim struct {
 	// unpinned run with no lease would not be busy, so WorkspaceIdle or Reclaim could
 	// remove the tree under the dying VM.
 	rp *runPool
+	// mode and tracked are the lease's level and its tracked mirror when it was detached,
+	// and endAt the At of the end event endLeaseLocked saved (zero for a detach, whose open
+	// record stays). The sync step's table is diffed against tracked, and refreshes that
+	// end, or that open record (ruling P5-R38: refreshEndedTracked).
+	mode    Mode
+	tracked []TrackedProcess
+	endAt   time.Time
 }
 
 // routeExec decides how a lease-enabled pool serves e: the effective mode, and for a
@@ -853,18 +861,26 @@ func (p *pool) endLeaseLocked(rp *runPool, reason LeaseEndReason) *leaseVictim {
 		return nil
 	}
 	v.reason = reason
-	if reason == LeaseEndTeardownFailed {
+	switch reason {
+	case LeaseEndTeardownFailed:
 		v.sync = false // the guest is not fit to answer; the end does not wait on it
+	case LeaseEndSandboxDeleted:
+		// The workspace is going away (ruling P5-R39): there are no writes to keep, and the
+		// end does not wait on the guest for them. Its stopped list stays the mirror's.
+		v.sync = false
 	}
 	// agent_dead still syncs (ruling P5-R36): it also covers the host's own deadline and an
 	// abort, where the guest usually lives on with a tracked process's unsynced writes, and an
-	// agent that is really gone refuses the sync at once.
+	// agent that is really gone refuses the sync at once. memory_reclaim syncs too: losing a
+	// tracked process's writes is worse than a reclaim that waits on a wedged guest, up to
+	// the ~40 s bound (10 s vsock connect + LeaseEndSyncTimeout).
 	now := p.clk.Now()
 	age := now.Sub(l.started)
 	s := p.leaseStateLocked(rp)
 	s.Open = nil
 	run := runningTracked(l.tracked)
-	s.Pending = &LeaseEvent{State: leaseEventEnd, Reason: reason, At: leaseEventAt(now), Mode: l.mode, Age: age,
+	v.endAt = leaseEventAt(now)
+	s.Pending = &LeaseEvent{State: leaseEventEnd, Reason: reason, At: v.endAt, Mode: l.mode, Age: age,
 		Processes: displays(run), Tracked: run}
 	if s.Known && leaseStateFileGone(p.cfg.WorkspaceRoot, rp.key) {
 		// The janitor removed the file of a deleted sandbox while this lease was live (a
@@ -898,7 +914,7 @@ func (p *pool) detachLeaseLocked(rp *runPool) *leaseVictim {
 	rp.lease = nil
 	close(l.gone)
 	return &leaseVictim{key: rp.key, vm: l.vm, gate: rp.execGate, reason: LeaseEndWorkerRestart,
-		sync: l.mode == ModeLeaseProcesses || len(l.tracked) > 0}
+		sync: l.mode == ModeLeaseProcesses || len(l.tracked) > 0, mode: l.mode, tracked: slices.Clone(l.tracked)}
 }
 
 // endOrDetachLocked is endLeaseLocked, or detachLeaseLocked on a closed pool. Caller
@@ -925,19 +941,65 @@ const leaseEndSyncCommand = "sync"
 const LeaseEndSyncTimeout = 30 * time.Second
 
 // destroyLeaseVictim is destroyLeaseVM for an ended (or detached) lease: a victim marked
-// sync has its guest synced first. A failed sync is logged; the destroy goes ahead.
+// sync has its guest synced first. A failed sync is logged; the destroy goes ahead. A
+// sync that succeeded answers with the guest's whole tracked table, like every lease End,
+// and that refreshes the end before the end is reported (refreshEndedTracked).
 func (p *pool) destroyLeaseVictim(v *leaseVictim) error {
 	if v.sync {
 		ctx, cancel := context.WithTimeout(context.Background(), LeaseEndSyncTimeout)
 		res, err := v.vm.Run(ctx, Command{Command: leaseEndSyncCommand, Lease: true,
 			TimeoutS: uint32(LeaseEndSyncTimeout / time.Second), CapBytes: OutputCapBytes}, discardingSink{})
 		cancel()
-		if err != nil || res.ExitCode != 0 {
-			log.Printf("vmpool: lease end sync workspace_key=%q vm=%s: exit %d, %v; destroying it anyway",
-				v.key, vmID(v.vm), res.ExitCode, err)
+		if err != nil || res.ExitCode != 0 || res.TeardownFailed {
+			log.Printf("vmpool: lease end sync workspace_key=%q vm=%s: exit %d, teardown_failed=%t, %v; destroying it anyway",
+				v.key, vmID(v.vm), res.ExitCode, res.TeardownFailed, err)
+		} else {
+			p.refreshEndedTracked(v, res.Tracked)
 		}
 	}
 	return p.destroyLeaseVM(v.key, v.vm)
+}
+
+// refreshEndedTracked applies the table an ended lease's sync step reported (ruling
+// P5-R38). The mirror only learns of an exit from a lease End, so a tracked process that
+// died since the last one still shows running in v.tracked: here it gets its lease_process
+// exit record (auditTracked, at the lease's level), and leaves the end's stopped list. The
+// list lives in the end event endLeaseLocked saved, matched by its At, or, for a detach,
+// in the open record a worker_restart end is built from, matched by its VM. Only a record
+// still there is rewritten: an end a client acknowledged meanwhile is not brought back, and
+// none is added. Called with rp's gate held and not p.mu.
+func (p *pool) refreshEndedTracked(v *leaseVictim, next []TrackedProcess) {
+	if !auditTracked(v.key, v.mode, nil, v.tracked, next) {
+		return
+	}
+	run := runningTracked(next)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rp := p.runs[v.key]
+	s := p.peekLeaseStateLocked(v.key, rp)
+	switch {
+	case !v.endAt.IsZero() && s.Pending != nil && s.Pending.State == leaseEventEnd && s.Pending.At.Equal(v.endAt):
+		ev := *s.Pending // copied, not written through: the cached state may share it
+		ev.Processes, ev.Tracked = displays(run), run
+		s.Pending = &ev
+	case v.endAt.IsZero() && s.Open != nil && s.Open.VMID == vmID(v.vm):
+		o := *s.Open
+		o.Tracked = next
+		s.Open = &o
+	default:
+		return
+	}
+	if leaseStateFileGone(p.cfg.WorkspaceRoot, v.key) {
+		return // removed by the host janitor: not written back (endLeaseLocked's rule)
+	}
+	if err := saveLeaseState(p.cfg.WorkspaceRoot, v.key, s); err != nil {
+		// The end on disk keeps the mirror's list: a process listed as stopped that had
+		// exited by itself, which its exit record above corrects.
+		log.Printf("vmpool: lease end tracked processes for %q: %v", v.key, err)
+	}
+	if rp != nil {
+		rp.state, rp.stateLoaded = s, true
+	}
 }
 
 // destroyLeaseVictims destroys each victim's VM, then releases its gate: the order that

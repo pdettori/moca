@@ -1215,7 +1215,8 @@ func TestDowngradeStopIsBoundedByTheGraceLimit(t *testing.T) {
 // may still be alive, the closed pool's detach (worker_restart) included. A level-1 lease
 // needs none (nothing outlives an Exec's sync), nor does a guest whose teardown failed. An
 // agent_dead end still syncs (ruling P5-R36): it covers the host's own deadline and an abort,
-// where the guest usually lives, and a dead agent refuses at once.
+// where the guest usually lives, and a dead agent refuses at once. A sandbox_deleted end
+// does not sync (ruling P5-R39).
 func TestLevel2LeaseEndSyncsBeforeDestroy(t *testing.T) {
 	started := time.Unix(1_700_000_000, 0)
 	for _, tc := range []struct {
@@ -1249,6 +1250,13 @@ func TestLevel2LeaseEndSyncsBeforeDestroy(t *testing.T) {
 			})
 			_, _ = p.Exec(t.Context(), "k", level2Exec("ls", 1), &capturingSink{})
 		}, true},
+		// Ruling P5-R39 (final review M5): the workspace of a deleted sandbox is going away,
+		// so its writes need no sync, and the end does not wait on the guest for them.
+		{"sandbox_deleted", true, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
+			if err := p.EndLease("k", LeaseEndSandboxDeleted); err != nil {
+				t.Fatalf("EndLease: %v", err)
+			}
+		}, false},
 		{"level 1 reset", false, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
 			if err := p.EndLease("k", LeaseEndReset); err != nil {
 				t.Fatalf("EndLease: %v", err)
@@ -1293,6 +1301,135 @@ func TestLevel2LeaseEndSyncsBeforeDestroy(t *testing.T) {
 			}
 			if s := lc.syncCommands(); len(s) != 1 || !s[0].Lease || s[0].Kind != ExecKindCommand || s[0].TimeoutS == 0 {
 				t.Fatalf("sync steps %+v, want one bounded lease command", s)
+			}
+		})
+	}
+}
+
+// Ruling P5-R38 (final review I1): the mirror learns of an exit only from a lease End, so a
+// tracked process that died between calls would be listed as stopped by the end and never
+// get its exit record. The level-2 end's sync step answers with the guest's whole table: it
+// refreshes the mirror before the end is reported. A process that table shows exited is not
+// in the end's stopped list -- in the pending event or on disk -- and gets its lease_process
+// exit record, once. The worker_restart detach (Close) refreshes the open lease's mirror
+// instead, so the next process's end lists only what was still running.
+func TestLeaseEndSyncRefreshesTheMirror(t *testing.T) {
+	started := time.Unix(1_700_000_000, 0)
+	web := running("1", "web", 412, started)
+	api := running("2", "api", 413, started)
+	webDied := web
+	webDied.State, webDied.Code = "exited", 3
+
+	t.Run("reset", func(t *testing.T) {
+		logs := captureLog(t)
+		p, lc, _ := processPool(t)
+		tab := &fakeTable{}
+		reportTable(lc, tab)
+		mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+		tab.set(web, api)
+		mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "api"}, 1))
+		// web dies between calls: only the end's sync step sees it.
+		lc.setSyncFn(func(Command) (Result, error) { return Result{Tracked: []TrackedProcess{webDied, api}}, nil })
+
+		if err := p.EndLease("k", LeaseEndReset); err != nil {
+			t.Fatalf("EndLease: %v", err)
+		}
+		ev := p.LeaseStatus("k").Pending
+		if ev == nil || ev.Reason != LeaseEndReset {
+			t.Fatalf("pending = %+v, want the reset end", ev)
+		}
+		if want := []string{"api (pid 413)"}; !slices.Equal(ev.Processes, want) || !trackedIDsEqual(ev.Tracked, "2") {
+			t.Fatalf("end lists %q / %+v, want only api: web had exited before the end", ev.Processes, ev.Tracked)
+		}
+		if s := loadLeaseState(p.cfg.WorkspaceRoot, "k"); s.Pending == nil || !s.Pending.At.Equal(ev.At) ||
+			!slices.Equal(s.Pending.Processes, ev.Processes) || !trackedIDsEqual(s.Pending.Tracked, "2") {
+			t.Fatalf("state file pending = %+v, want the refreshed end persisted", s.Pending)
+		}
+		exits := auditRecords(logs, "exit")
+		if len(exits) != 1 || !strings.Contains(exits[0], "id=1") || !strings.Contains(exits[0], "code=3") {
+			t.Fatalf("exit records %q, want one for web, exited(3)", exits)
+		}
+		// The next lease's first Exec delivers it; nothing writes the record again.
+		mustExec(t, p, "k", level2Exec("ls", 1))
+		if n := len(auditRecords(logs, "exit")); n != 1 {
+			t.Fatalf("exit records = %d after the next lease, want still 1", n)
+		}
+	})
+
+	t.Run("worker_restart", func(t *testing.T) {
+		root := t.TempDir()
+		clk := newFakeClock()
+		p1, lc1 := processPoolOn(t, root, clk)
+		tab := &fakeTable{}
+		reportTable(lc1, tab)
+		mustSetMode(t, p1, "k", ModeLeaseProcesses, 1)
+		tab.set(web, api)
+		mustExec(t, p1, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "api"}, 1))
+		lc1.setSyncFn(func(Command) (Result, error) { return Result{Tracked: []TrackedProcess{webDied, api}}, nil })
+		if err := p1.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		p2, _ := processPoolOn(t, root, clk)
+		ev := p2.LeaseStatus("k").Pending
+		if ev == nil || ev.Reason != LeaseEndWorkerRestart || !slices.Equal(ev.Processes, []string{"api (pid 413)"}) {
+			t.Fatalf("pending after the restart = %+v, want the worker_restart end listing only api", ev)
+		}
+	})
+
+	// A client that read and acknowledged the end while the sync ran has seen it: the
+	// refresh must not bring it back, nor write a second one.
+	t.Run("acknowledged during the sync", func(t *testing.T) {
+		p, lc, _ := processPool(t)
+		tab := &fakeTable{}
+		reportTable(lc, tab)
+		mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+		tab.set(web)
+		mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+		lc.setSyncFn(func(Command) (Result, error) {
+			if ev := p.LeaseStatus("k").Pending; ev != nil {
+				p.AckLeaseEvent("k", ev.At)
+			}
+			return Result{Tracked: []TrackedProcess{webDied}}, nil
+		})
+		if err := p.EndLease("k", LeaseEndReset); err != nil {
+			t.Fatalf("EndLease: %v", err)
+		}
+		if ev := p.LeaseStatus("k").Pending; ev != nil {
+			t.Fatalf("pending = %+v, want none: the end was acknowledged during the sync", ev)
+		}
+		if s := loadLeaseState(p.cfg.WorkspaceRoot, "k"); s.Pending != nil {
+			t.Fatalf("state file pending = %+v, want none", s.Pending)
+		}
+	})
+
+	// A failed sync says nothing about the table: the end keeps what the mirror showed,
+	// with no exit record (today's behaviour).
+	for name, answer := range map[string]func(Command) (Result, error){
+		"sync error": func(Command) (Result, error) {
+			return Result{}, errors.Join(ErrGuest, errors.New("vsock: connection reset"))
+		},
+		"sync exit 1": func(Command) (Result, error) {
+			return Result{ExitCode: 1, Tracked: []TrackedProcess{webDied}}, nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			logs := captureLog(t)
+			p, lc, _ := processPool(t)
+			tab := &fakeTable{}
+			reportTable(lc, tab)
+			mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+			tab.set(web)
+			mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+			lc.setSyncFn(answer)
+			if err := p.EndLease("k", LeaseEndReset); err != nil {
+				t.Fatalf("EndLease: %v", err)
+			}
+			ev := p.LeaseStatus("k").Pending
+			if ev == nil || !slices.Equal(ev.Processes, []string{"web (pid 412)"}) || !trackedIDsEqual(ev.Tracked, "1") {
+				t.Fatalf("pending = %+v, want the end listing web as the mirror had it", ev)
+			}
+			if exits := auditRecords(logs, "exit"); len(exits) != 0 {
+				t.Fatalf("exit records %q, want none after a failed sync", exits)
 			}
 		})
 	}

@@ -35,7 +35,16 @@ type leaseLauncher struct {
 	normalises  []Command
 	normaliseFn func(Command) (Result, error)
 	// syncs is every lease end's sync step (destroyLeaseVictim), recorded as "sync <id>".
-	syncs []Command
+	// syncFn, when set, answers it; otherwise it succeeds with the tracked table the VM's
+	// last successful Run reported, as a guest whose table has not changed since would.
+	syncs  []Command
+	syncFn func(Command) (Result, error)
+}
+
+func (l *leaseLauncher) setSyncFn(f func(Command) (Result, error)) {
+	l.rec.Lock()
+	l.syncFn = f
+	l.rec.Unlock()
 }
 
 func (l *leaseLauncher) syncCommands() []Command {
@@ -102,6 +111,9 @@ func (l *leaseLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, er
 type leaseFakeVM struct {
 	*fakeVM
 	l *leaseLauncher
+	// lastTracked is the tracked table of this VM's last successful Run, under l.rec: the
+	// default sync step's answer.
+	lastTracked []TrackedProcess
 }
 
 func (v *leaseFakeVM) LeaseCgroup(maxBytes int64) error {
@@ -151,15 +163,25 @@ func (v *leaseFakeVM) Run(ctx context.Context, c Command, out Sink) (Result, err
 		// an Exec's Runs is not thrown by the step a level-2 lease's end takes.
 		v.l.rec.Lock()
 		v.l.syncs = append(v.l.syncs, c)
+		fn, tracked := v.l.syncFn, slices.Clone(v.lastTracked)
 		v.l.rec.Unlock()
 		v.l.record("sync " + v.id)
-		return Result{}, nil
+		if fn != nil {
+			return fn(c)
+		}
+		return Result{Tracked: tracked}, nil
 	}
 	v.l.rec.Lock()
 	v.l.cmds = append(v.l.cmds, c)
 	v.l.rec.Unlock()
 	v.l.record("run " + v.id)
-	return v.fakeVM.Run(ctx, c, out)
+	res, err := v.fakeVM.Run(ctx, c, out)
+	if err == nil {
+		v.l.rec.Lock()
+		v.lastTracked = slices.Clone(res.Tracked)
+		v.l.rec.Unlock()
+	}
+	return res, err
 }
 
 func (v *leaseFakeVM) Destroy() error {
