@@ -8,7 +8,6 @@ import (
 	"time"
 
 	pb "github.com/rossoctl/moca/gen/go/sandbox/v1"
-	ga "github.com/rossoctl/moca/remote-worker/internal/guestagent"
 )
 
 // Mode is how a sandbox's Execs use VMs (spec §3). The zero value is per-Exec, so an
@@ -122,65 +121,6 @@ type LeaseEvent struct {
 	Age       time.Duration
 	Processes []string
 	Tracked   []TrackedProcess
-}
-
-// TrackedProcess is one entry of a lease guest's tracked-process table (plan 5), as the
-// guest's End reports it (guestagent.TrackedProcess). State is running, exited or killed;
-// Code is the exit code, or the signal number when killed. Started is the guest's clock,
-// which every lease request sets from the host's (Request.HostUnixNanos).
-type TrackedProcess struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name,omitempty"`
-	PID         int       `json:"pid"`
-	State       string    `json:"state"`
-	Code        int       `json:"code,omitempty"`
-	Started     time.Time `json:"started"`
-	MemoryBytes int64     `json:"memory_bytes,omitempty"`
-}
-
-// DisplayName is how the process is shown: its name, or p<id> when it has none (ruling
-// P5-R6). The guest already reports an unnamed process as p<id>; this is the same rule.
-func (tp TrackedProcess) DisplayName() string {
-	if tp.Name == "" {
-		return "p" + tp.ID
-	}
-	return tp.Name
-}
-
-// Display is the process as clients render it: "<name> (pid <n>)".
-func (tp TrackedProcess) Display() string {
-	return fmt.Sprintf("%s (pid %d)", tp.DisplayName(), tp.PID)
-}
-
-// stateText is the process's state as process_list spells it (spec §7): running,
-// exited(<code>) or killed(<signal>).
-func (tp TrackedProcess) stateText() string {
-	if tp.State == ga.TrackedRunning {
-		return tp.State
-	}
-	return fmt.Sprintf("%s(%d)", tp.State, tp.Code)
-}
-
-func (tp TrackedProcess) running() bool { return tp.State == ga.TrackedRunning }
-
-// runningTracked is the running entries of ps, nil when there are none.
-func runningTracked(ps []TrackedProcess) []TrackedProcess {
-	var out []TrackedProcess
-	for _, tp := range ps {
-		if tp.running() {
-			out = append(out, tp)
-		}
-	}
-	return out
-}
-
-// displays is each process's Display, nil for none.
-func displays(ps []TrackedProcess) []string {
-	var out []string
-	for _, tp := range ps {
-		out = append(out, tp.Display())
-	}
-	return out
 }
 
 // leaseEventAt is the At of an event minted at now: now to the millisecond (PR #763
