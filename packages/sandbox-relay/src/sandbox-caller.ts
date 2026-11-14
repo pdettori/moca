@@ -310,12 +310,19 @@ export function makeAudit(write: ((line: string) => void) | undefined, withComma
 }
 export type Audit = ReturnType<typeof makeAudit>;
 
-/** The outcome of an Exec that ran to its end (not expired, not cancelled at the call). */
+/**
+ * The outcome of an Exec that ran to its end (not expired, not cancelled at the call). routeExec's
+ * own capability check (P5-R37's backstop, for a worker that re-attached without it after the
+ * check above) is a refusal like that check's, with the same reason (final review P4).
+ */
 function finished(
   r: PumpResult,
   aborted: boolean,
-): Pick<AuditLine, 'outcome' | 'exit_code' | 'truncated'> {
+): Pick<AuditLine, 'outcome' | 'exit_code' | 'truncated' | 'reason'> {
   if (r.cancelled || aborted) return { outcome: 'cancelled' };
+  const thrown = r.thrown as { code?: unknown; message?: unknown } | undefined;
+  if (thrown?.code === status.FAILED_PRECONDITION && thrown.message === WORKER_WITHOUT_PROCESSES)
+    return { outcome: 'refused', reason: WORKER_WITHOUT_PROCESSES };
   if (r.end) return { outcome: 'end', exit_code: r.end.exitCode, truncated: r.end.truncated };
   if (r.execError !== undefined)
     return { outcome: WORKER_TIMEOUT_RE.test(r.execError) ? 'timeout' : 'error' };

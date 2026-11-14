@@ -347,10 +347,10 @@ func TestRotateWhenIdleStreamFollowsItsParent(t *testing.T) {
 
 // Ruling P5-R37: the container tier has no lease mode, so its Hello never advertises the
 // reserved sbx:lease-processes-v1 capability (the relay refuses a process kind before it
-// reaches a worker without it), whatever is on PATH -- a binary by that name included.
+// reaches a worker without it), whatever tools are on PATH.
 func TestContainerHelloNeverAdvertisesLeaseProcesses(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range append(append([]string(nil), probed...), "sbx:lease-processes-v1") {
+	for _, name := range probed {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}

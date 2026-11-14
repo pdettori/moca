@@ -382,8 +382,9 @@ var processNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 // could make a client's p<n> address another process than the one it shows.
 var idShapedNameRE = regexp.MustCompile(`^p?[0-9]+$`)
 
-// processNameWant is the rule as a refusal names it; the clients' copy is identical
-// (sandbox-client processNameProblem).
+// processNameWant is the rule as a refusal names it. The clients' check (sandbox-client
+// processNameProblem) accepts the same set of names, with the same text; the quoting of a
+// refused control character may differ (Go %q vs JSON).
 const processNameWant = "want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)"
 
 // validateProcessName refuses a name outside rulings P5-R8 and P5-R33 with

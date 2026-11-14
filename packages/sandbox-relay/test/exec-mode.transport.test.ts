@@ -1,9 +1,10 @@
+import { EventEmitter } from 'node:events';
 import { status } from '@grpc/grpc-js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ExecKind, ProcessArgs, SandboxMode } from '@moca/k8s-sandbox';
+import { Exec, ExecKind, ProcessArgs, SandboxMode } from '@moca/k8s-sandbox';
 import { SANDBOX_TOKEN_TYP, type SandboxTokenClaims } from '@moca/control-plane';
-import { claimsToExecMode } from '../src/sandbox-caller.js';
-import { LEASE_PROCESSES_CAPABILITY, WORKER_WITHOUT_PROCESSES } from '../src/relay.js';
+import { claimsToExecMode, makeAudit, makeSandboxCaller } from '../src/sandbox-caller.js';
+import { LEASE_PROCESSES_CAPABILITY, WORKER_WITHOUT_PROCESSES, type Relay } from '../src/relay.js';
 import {
   HARNESS,
   K,
@@ -388,6 +389,59 @@ describe('Exec kinds (plan 5, level 2)', () => {
         process: 'web',
         reason: "processes_not_enabled: this sandbox's mode is lease",
       }),
+    ]);
+  });
+});
+
+// Final review P4: routeExec's own capability check (P5-R37's backstop) refuses a process kind
+// to a worker that re-attached without the capability after the sandbox caller's check passed.
+// That refusal is audited `refused` with its reason, as the caller's own check audits it, not
+// `error`. A relay whose capability answer and whose routeExec disagree stands in for the
+// re-attach, so the test needs no race.
+describe("routeExec's capability backstop is audited refused (final review P4)", () => {
+  it('a process kind refused at the write is a refused line with its reason', async () => {
+    const backstop = Object.assign(new Error(WORKER_WITHOUT_PROCESSES), {
+      code: status.FAILED_PRECONDITION,
+      details: WORKER_WITHOUT_PROCESSES,
+    });
+    const relay = {
+      workerCapabilities: () => ['bash', LEASE_PROCESSES_CAPABILITY],
+      // eslint-disable-next-line require-yield
+      async *routeExec() {
+        throw backstop;
+      },
+      routeAbort: () => {},
+    } as unknown as Relay;
+    const lines: string[] = [];
+    const caller = makeSandboxCaller(relay, {
+      maxInflight: 2,
+      leewayS: 30,
+      drainGraceS: 60,
+      reqIdKey: Buffer.alloc(32, 7),
+      audit: makeAudit((l) => lines.push(l), false),
+    });
+    const errors: Array<{ code?: number }> = [];
+    const call = Object.assign(new EventEmitter(), { cancelled: false, write() {}, end() {} });
+    call.on('error', (e: { code?: number }) => errors.push(e));
+    const e = Exec.fromPartial({
+      reqId: 1,
+      workspaceKey: 'sbx-aaaa',
+      timeoutS: 60,
+      kind: ExecKind.EXEC_KIND_PROCESS_LIST,
+    });
+    await caller.exec(
+      call as never,
+      claims({ mode: 'lease+processes', mode_epoch: 3 }) as unknown as SandboxTokenClaims,
+      'sbx_default',
+      e,
+      Date.now(),
+    );
+    expect(errors.map((x) => x.code)).toEqual([status.FAILED_PRECONDITION]);
+    const audit = lines
+      .map((l) => JSON.parse(l) as { audit: string; outcome?: string; reason?: string })
+      .filter((l) => l.audit === 'sandbox_exec');
+    expect(audit).toEqual([
+      expect.objectContaining({ outcome: 'refused', reason: WORKER_WITHOUT_PROCESSES }),
     ]);
   });
 });

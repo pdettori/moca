@@ -1480,7 +1480,7 @@ exec python3 -m http.server 8080 --bind 127.0.0.1`, epoch)
 		leaseWaitPoolLogs(t, g, key, ProcessArgs{Name: "here"}, "/workspace\n")
 		for _, p := range []gateTracked{where, here} {
 			if got := stop(t, key, ProcessArgs{ID: p.ID}); got.stateText() != "killed(15)" {
-				t.Fatalf("process_stop %s = %+v, want killed(15): its pid is the command's own, not a wrapper's", p.Name, got)
+				t.Fatalf("process_stop %s = %+v, want killed(15): the stop's TERM is what ended it", p.Name, got)
 			}
 		}
 
