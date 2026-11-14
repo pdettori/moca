@@ -12,7 +12,7 @@ import type { LeaseEvent } from './gen/sandbox/v1/sandbox.js';
 import {
   LeaseControlError,
   processRow,
-  shownProcessId,
+  startedProcessText,
   type LeaseStatusView,
   type SandboxModeName,
 } from './lease.js';
@@ -784,7 +784,11 @@ function processTools(ws: string): SandboxTool[] {
       properties: {
         command: { type: 'string', description: 'The bash command to run' },
         cwd: { type: 'string', description: `Its working directory, inside ${ws}` },
-        name: { type: 'string', description: 'A name for it, unique among the running processes' },
+        name: {
+          type: 'string',
+          description:
+            'A name for it, unique among the running processes: 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)',
+        },
       },
       required: ['command'],
     },
@@ -801,7 +805,7 @@ function processTools(ws: string): SandboxTool[] {
         { signal },
       );
       const p = r.result;
-      return ok(`started ${shownProcessId(p.id)} ${p.name || shownProcessId(p.id)} (pid ${p.pid})`);
+      return ok(`started ${startedProcessText(p)} (pid ${p.pid})`);
     },
   };
   const list: SandboxTool = {

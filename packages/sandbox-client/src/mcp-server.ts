@@ -24,6 +24,7 @@ import {
   noticeLines,
   NoticeDedupe,
   processRow,
+  shownProcessId,
   type SandboxModeName,
 } from './lease.js';
 import {
@@ -240,8 +241,12 @@ function processFailureText(
         : processesNotEnabledText(id);
     }
     // A person at a terminal has the sbx proc commands, not the model's tools.
-    case 'process_not_found':
-      return `no tracked process ${d}; ${o.audience === 'cli' ? 'mocactl sbx proc ls' : 'process_list'} shows them`;
+    case 'process_not_found': {
+      // The guest names an id bare; no name is shaped like one (P5-R33), so a decimal detail is
+      // an id, shown as the rows show it (final review M2).
+      const who = /^\d+$/.test(d) ? shownProcessId(d) : d;
+      return `no tracked process ${who}; ${o.audience === 'cli' ? 'mocactl sbx proc ls' : 'process_list'} shows them`;
+    }
     case 'process_limit':
       return `too many tracked processes: ${d}; stop one with ${o.audience === 'cli' ? 'mocactl sbx proc stop' : 'process_stop'} first`;
     case 'process_name_taken':
@@ -408,7 +413,12 @@ export function createSandboxMcpServer(o: SandboxMcpOptions): SandboxMcpServer {
         );
         // The full table (plan 5), exited entries included, so the agent can read why one died.
         if (v.processes?.length) {
-          tracked = ['tracked processes:', ...v.processes.map((p) => `  ${processRow(p)}`)];
+          // The worker's mirror, refreshed by each call (P5-R38): a status touches no guest,
+          // so it cannot touch the lease's idle clock either.
+          tracked = [
+            'tracked processes (as of the last call):',
+            ...v.processes.map((p) => `  ${processRow(p)}`),
+          ];
         }
       } catch (err) {
         const code = err instanceof LeaseControlError ? err.code : 'unavailable';

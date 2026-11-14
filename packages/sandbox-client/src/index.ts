@@ -40,6 +40,7 @@ export {
   modeName,
   processRow,
   shownProcessId,
+  startedProcessText,
   processStateText,
   trackedProcessView,
   type LeaseControlErrorCode,

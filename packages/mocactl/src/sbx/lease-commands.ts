@@ -286,6 +286,9 @@ export async function cmdGet(c: SbxCtx, id: string, factory?: ExecFactory): Prom
   // worker has some; one per line, ids as `sbx proc` takes them (p<id>).
   if (lease !== null && !('error' in lease) && (s.mode === 'lease+processes' || lease.processes)) {
     const ps = (lease.processes ?? []).map(processRowText);
+    // The worker's mirror, refreshed by each call (P5-R38): a status touches no guest, so it
+    // cannot touch the lease's idle clock either.
+    if (ps.length) ps.push('(as of the last call)');
     rows.push(['processes', ps.length ? ps.join(`\n${' '.repeat(14)}`) : 'none']);
   }
   for (const [k, v] of rows) c.io.out(`${k.padEnd(14)}${v}\n`);

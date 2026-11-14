@@ -232,11 +232,15 @@ describe('tracked processes as a client shows them (plan 5, spec §7)', () => {
   it('renders a row as `id name (pid n): state, age, memory`', () => {
     const v = trackedProcessView(tp({ ageMs: 130_400, memoryBytes: 12.5 * 1024 * 1024 }));
     expect(processRow(v)).toBe('p3 web (pid 412): running, 2m10s, 12.5 MiB');
+    // An exited row has no age (final review M6): it counts from the start, not a runtime.
     expect(
       processRow(
         trackedProcessView(tp({ state: 'killed', code: 9, ageMs: 4_999, memoryBytes: 0 })),
       ),
-    ).toBe('p3 web (pid 412): killed(9), 4s, 0.0 MiB');
+    ).toBe('p3 web (pid 412): killed(9), 0.0 MiB');
+    expect(processRow(trackedProcessView(tp({ state: 'exited', code: 1, ageMs: 7_380_000 })))).toBe(
+      'p3 web (pid 412): exited(1), 0.0 MiB',
+    );
   });
 
   it('carries the full tracked table on the lease status view, and none when it is empty', () => {

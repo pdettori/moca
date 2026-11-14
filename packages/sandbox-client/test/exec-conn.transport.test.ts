@@ -33,6 +33,7 @@ import {
   type TokenRequest,
 } from '../src/exec-conn.js';
 import { LeaseControlError } from '../src/lease.js';
+import { execFailureText } from '../src/mcp-server.js';
 
 type Behaviour = (call: ServerWritableStream<ExecRequest, ExecEvent>, n: number) => void;
 const closers: Array<() => unknown> = [];
@@ -1482,6 +1483,22 @@ describe('SandboxExecConn process calls (plan 5, spec §7)', () => {
         new RegExp(`^sandbox failure: unreadable process_${op} answer`),
       );
     }
+  });
+
+  // Final review M4: a process call queues on the sandbox's one run gate, so its timeout means
+  // another command held the sandbox all along, and the text says so.
+  it('a process call that timed out says it waited for the sandbox', async () => {
+    const r = await fakeRelay(execError('timeout:60'));
+    const e = await conn(r.addr)
+      .c.process('stop', { name: 'web' })
+      .catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ExecMachineryError);
+    expect((e as Error).message).toBe(
+      'sandbox failure: process_stop timed out waiting for the sandbox (another command may still be running)',
+    );
+    expect(execFailureText(e, { audience: 'cli' })).toBe(
+      'sandbox failure: process_stop timed out waiting for the sandbox (another command may still be running); the command may have partly run',
+    );
   });
 
   it('sends nothing for a signal that is already aborted', async () => {

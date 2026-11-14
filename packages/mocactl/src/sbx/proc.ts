@@ -9,6 +9,7 @@ import {
   processSelector,
   q,
   shownProcessId,
+  startedProcessText,
   type LeaseEvent,
   type ProcessSelector,
   type TrackedProcessView,
@@ -210,9 +211,8 @@ export async function cmdProc(
         const r = await x.process('start', args, opts);
         printNotices(c, id, r.lease);
         const p = r.result;
-        c.io.out(
-          `${shownProcessId(p.id)} ${sanitizeRemote(p.name || shownProcessId(p.id))} pid ${p.pid}\n`,
-        );
+        // `<id> <name> pid <n>`, or `<id> pid <n>` for an unnamed one (final review M3).
+        c.io.out(`${sanitizeRemote(startedProcessText(p))} pid ${p.pid}\n`);
         return SBX_EXIT.ok;
       }
       case 'ls': {

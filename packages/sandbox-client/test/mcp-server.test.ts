@@ -1271,6 +1271,11 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
         'no tracked process web; process_list shows them',
       ],
       [
+        // The guest's bare id, shown as the rows show ids (final review M2).
+        new ProcessError('process_not_found', '3', 'process_not_found: 3'),
+        'no tracked process p3; process_list shows them',
+      ],
+      [
         new ProcessError('process_limit', '4 running (SH_LEASE_MAX_PROCESSES)', ''),
         'too many tracked processes: 4 running (SH_LEASE_MAX_PROCESSES); stop one with process_stop first',
       ],
@@ -1339,7 +1344,7 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
     );
     expect(text(await call(client, 'process_logs', { name: 'web' }))).toBe('serving\n');
     expect(text(await call(client, 'process_stop', { name: 'web' }))).toBe(
-      'final state: p3 web (pid 412): exited(0), 2m10s, 12.0 MiB',
+      'final state: p3 web (pid 412): exited(0), 12.0 MiB',
     );
     expect(p.ops).toEqual(['start', 'list', 'logs', 'stop']);
     expect(records.map((r) => [r.tool, r.execs, r.ok])).toEqual([
@@ -1570,9 +1575,10 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
         'age: 61s',
         'idle timeout: 900s',
         'last end: none',
-        'tracked processes:',
+        // The worker's mirror, refreshed by each call (P5-R38): a status touches no guest.
+        'tracked processes (as of the last call):',
         '  p3 web (pid 412): running, 2m10s, 12.0 MiB',
-        '  p4 p4 (pid 9): killed(9), 5s, 0.0 MiB',
+        '  p4 p4 (pid 9): killed(9), 0.0 MiB',
       ].join('\n'),
     );
   });
@@ -1699,6 +1705,10 @@ describe('execFailureText for a process refusal', () => {
       'no tracked process web; mocactl sbx proc ls shows them',
     );
     expect(execFailureText(nf)).toBe('no tracked process web; process_list shows them');
+    const byId = new ProcessError('process_not_found', '3', 'process_not_found: 3');
+    expect(execFailureText(byId, { audience: 'cli' })).toBe(
+      'no tracked process p3; mocactl sbx proc ls shows them',
+    );
     const lim = new ProcessError('process_limit', '4 running (SH_LEASE_MAX_PROCESSES)', '');
     expect(execFailureText(lim, { audience: 'cli' })).toBe(
       'too many tracked processes: 4 running (SH_LEASE_MAX_PROCESSES); stop one with mocactl sbx proc stop first',

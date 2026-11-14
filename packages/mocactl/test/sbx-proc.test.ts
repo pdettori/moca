@@ -152,11 +152,14 @@ describe('mocactl sbx proc start (spec §7, P5-R31)', () => {
     expect(w.closed()).toBe(1);
   });
 
-  it('an unnamed process is shown by its id', async () => {
-    const w = world({ answer: () => ({ id: '7', name: '', pid: 9 }) });
-    expect(await w.run(['proc', 'start', SBX, '--', 'sleep', '100'])).toBe(0);
-    expect(args<'start'>(w.calls[0]!)).toEqual({ command: "'sleep' '100'" });
-    expect(w.out()).toBe('p7 p7 pid 9\n');
+  it('an unnamed process is shown by its id, once (final review M3)', async () => {
+    // The guest names an unnamed process p<id>; an empty name reads the same.
+    for (const name of ['p7', '']) {
+      const w = world({ answer: () => ({ id: '7', name, pid: 9 }) });
+      expect(await w.run(['proc', 'start', SBX, '--', 'sleep', '100'])).toBe(0);
+      expect(args<'start'>(w.calls[0]!)).toEqual({ command: "'sleep' '100'" });
+      expect(w.out(), name).toBe('p7 pid 9\n');
+    }
   });
 
   it('the sandbox defaults to the bound one; --sandbox works too', async () => {
@@ -201,7 +204,7 @@ describe('mocactl sbx proc ls', () => {
     expect(await w.run(['proc', 'ls', SBX])).toBe(0);
     expect(w.calls).toEqual([{ op: 'list', args: {}, signal: true }]);
     expect(w.out()).toBe(
-      'p3 web (pid 412): running, 2m10s, 12.5 MiB\np4 p4 (pid 9): exited(1), 4s, 0.0 MiB\n',
+      'p3 web (pid 412): running, 2m10s, 12.5 MiB\np4 p4 (pid 9): exited(1), 0.0 MiB\n',
     );
     expect(await w.run(['proc', 'ls', SBX, '--json'])).toBe(0);
     expect(JSON.parse(w.out())).toEqual(list);
@@ -252,7 +255,7 @@ describe('mocactl sbx proc logs and stop (P5-R6, P5-R31)', () => {
     const w = world();
     expect(await w.run(['proc', 'stop', 'p3', '--signal', 'INT', SBX])).toBe(0);
     expect(w.calls).toEqual([{ op: 'stop', args: { id: '3', signal: 'INT' }, signal: true }]);
-    expect(w.out()).toBe('p3 web (pid 412): killed(15), 2m10s, 12.5 MiB\n');
+    expect(w.out()).toBe('p3 web (pid 412): killed(15), 12.5 MiB\n');
   });
 
   it('logs and stop need the process; at most one sandbox after it', async () => {
@@ -328,6 +331,21 @@ describe('mocactl sbx proc: refusals, failures, notices', () => {
       [
         new ProcessError('process_not_found', 'web', 'process_not_found: web'),
         'sbx: no tracked process web; mocactl sbx proc ls shows them',
+      ],
+      [
+        // The guest's bare id, shown as the rows show ids (final review M2).
+        new ProcessError('process_not_found', '3', 'process_not_found: 3'),
+        'sbx: no tracked process p3; mocactl sbx proc ls shows them',
+      ],
+      [
+        // A call that queued behind a running command on the sandbox's run gate (final review M4).
+        new ExecMachineryError(
+          'sandbox failure: process_stop timed out waiting for the sandbox (another command may still be running)',
+          undefined,
+          'machinery',
+          true,
+        ),
+        'sbx: sandbox failure: process_stop timed out waiting for the sandbox (another command may still be running); the command may have partly run',
       ],
       [
         new ProcessError('process_name_taken', 'web', 'process_name_taken: web'),

@@ -94,14 +94,25 @@ const MIB = 1024 * 1024;
 export const shownProcessId = (id: string): string => `p${id}`;
 
 /**
- * One process as a client lists it (P5-R27): `p<id> name (pid n): state, age, memory`. The name is
- * the worker's text: a client sanitizes the row before a terminal shows it.
+ * One process as a client lists it (P5-R27): `p<id> name (pid n): state, age, memory`. An exited
+ * or killed row has no age: it counts from the start, so it would read as a runtime (final review
+ * M6). The name is the worker's text: a client sanitizes the row before a terminal shows it.
  */
 export function processRow(v: TrackedProcessView): string {
+  const age = v.state === 'running' ? `${ageText(v.ageMs)}, ` : '';
   return (
-    `${shownProcessId(v.id)} ${v.name} (pid ${v.pid}): ${processStateText(v)}, ${ageText(v.ageMs)}, ` +
+    `${shownProcessId(v.id)} ${v.name} (pid ${v.pid}): ${processStateText(v)}, ${age}` +
     `${(v.memoryBytes / MIB).toFixed(1)} MiB`
   );
+}
+
+/**
+ * A started process as its start reports it (final review M3): `p<id> name`, or just `p<id>` for
+ * an unnamed one, which the guest names `p<id>` and which would read twice. Not sanitized.
+ */
+export function startedProcessText(p: { id: string; name: string }): string {
+  const id = shownProcessId(p.id);
+  return p.name && p.name !== id ? `${id} ${p.name}` : id;
 }
 
 /** A missing status reads as no lease; a state this client does not know reads as none. */

@@ -162,11 +162,12 @@ export interface ProcessSelector {
 /**
  * A process as a client is given it (P5-R6): `p<n>` (an id as clients show it) or a decimal `n` is
  * the id; anything else a name. No name is shaped like an id (P5-R33), so an id-shaped name can
- * only mean the id. The MCP tools and `mocactl sbx proc` both read their selector through this.
+ * only mean the id. Leading zeros are dropped (`p007` is id `7`): the guest compares id strings.
+ * The MCP tools and `mocactl sbx proc` both read their selector through this.
  */
 export function processSelector(given: string): ProcessSelector {
   const m = /^p?(\d+)$/.exec(given);
-  return m ? { id: m[1]! } : { name: given };
+  return m ? { id: m[1]!.replace(/^0+(?=\d)/, '') } : { name: given };
 }
 
 const PROCESS_NAME_WANT = 'want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)';
@@ -526,7 +527,12 @@ export class SandboxExecConn {
       e.lease = r.lease;
       return e;
     };
-    if (r.timedOutS !== undefined) throw bad(`${what} timed out after ${r.timedOutS} s`);
+    // A process kind is quick in the guest (a stop takes ~10 s at most, well inside the budget),
+    // but it queues on the sandbox's one run gate, and the wait counts: a timeout means another
+    // command held the sandbox (final review M4).
+    if (r.timedOutS !== undefined) {
+      throw bad(`${what} timed out waiting for the sandbox (another command may still be running)`);
+    }
     if (r.exitCode !== 0) throw bad(`${what} answered exit ${r.exitCode}`);
     const out = r.stdout.toString();
     const result = parseProcessAnswer(op, out, this.now());

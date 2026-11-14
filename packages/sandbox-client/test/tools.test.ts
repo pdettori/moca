@@ -951,6 +951,13 @@ describe('process tools (plan 5, spec §7)', () => {
         name: { type: 'string' },
       },
     });
+    // The name rule, as the guest and both clients refuse it (P5-R8, P5-R33; final review P2).
+    expect(
+      (t(tools, 'process_start').inputSchema.properties as Record<string, { description: string }>)
+        .name!.description,
+    ).toBe(
+      'A name for it, unique among the running processes: 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)',
+    );
     expect(t(tools, 'process_list').inputSchema).toEqual({ type: 'object', properties: {} });
     expect(t(tools, 'process_logs').inputSchema).toMatchObject({
       type: 'object',
@@ -987,13 +994,27 @@ describe('process tools (plan 5, spec §7)', () => {
     expect(p.sent[1]!.args).toEqual({ command: 'make watch' });
   });
 
+  it('process_start shows an unnamed process once, by its id (final review M3)', async () => {
+    // The guest names an unnamed process p<id>; an empty name reads the same.
+    for (const name of ['p7', '']) {
+      const p = procs(() => ({ id: '7', name, pid: 9 }));
+      const r = await t(l2(), 'process_start').run(
+        { command: 'sleep 100' },
+        noExec,
+        undefined,
+        p.process,
+      );
+      expect(txt(r), name).toBe('started p7 (pid 9)');
+    }
+  });
+
   it('process_list answers one row per process, or says there are none', async () => {
     const p = procs(() => [
       view(),
       view({ id: '4', name: 'p4', pid: 9, state: 'exited', code: 1, ageMs: 5_000, memoryBytes: 0 }),
     ]);
     expect(txt(await t(l2(), 'process_list').run({}, noExec, undefined, p.process))).toBe(
-      'p3 web (pid 412): running, 2m10s, 12.0 MiB\np4 p4 (pid 9): exited(1), 5s, 0.0 MiB',
+      'p3 web (pid 412): running, 2m10s, 12.0 MiB\np4 p4 (pid 9): exited(1), 0.0 MiB',
     );
     const none = procs(() => []);
     expect(txt(await t(l2(), 'process_list').run({}, noExec, undefined, none.process))).toBe(
@@ -1031,7 +1052,7 @@ describe('process tools (plan 5, spec §7)', () => {
           p.process,
         ),
       ),
-    ).toBe('final state: p3 web (pid 412): killed(15), 2m10s, 0.0 MiB');
+    ).toBe('final state: p3 web (pid 412): killed(15), 0.0 MiB');
     expect(p.sent[0]!.args).toEqual({ name: 'web', signal: 'INT' });
   });
 
@@ -1048,6 +1069,11 @@ describe('process tools (plan 5, spec §7)', () => {
     expect(processSelector('3')).toEqual({ id: '3' });
     expect(processSelector('web')).toEqual({ name: 'web' });
     expect(processSelector('p3x')).toEqual({ name: 'p3x' });
+    // Leading zeros name the same id (final review P1): the guest compares id strings.
+    expect(processSelector('p007')).toEqual({ id: '7' });
+    expect(processSelector('007')).toEqual({ id: '7' });
+    expect(processSelector('p0')).toEqual({ id: '0' });
+    expect(processSelector('000')).toEqual({ id: '0' });
   });
 
   it('process_start refuses a name the guest would, id-shaped ones included, sending nothing (P5-R33)', async () => {
