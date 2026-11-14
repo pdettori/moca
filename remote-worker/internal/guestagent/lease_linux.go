@@ -54,6 +54,8 @@ func (a *Agent) leasePrepare() error {
 		return fmt.Errorf("guest-agent: lease: uid %d, gid %d, home %q: want a non-root uid and gid and a home", lo.UID, lo.GID, lo.Home)
 	}
 	// A tracked process under the exec uid could be traced by any later Exec (spec §3.3).
+	// NewAgent has already turned a zero base or count into the default, so 0 never
+	// reaches here: the range cannot be turned off.
 	if lo.TrackedUIDBase <= 0 || lo.MaxTrackedUIDs < 0 ||
 		(lo.UID >= lo.TrackedUIDBase && lo.UID < lo.TrackedUIDBase+lo.MaxTrackedUIDs) {
 		return fmt.Errorf("guest-agent: lease: tracked uids %d from %d: want a non-root range without the exec uid %d", lo.MaxTrackedUIDs, lo.TrackedUIDBase, lo.UID)
@@ -556,8 +558,10 @@ type reaper struct {
 
 const reaperEarlyCap = 1024
 
-func startReaper() *reaper {
-	r := &reaper{
+// newReaper is a reaper with nothing running: startReaper starts its loop, and the
+// tests drive deliver by hand.
+func newReaper() *reaper {
+	return &reaper{
 		waiting: map[int]chan syscall.WaitStatus{},
 		tracked: map[int]func(syscall.WaitStatus){},
 		early:   map[int]syscall.WaitStatus{},
@@ -565,6 +569,10 @@ func startReaper() *reaper {
 		quit:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
+}
+
+func startReaper() *reaper {
+	r := newReaper()
 	signal.Notify(r.sig, syscall.SIGCHLD)
 	go func() {
 		defer close(r.done)
@@ -657,7 +665,9 @@ func (r *reaper) await(pid int) <-chan syscall.WaitStatus {
 }
 
 // track registers a tracked process: onExit gets its status once, whenever the reaper
-// reaps it, and at once if it was reaped before this call. Unlike await's, the
+// reaps it, and at once if it was reaped before this call. The caller must call expect
+// before the fork, as for await: a child that exits outside an expect window, before
+// track, is reaped as an orphan and its status dropped. Unlike await's, the
 // registration survives expect and cancel. It closes the registration window, as await
 // does. onExit runs without the reaper's lock, on whichever goroutine reaps: the
 // reaper's own, this one, or a runLease that holds lease.mu while it sweeps. So it must

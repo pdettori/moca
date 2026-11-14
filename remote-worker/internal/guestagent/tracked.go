@@ -25,6 +25,10 @@ const (
 	trackedExitedLogCap = 64 << 10
 )
 
+// defaultMaxProcesses is SH_LEASE_MAX_PROCESSES's default, the running cap when the
+// host sends none (max_processes is omitempty).
+const defaultMaxProcesses = 4
+
 // ring keeps the last max bytes of a byte stream. It is an io.Writer, safe for the
 // concurrent stdout and stderr drains of one process and a reader of its Tail.
 // Memory grows with what was written, up to max, never past it.
@@ -43,14 +47,15 @@ func newRing(max int) *ring { return &ring{max: max} }
 // all of p written, so a drain never stops on it.
 func (r *ring) Write(p []byte) (int, error) {
 	n := len(p)
+	// max included: shrink lowers it while a process's leftovers may still write.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.max <= 0 {
 		return n, nil
 	}
 	if len(p) > r.max {
 		p = p[len(p)-r.max:]
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if len(r.buf) < r.max {
 		k := min(r.max-len(r.buf), len(p))
 		if need := len(r.buf) + k; need > cap(r.buf) {
@@ -165,7 +170,8 @@ type trackedTable struct {
 
 // start applies the name and limit rules, then calls launch to start the process, and
 // records it. maxRunning caps the running processes (SH_LEASE_MAX_PROCESSES); an exited
-// one does not count. An empty name is allowed and never clashes.
+// one does not count, and maxRunning <= 0 means defaultMaxProcesses. An empty name is
+// allowed and never clashes.
 //
 // launch gets the new entry's id and ring, and returns the process's pid and uid. It
 // runs without the table's lock, with the entry already in the table as running, so a
@@ -173,6 +179,9 @@ type trackedTable struct {
 // kept, and a concurrent start sees the name and the slot as taken. If launch fails the
 // entry is removed and its error returned; an exited entry of the same name is kept.
 func (t *trackedTable) start(name string, maxRunning int, launch func(id string, log *ring) (pid, uid int, err error)) (TrackedProcess, error) {
+	if maxRunning <= 0 {
+		maxRunning = defaultMaxProcesses
+	}
 	t.mu.Lock()
 	running := 0
 	for _, e := range t.entries {
@@ -266,7 +275,12 @@ func (t *trackedTable) list() []TrackedProcess {
 // unknown id. Ruling P5-R5: the exited process's ring is trimmed to its last
 // trackedExitedLogCap bytes, and past trackedExitedKeep exited entries the oldest
 // exited one is evicted, ring and all. A running entry is never evicted.
-func (t *trackedTable) markExit(id string, code, signal int) {
+//
+// It returns copies of the evicted entries (ruling P5-R9). Eviction forgets a process
+// whose cgroup may still hold its children, so the caller must keep that cgroup, and
+// the uid's hold on it, until it is empty: the uidAllocator's populated is answered
+// from the cgroup of every uid ever handed out, never from this table.
+func (t *trackedTable) markExit(id string, code, signal int) []trackedEntry {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, e := range t.entries {
@@ -279,34 +293,39 @@ func (t *trackedTable) markExit(id string, code, signal int) {
 			e.State, e.Code = TrackedExited, code
 		}
 		e.Log.shrink(trackedExitedLogCap)
-		t.evictExited()
-		return
+		return t.evictExited()
 	}
+	return nil
 }
 
-// evictExited drops the oldest exited entries past trackedExitedKeep. The caller holds
-// mu.
-func (t *trackedTable) evictExited() {
+// evictExited drops the oldest exited entries past trackedExitedKeep and returns copies
+// of them. The caller holds mu.
+func (t *trackedTable) evictExited() []trackedEntry {
 	excess := -trackedExitedKeep
 	for _, e := range t.entries {
 		if e.State != TrackedRunning {
 			excess++
 		}
 	}
+	var evicted []trackedEntry
 	t.entries = removeEntries(t.entries, func(e *trackedEntry) bool {
 		if excess <= 0 || e.State == TrackedRunning {
 			return false
 		}
 		excess--
+		evicted = append(evicted, *e)
 		return true
 	})
+	return evicted
 }
 
 // uidAllocator hands out the tracked uids base .. base+n-1, one per tracked process
 // (spec §3.3). A uid is held from take until release, and take also skips any uid the
 // caller reports populated: a tracked process's children can outlive it in its cgroup,
-// and a new process under the same uid could then ptrace them. Uids are handed out in
-// turn, so a released one is the last to be reused.
+// and a new process under the same uid could then ptrace them. The caller answers
+// populated from real cgroups, through a uid -> cgroup map of its own that outlives the
+// trackedTable's entries (ruling P5-R9: an evicted entry's cgroup can still be
+// populated). Uids are handed out in turn, so a released one is the last to be reused.
 type uidAllocator struct {
 	mu    sync.Mutex
 	base  int

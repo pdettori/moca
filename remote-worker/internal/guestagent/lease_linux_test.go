@@ -1329,14 +1329,10 @@ func TestShimEnvSetsTheGivenUser(t *testing.T) {
 // waitStatusExit is the wait status of a process that exited with code.
 func waitStatusExit(code int) syscall.WaitStatus { return syscall.WaitStatus(code << 8) }
 
-func newBareReaper() *reaper {
-	return &reaper{waiting: map[int]chan syscall.WaitStatus{}, early: map[int]syscall.WaitStatus{}, tracked: map[int]func(syscall.WaitStatus){}}
-}
-
 // runLease calls cancel after every Exec and expect before every fork; a tracked
 // process outlives both, so its registration must too. It fires once.
 func TestReaperTrackedRegistrationSurvivesCancelAndExpect(t *testing.T) {
-	r := newBareReaper()
+	r := newReaper()
 	var got []int
 	r.track(100, func(ws syscall.WaitStatus) { got = append(got, ws.ExitStatus()) })
 	r.cancel()
@@ -1352,7 +1348,7 @@ func TestReaperTrackedRegistrationSurvivesCancelAndExpect(t *testing.T) {
 // A tracked process can exit between its fork and track: its status is then in early,
 // and track hands it over at once. track closes the registration window, as await does.
 func TestReaperTrackHandsOverAnEarlyExit(t *testing.T) {
-	r := newBareReaper()
+	r := newReaper()
 	r.expect()
 	r.deliver(100, waitStatusExit(5))
 	var got []int
@@ -1367,7 +1363,7 @@ func TestReaperTrackHandsOverAnEarlyExit(t *testing.T) {
 
 // onExit runs without the reaper's lock, so it may call back into the reaper.
 func TestReaperOnExitRunsOutsideTheLock(t *testing.T) {
-	r := newBareReaper()
+	r := newReaper()
 	done := make(chan struct{})
 	r.track(100, func(syscall.WaitStatus) { r.cancel(); close(done) })
 	go r.deliver(100, waitStatusExit(0))

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -520,4 +521,88 @@ func TestTrackedEndAtTheCapFitsAFrame(t *testing.T) {
 		t.Fatalf("the End at the cap does not fit a frame: %v", err)
 	}
 	t.Logf("End at the cap: %d of %d bytes", buf.Len()-5, MaxFrame)
+}
+
+// A tracked process's leftover children can still write through the drains while
+// markExit shrinks its ring, and process_logs can Tail it at any time: -race must see
+// every access to the ring under its lock.
+func TestRingConcurrentWriteShrinkAndTail(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		r := newRing(1 << 16)
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+		for w := 0; w < 2; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				line := []byte("0123456789abcdef\n")
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						_, _ = r.Write(line)
+					}
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				_ = r.Tail(5)
+			}
+		}()
+		r.shrink(1 << 10)
+		r.shrink(1 << 8)
+		close(stop)
+		wg.Wait()
+		if got := len(r.Tail(1 << 20)); got > 1<<8 {
+			t.Fatalf("round %d: the ring holds %d bytes after shrinking to 256", round, got)
+		}
+	}
+}
+
+// Ruling P5-R9: the eviction returns what it dropped, so the caller can keep each
+// evicted process's cgroup (and so its uid) until that cgroup is empty.
+func TestTrackedMarkExitReturnsTheEvictedEntries(t *testing.T) {
+	var tt trackedTable
+	var ids []string
+	for i := 0; i < trackedExitedKeep; i++ {
+		p := mustStart(t, &tt, fmt.Sprintf("e%d", i), 100, 2000+i)
+		ids = append(ids, p.ID)
+		if ev := tt.markExit(p.ID, 0, 0); len(ev) != 0 {
+			t.Fatalf("exit %d evicted %+v, under the cap", i, ev)
+		}
+	}
+	p, err := tt.start("e-last", 100, launchOK(3000, 20003))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := tt.markExit(p.ID, 0, 9)
+	if len(ev) != 1 || ev[0].ID != ids[0] || ev[0].PID != 2000 || ev[0].UID != 20000 || ev[0].State != TrackedExited {
+		t.Fatalf("evicted = %+v, want the oldest exited entry, with its pid and uid", ev)
+	}
+	if ev := tt.markExit(p.ID, 0, 0); len(ev) != 0 {
+		t.Fatalf("a repeated markExit evicted %+v", ev)
+	}
+	if ev := tt.markExit("999", 0, 0); len(ev) != 0 {
+		t.Fatalf("an unknown id evicted %+v", ev)
+	}
+}
+
+// An old host sends no max_processes (omitempty), which means the default, 4: not a
+// cap of 0 that refuses every start.
+func TestTrackedMaxRunningZeroMeansTheDefault(t *testing.T) {
+	if defaultMaxProcesses != 4 {
+		t.Fatalf("defaultMaxProcesses = %d, want 4 (SH_LEASE_MAX_PROCESSES)", defaultMaxProcesses)
+	}
+	var tt trackedTable
+	for i := 0; i < 4; i++ {
+		mustStart(t, &tt, "", 0, 100+i)
+	}
+	_, err := tt.start("", 0, launchOK(200, 20000))
+	if err == nil || err.Error() != "process_limit: 4 running (SH_LEASE_MAX_PROCESSES)" {
+		t.Fatalf("fifth start err = %v, want process_limit: 4 running (SH_LEASE_MAX_PROCESSES)", err)
+	}
 }

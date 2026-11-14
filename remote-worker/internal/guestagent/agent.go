@@ -36,7 +36,8 @@ type LeaseOptions struct {
 	Home       string // the exec identity's HOME
 	ShimPath   string // the binary that acts as the lease shim; default /proc/self/exe
 	// Tracked processes (level 2) each run under their own uid, from TrackedUIDBase up to
-	// TrackedUIDBase+MaxTrackedUIDs-1 (spec §3.3). Zero means the default.
+	// TrackedUIDBase+MaxTrackedUIDs-1 (spec §3.3). Zero means the default, so the range
+	// cannot be turned off here: level 2 is gated on the host, not by an empty range.
 	TrackedUIDBase int // default DefaultTrackedUIDBase
 	MaxTrackedUIDs int // default DefaultMaxTrackedUIDs
 }
