@@ -7,6 +7,7 @@ export {
   ProcessError,
   SandboxExecConn,
   TOKEN_MARGIN_S,
+  leaseEventsOf,
   newReqId,
   type Exec,
   type ExecConnOptions,
@@ -46,6 +47,7 @@ export {
 export type { LeaseEvent, TrackedProcess } from './gen/sandbox/v1/sandbox.js';
 export {
   FILE_TOOL_TIMEOUT_S,
+  LEASE_PROCESSES_RULE,
   LEASE_RULE,
   MAX_BYTES,
   MAX_LINES,

@@ -1,6 +1,7 @@
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
   createSandboxMcpServer,
+  LEASE_PROCESSES_RULE,
   LEASE_RULE,
   LeaseControlError,
   type Exec,
@@ -113,7 +114,17 @@ export async function serveSbxMcp(
   const exec: Exec = async (command, opts) => (await open()).exec(command, opts);
   // The tool call's cancel signal reaches the lease call: a cancelled `reset` stops waiting.
   const lease: LeaseCall = async (op, opts) => (await open()).leaseControl(op, undefined, opts);
-  const process: ProcessCall = async (op, args, opts) => (await open()).process(op, args, opts);
+  const processCall: ProcessCall = async (op, args, opts) => (await open()).process(op, args, opts);
+  /**
+   * A fresh token's mode, for the process tools' gate (P5-R29): the connection's first mint if it
+   * is not open yet, else one forced re-mint. `onToken` sees it, so the list follows it too.
+   */
+  const refreshMode = async () => {
+    const first = conn === undefined;
+    const opened = await open();
+    if (!first) await opened.remint();
+    return tokenMode;
+  };
   const info = async () => {
     const now = await c.api.getSandbox(id);
     const current = recordMode(now);
@@ -122,7 +133,7 @@ export async function serveSbxMcp(
         ? 'every call is a fresh VM, so no process survives it'
         : current === 'lease'
           ? LEASE_RULE
-          : `${LEASE_RULE}; a process started with process_start does survive calls`;
+          : `${LEASE_PROCESSES_RULE}; a process started with process_start survives calls`;
     return {
       text:
         `Sandbox ${now.id}${now.name ? ` (${now.name})` : ''}: template ${now.template}, ${now.state}, expires ` +
@@ -133,7 +144,8 @@ export async function serveSbxMcp(
   };
   server = createSandboxMcpServer({
     exec,
-    process,
+    process: processCall,
+    refreshMode,
     sandboxId: id,
     info,
     lease,

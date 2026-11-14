@@ -156,6 +156,8 @@ export interface OpenedExec {
   leaseKeepalive(): Promise<void>;
   /** The process calls (plan 5, spec §7). */
   process: ProcessCall;
+  /** Mints a fresh sandbox token now, as the next Exec would after a refusal (P5-R29). */
+  remint(): Promise<void>;
   /** The first token, minted before dialing: where to dial and which worker and workspace. */
   token: SbxToken;
   /** The token's lifetime (`exp − iat`), 0 if unreadable: the default timeout is this minus 60. */
@@ -211,6 +213,9 @@ export async function openExec(
     leaseControl: c.leaseControl,
     leaseKeepalive: c.leaseKeepalive,
     process: c.process ?? noProcess,
+    remint: async () => {
+      await t.token({ force: true, minValidS: MIN_LEFT_S });
+    },
     token: first,
     lifetimeS: grantOf(first).lifetimeS,
   };

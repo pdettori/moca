@@ -1101,6 +1101,7 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
       processOps,
       signals,
       keepalives: () => keepalives,
+      mints: () => minted,
       connect: () => client.connect(clientSide),
     };
   }
@@ -1342,9 +1343,9 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
     await m.served;
   });
 
-  it('a process call below lease+processes answers the §7 refusal naming the sandbox, sending nothing', async () => {
-    // The record says lease+processes, so the tools are listed; the token minted says lease.
-    const m = leaseSession(['lease'], { record: () => 'lease+processes' });
+  it('an upgrade since the held token: the process call re-mints once and goes through (P5-R29)', async () => {
+    // The user ran `mocactl sbx mode <id> lease+processes` after the held token was minted.
+    const m = leaseSession(['lease', 'lease+processes'], { record: () => 'lease+processes' });
     let changed = 0;
     m.client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       changed++;
@@ -1355,19 +1356,53 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
       content: { text: string }[];
     };
     expect(info.content[0]!.text).toContain('process_start');
-    await m.bash('echo'); // the first mint, listed under another mode: the client is told
+    expect(info.content[0]!.text).not.toContain('no process survives');
+    await m.bash('echo'); // the held token: lease, unlike the list: the client is told
     await vi.waitFor(() => expect(changed).toBe(1));
+    expect(m.mints()).toBe(1);
+    const r = (await m.client.callTool({
+      name: 'process_start',
+      arguments: { command: 'python3 -m http.server' },
+    })) as { content: { text: string }[]; isError?: boolean };
+    expect(r.isError).toBeFalsy();
+    expect(m.processOps).toEqual(['start']);
+    expect(m.mints()).toBe(2); // exactly one re-mint, which says lease+processes
+    // The next process call needs no re-mint.
+    await m.client.callTool({ name: 'process_list', arguments: {} });
+    expect(m.mints()).toBe(2);
+    expect(m.processOps).toEqual(['start', 'list']);
+    await m.client.close();
+    await m.served;
+  });
+
+  it('a record still below lease+processes: the §7 refusal naming the sandbox, after one re-mint, sending nothing', async () => {
+    const REFUSAL = `processes not enabled for this sandbox; ask the user to run: mocactl sbx mode ${SBX} lease+processes`;
+    const m = leaseSession(['lease'], { record: () => 'lease' });
+    await m.connect();
+    await m.bash('echo'); // the held token
+    expect(m.mints()).toBe(1);
     const r = (await m.client.callTool({
       name: 'process_start',
       arguments: { command: 'python3 -m http.server' },
     })) as { content: { text: string }[]; isError?: boolean };
     expect(r.isError).toBe(true);
-    expect(r.content[0]!.text).toBe(
-      `processes not enabled for this sandbox; ask the user to run: mocactl sbx mode ${SBX} lease+processes`,
-    );
+    expect(r.content[0]!.text).toBe(REFUSAL);
+    expect(m.mints()).toBe(2); // one re-mint per refused call, no more
     expect(m.processOps).toEqual([]);
     await m.client.close();
     await m.served;
+    // No token held yet: the call's own first mint is the fresh one, and is not repeated.
+    const first = leaseSession(['lease'], { record: () => 'lease' });
+    await first.connect();
+    const r2 = (await first.client.callTool({ name: 'process_list', arguments: {} })) as {
+      content: { text: string }[];
+      isError?: boolean;
+    };
+    expect(r2.content[0]!.text).toBe(REFUSAL);
+    expect(first.mints()).toBe(1);
+    expect(first.processOps).toEqual([]);
+    await first.client.close();
+    await first.served;
   });
 
   it('jwtMode reads the mode claim; anything else is per-exec', () => {

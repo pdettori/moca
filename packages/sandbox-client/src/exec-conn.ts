@@ -29,7 +29,9 @@ import {
  * ONLY if no event arrived. A command that started is never run twice: any failure after the first
  * event -- a dropped connection included -- is surfaced as an error. The worker's `stale_mode:`
  * refusal (the token predates a mode change) is retried the same way, once, under a new req_id
- * (ruling P4-R21): the worker refuses it before the start, so nothing ran. The lease calls follow
+ * (ruling P4-R21): the worker refuses it before the start, so nothing ran. So is the relay's
+ * `processes_not_enabled:` refusal of a process kind (P5-R29): the held token may predate an
+ * upgrade to lease+processes, and the fresh one reads the record as it is now. The lease calls follow
  * the token rule (ruling P4-R7): `leaseControl`, every op, and `leaseKeepalive` retry a token
  * refusal once with a forced fresh token, and a second refusal is a LeaseControlError
  * `unauthenticated`. The relay refuses the bearer before routing, so `set_mode` resends the same
@@ -379,14 +381,32 @@ export function newReqId(): number {
 
 /** The worker's refusal of an Exec whose token's mode epoch is below the stored one (spec §8.2). */
 const STALE_MODE = /^stale_mode:/;
+/** The relay's refusal of a process kind under a token whose mode is below lease+processes. */
+const PROCESSES_NOT_ENABLED = /^processes_not_enabled:/;
 
 class NotStarted extends Error {}
 
-/** A `stale_mode:` refusal: nothing ran. `surfaced` is the error a second one is reported as. */
-class StaleMode extends Error {
-  constructor(readonly surfaced: ExecMachineryError) {
+/**
+ * A refusal that a token minted now may not get: the worker's `stale_mode:` or the relay's
+ * `processes_not_enabled:`. Nothing ran. `surfaced` is the error a second one is reported as.
+ */
+class Remint extends Error {
+  constructor(
+    readonly surfaced: ExecMachineryError,
+    readonly refusal: 'stale_mode' | 'processes_not_enabled',
+  ) {
     super(surfaced.message);
   }
+}
+
+/**
+ * The lease events an Exec's failure carries (spec §5): its `lease` array, whichever error it is.
+ * The connection attaches the events of a refused first attempt even to a token source's own
+ * error when the re-mint fails, as the worker acked them.
+ */
+export function leaseEventsOf(err: unknown): LeaseEvent[] {
+  const lease = typeof err === 'object' && err !== null ? (err as { lease?: unknown }).lease : [];
+  return Array.isArray(lease) ? (lease as LeaseEvent[]) : [];
 }
 
 /** Where the trusted roots come from: `node:tls`, or a fake in tests. */
@@ -505,16 +525,16 @@ export class SandboxExecConn {
     };
     /** The lease events of a stale_mode refusal, which ride before the retry's own. */
     let carried: LeaseEvent[] = [];
-    let staleFirst = false;
+    let reminted: Remint['refusal'] | undefined;
     try {
       return await attempt(false);
     } catch (err) {
-      if (err instanceof StaleMode) {
-        // The token predates a mode change (P4-R21): the worker refused before the start. The
+      if (err instanceof Remint) {
+        // The token predates a mode change (P4-R21, P5-R29): refused before the start. The
         // retry's token carries the new epoch, which the worker's req_id cache fingerprints, so
         // the same id would read there as a collision: it is a different Exec, under a new id.
         carried = err.surfaced.lease;
-        staleFirst = true;
+        reminted = err.refusal;
         reqId = newReqId();
       } else if (!(err instanceof NotStarted)) throw err;
     }
@@ -527,12 +547,12 @@ export class SandboxExecConn {
     } catch (err) {
       if (err instanceof NotStarted) {
         // The retry after a stale_mode refusal was a re-mint for the new epoch, not a refresh.
-        const after = staleFirst
-          ? 'after a stale_mode refusal and a fresh token'
+        const after = reminted
+          ? `after a ${reminted} refusal and a fresh token`
           : 'after one token refresh';
         throw new ExecRefusedError(`${err.message} (${after})`, status.UNAUTHENTICATED, carried);
       }
-      const e = err instanceof StaleMode ? err.surfaced : err;
+      const e = err instanceof Remint ? err.surfaced : err;
       // The first attempt's events ride whatever the retry failed with: the worker acked them.
       if (
         e instanceof ExecMachineryError ||
@@ -540,6 +560,14 @@ export class SandboxExecConn {
         e instanceof ExecRefusedError
       ) {
         e.lease = [...carried, ...e.lease];
+      } else if (carried.length > 0 && typeof e === 'object' && e !== null) {
+        // The re-mint itself failed (the token source's error): it still carries them, unchanged
+        // otherwise, so its callers read it as before (Minor 1).
+        try {
+          Object.assign(e, { lease: [...carried, ...leaseEventsOf(e)] });
+        } catch {
+          // A frozen error cannot carry them: nothing else to do.
+        }
       }
       throw e;
     }
@@ -787,7 +815,7 @@ export class SandboxExecConn {
           e instanceof ExecRefusedError
         ) {
           e.lease = lease;
-        } else if (e instanceof StaleMode) e.surfaced.lease = lease;
+        } else if (e instanceof Remint) e.surfaced.lease = lease;
         reject(e);
       };
       const onAbort = () => {
@@ -836,7 +864,7 @@ export class SandboxExecConn {
       /** The worker's in-stream ExecError: a stale_mode refusal before any output is retried. */
       const inStreamFailure = (message: string, code?: number): Error => {
         const e = workerFailure(message, code, true);
-        return !output && STALE_MODE.test(message) ? new StaleMode(e) : e;
+        return !output && STALE_MODE.test(message) ? new Remint(e, 'stale_mode') : e;
       };
 
       call.on('data', (ev: ExecEvent) => {
@@ -864,6 +892,21 @@ export class SandboxExecConn {
         if (!started && e.code === status.UNAUTHENTICATED) return fail(new NotStarted(details));
         if (!started && e.code === status.PERMISSION_DENIED) {
           return fail(new ExecRefusedError(details, e.code));
+        }
+        if (
+          !started &&
+          e.code === status.FAILED_PRECONDITION &&
+          PROCESSES_NOT_ENABLED.test(details)
+        ) {
+          // The relay read the held token's mode claim before routing: nothing ran (P5-R29).
+          const refused = new ExecMachineryError(
+            `sandbox failure: ${status[e.code]}: ${details}`,
+            e.code,
+            'machinery',
+            false,
+            details,
+          );
+          return fail(new Remint(refused, 'processes_not_enabled'));
         }
         // Only the relay's "sandbox busy" is busy: grpc-js message-size limits are RESOURCE_EXHAUSTED too.
         if (e.code === status.RESOURCE_EXHAUSTED && details.startsWith('sandbox busy')) {

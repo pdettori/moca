@@ -25,6 +25,7 @@ import {
   sandboxRules,
 } from '../src/mcp-server.js';
 import { PI_SCHEMAS } from '../src/schemas.js';
+import { LEASE_PROCESSES_RULE, LEASE_RULE } from '../src/tools.js';
 import { fakeExecRelay, type FakeExecAnswer } from './helpers/fake-relay.js';
 
 const res = (over: Partial<ExecResult> = {}): ExecResult => ({
@@ -1077,8 +1078,8 @@ describe('lease mode (plan 4, spec §5)', () => {
     const peTools = (await pe.listTools()).tools;
     expect(peTools.find((t) => t.name === 'bash')!.description).toMatch(/Every call is a fresh VM/);
     expect(peTools.find((t) => t.name === 'bash')!.description).not.toContain(PHRASE);
-    // Level 2 keeps the lease phrase and adds its own sentence (plan 5).
-    expect(sandboxRules('/workspace', 'lease+processes')).toContain(PHRASE);
+    // Level 2 has its own lease rule, which never says that no process survives (fix round 1).
+    expect(sandboxRules('/workspace', 'lease+processes')).not.toContain(PHRASE);
     expect(sandboxRules('/workspace', 'lease+processes')).not.toBe(
       sandboxRules('/workspace', 'lease'),
     );
@@ -1422,26 +1423,51 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
     );
   });
 
-  it('declares tools.listChanged, and sends list_changed when a minted token changes the mode (P5-R27)', async () => {
-    const { client, server } = await connect({ exec: neverExec, mode: 'lease' });
+  it('declares tools.listChanged, and sends list_changed when a mint differs from the listed mode (P5-R27)', async () => {
+    let minted: 'lease' | 'lease+processes' | undefined;
+    const { client, server } = await connect({
+      exec: neverExec,
+      mode: 'lease',
+      leaseMode: () => minted,
+    });
     expect(client.getServerCapabilities()?.tools?.listChanged).toBe(true);
     let changed = 0;
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       changed++;
     });
-    // The first mint, nothing listed yet: no notice.
+    const mint = async (m: 'lease' | 'lease+processes') => {
+      minted = m;
+      server.tokenMinted(m);
+      await sleep(10);
+    };
+    // Nothing listed yet: the first list will be right, so no notice.
+    await mint('lease+processes');
+    expect(changed).toBe(0);
+    await client.listTools(); // listed under lease+processes
+    await mint('lease+processes'); // the listed mode
+    expect(changed).toBe(0);
+    await mint('lease'); // a downgrade
+    expect(changed).toBe(1);
+    await client.listTools(); // the client re-lists: lease
+    await mint('lease+processes'); // and back
+    expect(changed).toBe(2);
+  });
+
+  it('sends one list_changed for two mints at the same new mode, and none for a mint back to the listed one (Minor 4)', async () => {
+    const { client, server } = await connect({ exec: neverExec, mode: 'lease' });
+    let changed = 0;
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      changed++;
+    });
+    await client.listTools(); // listed under lease
+    server.tokenMinted('lease+processes');
     server.tokenMinted('lease+processes');
     await sleep(10);
-    expect(changed).toBe(0);
-    server.tokenMinted('lease+processes'); // the same mode again
-    await sleep(10);
-    expect(changed).toBe(0);
-    server.tokenMinted('lease'); // a downgrade
+    expect(changed).toBe(1);
+    // Not re-listed yet: a mint back to the listed mode needs no second notice.
+    server.tokenMinted('lease');
     await sleep(10);
     expect(changed).toBe(1);
-    server.tokenMinted('lease+processes'); // and back
-    await sleep(10);
-    expect(changed).toBe(2);
   });
 
   it('sends list_changed on the first mint only when the tools were listed under another mode', async () => {
@@ -1479,6 +1505,27 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
     const { client: l2 } = await connect({ exec: neverExec, mode: 'lease+processes' });
     expect(l2.getInstructions()).toBe(sandboxRules('/workspace', 'lease+processes'));
     expect(l2.getInstructions()).not.toMatch(/Never start background jobs/);
+  });
+
+  it('level-2 texts never say that no process survives a call (fix round 1, Minor 2)', async () => {
+    const L2_RULE =
+      'consecutive calls may share one guest until it restarts; a process started with `&`, `nohup` or `setsid` does not survive the call; /tmp lasts until the guest restarts';
+    expect(LEASE_PROCESSES_RULE).toBe(L2_RULE);
+    const { client } = await connect({ exec: neverExec, mode: 'lease+processes' });
+    expect(client.getInstructions()).toContain(L2_RULE);
+    expect(client.getInstructions()).toContain(L2_SENTENCE);
+    expect(client.getInstructions()).not.toContain('no process survives');
+    for (const t of (await client.listTools()).tools) {
+      expect(t.description, t.name).not.toContain('no process survives');
+    }
+    const bash = (await client.listTools()).tools.find((t) => t.name === 'bash')!.description!;
+    expect(bash).toContain(L2_RULE);
+    expect(bash).toContain(L2_SENTENCE);
+    // Level 1 keeps its wording.
+    const { client: l1 } = await connect({ exec: neverExec, mode: 'lease' });
+    const l1bash = (await l1.listTools()).tools.find((t) => t.name === 'bash')!.description!;
+    expect(l1bash).toContain(LEASE_RULE);
+    expect(l1.getInstructions()).toContain(LEASE_RULE);
   });
 
   it('sandbox_info lists the tracked processes from the lease status, exited ones included', async () => {
@@ -1519,5 +1566,149 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
         '  4 p4 (pid 9): killed(9), 5s, 0.0 MiB',
       ].join('\n'),
     );
+  });
+});
+
+describe('the §7 refusal clears once the user upgrades (fix round 1, P5-R29)', () => {
+  const REFUSAL =
+    'processes not enabled for this sandbox; ask the user to run: mocactl sbx mode sbx_0123abcd lease+processes';
+  const neverExec: Exec = async () => {
+    throw new Error('no command Exec expected');
+  };
+  function procs() {
+    const ops: string[] = [];
+    const processCall = (async (op: string) => {
+      ops.push(op);
+      return { result: op === 'start' ? { id: '1', name: 'web', pid: 7 } : [], lease: [] };
+    }) as unknown as ProcessCall;
+    return { processCall, ops };
+  }
+
+  it('a held token below lease+processes is re-minted once; an upgraded record lets the call through', async () => {
+    let minted: 'lease' | 'lease+processes' = 'lease';
+    const refreshes: (AbortSignal | undefined)[] = [];
+    const p = procs();
+    const { client } = await connect({
+      exec: neverExec,
+      process: p.processCall,
+      mode: 'lease',
+      sandboxId: 'sbx_0123abcd',
+      leaseMode: () => minted,
+      // The fresh mint reads the record as it is now: the user upgraded.
+      refreshMode: async (signal) => {
+        refreshes.push(signal);
+        minted = 'lease+processes';
+        return minted;
+      },
+    });
+    const r = await call(client, 'process_start', { command: 'serve', name: 'web' });
+    expect(r.isError).toBeFalsy();
+    expect(text(r)).toBe('started 1 web (pid 7)');
+    expect(refreshes).toHaveLength(1);
+    expect(refreshes[0]).toBeInstanceOf(AbortSignal);
+    expect(p.ops).toEqual(['start']);
+    // Now at level 2: no more re-mints.
+    await call(client, 'process_list', {});
+    expect(refreshes).toHaveLength(1);
+  });
+
+  it('a record still below lease+processes is refused after exactly one re-mint, with no Exec', async () => {
+    let refreshes = 0;
+    const p = procs();
+    const execs: string[] = [];
+    const { client, records } = await connect({
+      exec: async (c) => (execs.push(c), res()),
+      process: p.processCall,
+      mode: 'lease',
+      sandboxId: 'sbx_0123abcd',
+      leaseMode: () => 'lease',
+      refreshMode: async () => (refreshes++, 'lease'),
+    });
+    const r = await call(client, 'process_start', { command: 'serve' });
+    expect(r.isError).toBe(true);
+    expect(text(r)).toBe(REFUSAL);
+    expect(refreshes).toBe(1);
+    expect(p.ops).toEqual([]);
+    expect(execs).toEqual([]);
+    expect(records).toMatchObject([{ tool: 'process_start', execs: 0, ok: false }]);
+  });
+
+  it('a re-mint that fails is the tool error, and nothing is sent', async () => {
+    const p = procs();
+    const { client } = await connect({
+      exec: neverExec,
+      process: p.processCall,
+      mode: 'lease',
+      leaseMode: () => 'lease',
+      refreshMode: async () => {
+        throw new Error('control plane unreachable');
+      },
+    });
+    const r = await call(client, 'process_list', {});
+    expect(r.isError).toBe(true);
+    expect(text(r)).toBe('sandbox unavailable: control plane unreachable');
+    expect(p.ops).toEqual([]);
+  });
+
+  it('never re-mints for a non-process tool, nor once the token is at lease+processes', async () => {
+    let refreshes = 0;
+    const p = procs();
+    let minted: 'lease' | 'lease+processes' = 'lease';
+    const { client } = await connect({
+      exec: async () => res(),
+      process: p.processCall,
+      mode: 'lease',
+      leaseMode: () => minted,
+      refreshMode: async () => (refreshes++, minted),
+    });
+    await call(client, 'bash', { command: 'x' });
+    expect(refreshes).toBe(0);
+    minted = 'lease+processes';
+    await call(client, 'process_list', {});
+    expect(refreshes).toBe(0);
+    expect(p.ops).toEqual(['list']);
+  });
+});
+
+describe('execFailureText for a process refusal', () => {
+  it('names the command without "ask the user" for the CLI (Minor 3)', () => {
+    const e = new ProcessError('processes_not_enabled', "this sandbox's mode is lease", '');
+    expect(execFailureText(e, { audience: 'cli', sandboxId: 'sbx_0123abcd' })).toBe(
+      'processes not enabled for this sandbox; run: mocactl sbx mode sbx_0123abcd lease+processes',
+    );
+    expect(execFailureText(e, { sandboxId: 'sbx_0123abcd' })).toBe(
+      'processes not enabled for this sandbox; ask the user to run: mocactl sbx mode sbx_0123abcd lease+processes',
+    );
+    expect(execFailureText(e, { audience: 'cli' })).toBe(
+      'processes not enabled for this sandbox; run: mocactl sbx mode <id> lease+processes',
+    );
+  });
+});
+
+describe("a failed re-mint's carried events (Minor 1)", () => {
+  it('ride the result of a call whose error carries them', async () => {
+    let tz: string | undefined = process.env.TZ;
+    process.env.TZ = 'UTC';
+    try {
+      const AT = Date.UTC(2026, 10, 13, 14, 2, 30);
+      const end = LeaseEvent.fromPartial({
+        state: 'end',
+        reason: 'idle',
+        atUnixMs: AT,
+        mode: SandboxMode.SANDBOX_MODE_LEASE,
+      });
+      // The token source's own error, with the first attempt's events attached by the connection.
+      const boom = Object.assign(new Error('control plane unreachable'), { lease: [end] });
+      const { client } = await connect({ exec: throwing(boom), mode: 'lease' });
+      const r = await call(client, 'bash', { command: 'x' });
+      expect(r.isError).toBe(true);
+      expect(text(r).split('\n')[0]).toBe(
+        '[sandbox] guest restarted (idle, 14:02): /tmp, installs outside /workspace and background processes are gone',
+      );
+    } finally {
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+      tz = undefined;
+    }
   });
 });

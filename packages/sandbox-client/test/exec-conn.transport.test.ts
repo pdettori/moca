@@ -1389,20 +1389,44 @@ describe('SandboxExecConn process calls (plan 5, spec §7)', () => {
     }
   });
 
-  it("maps the relay's processes_not_enabled refusal (FAILED_PRECONDITION, no event) to a ProcessError", async () => {
+  it("maps the relay's processes_not_enabled refusal (FAILED_PRECONDITION, no event), refused again after the re-mint, to a ProcessError", async () => {
     const r = await fakeRelay(
       fail(status.FAILED_PRECONDITION, "processes_not_enabled: this sandbox's mode is lease"),
     );
-    const e = await conn(r.addr)
-      .c.process('start', { command: 'sleep 9' })
-      .catch((x: unknown) => x);
+    const { c, asks } = conn(r.addr);
+    const e = await c.process('start', { command: 'sleep 9' }).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(ProcessError);
     expect(e).toMatchObject({
       code: 'processes_not_enabled',
       detail: "this sandbox's mode is lease",
       lease: [],
     });
-    expect(r.seen).toHaveLength(1);
+    // One forced re-mint and one retry (P5-R29), then the refusal is surfaced.
+    expect(r.seen).toHaveLength(2);
+    expect(asks.map((a) => a.force)).toEqual([false, true]);
+  });
+
+  it("re-mints once on the relay's processes_not_enabled and retries under a new req_id: an upgrade since the held token (P5-R29)", async () => {
+    const r = await fakeRelay((call, n) =>
+      n === 1
+        ? fail(status.FAILED_PRECONDITION, "processes_not_enabled: this sandbox's mode is lease")(
+            call,
+            n,
+          )
+        : answers('{"id":"1","name":"web","pid":7}', [start])(call, n),
+    );
+    const { c, asks } = conn(r.addr);
+    expect(await c.process('start', { command: 'serve', name: 'web' })).toEqual({
+      result: { id: '1', name: 'web', pid: 7 },
+      lease: [start],
+    });
+    expect(r.seen.map((s) => s.auth)).toEqual(['Bearer stale', 'Bearer fresh']);
+    expect(asks.map((a) => a.force)).toEqual([false, true]);
+    expect(r.seen[1]!.req.exec!.reqId).not.toBe(r.seen[0]!.req.exec!.reqId);
+    expect(r.seen[1]!.req.exec).toMatchObject({
+      kind: ExecKind.EXEC_KIND_PROCESS_START,
+      command: 'serve',
+    });
   });
 
   it('a stale_mode first attempt keeps its events on a ProcessError retry (the M3 follow-up)', async () => {
@@ -1483,5 +1507,46 @@ describe('SandboxExecConn: a refused first attempt keeps its events on a failed 
       .catch((x: unknown) => x);
     expect(e).toBeInstanceOf(ExecMachineryError);
     expect(e).toMatchObject({ lease: [end] });
+  });
+});
+
+describe("SandboxExecConn: a failed re-mint keeps the first attempt's events (fix round 1, Minor 1)", () => {
+  const end = LeaseEvent.fromPartial({
+    state: 'end',
+    reason: 'idle',
+    atUnixMs: 1_800_000_000_000,
+    mode: SandboxMode.SANDBOX_MODE_LEASE,
+  });
+
+  it('attaches them to the token source error, which is thrown unchanged otherwise', async () => {
+    const r = await fakeRelay((call, n) => {
+      call.write({ lease: end } as ExecEvent);
+      execError('stale_mode: Exec mode_epoch 3 is below the stored 4')(call, n);
+    });
+    const boom = new Error('control plane unreachable');
+    const { c } = conn(r.addr, {
+      token: async (o) => {
+        if (o.force) throw boom;
+        return { token: 'stale', expiresAt: NOW_S + 900, lifetimeS: 900 };
+      },
+    });
+    const e = await c.exec('x').catch((x: unknown) => x);
+    expect(e).toBe(boom);
+    expect(e).toMatchObject({ lease: [end] });
+    expect(r.seen).toHaveLength(1);
+  });
+
+  it('leaves a token source error with nothing carried as it was', async () => {
+    const r = await fakeRelay(fail(status.UNAUTHENTICATED, 'token rejected'));
+    const boom = new Error('control plane unreachable');
+    const { c } = conn(r.addr, {
+      token: async (o) => {
+        if (o.force) throw boom;
+        return { token: 'stale', expiresAt: NOW_S + 900, lifetimeS: 900 };
+      },
+    });
+    const e = await c.exec('x').catch((x: unknown) => x);
+    expect(e).toBe(boom);
+    expect(e).not.toHaveProperty('lease');
   });
 });

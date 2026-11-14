@@ -74,6 +74,12 @@ export type LeaseCall = (
 export const LEASE_RULE =
   'consecutive calls may share one guest until it restarts; no process survives a call; /tmp lasts until the guest restarts';
 /**
+ * LEASE_RULE at lease+processes (plan 5): a tracked process does survive a call, so the rule names
+ * only what does not, and PROCESS_RULE follows it.
+ */
+export const LEASE_PROCESSES_RULE =
+  'consecutive calls may share one guest until it restarts; a process started with `&`, `nohup` or `setsid` does not survive the call; /tmp lasts until the guest restarts';
+/**
  * What the `bash` description and the rules add at lease+processes (spec §7): background jobs
  * still end with the call, a tracked process does not.
  */
@@ -290,7 +296,8 @@ export function sandboxTools(o: {
     line.startsWith(`${ws}/`) ? line.slice(ws.length + 1) : line;
   const fileOpts = (signal?: AbortSignal) => ({ timeoutS: FILE_TOOL_TIMEOUT_S, signal });
   const rules = leased
-    ? `It runs in a remote sandbox whose working directory is ${ws}: ${LEASE_RULE}. There is no ` +
+    ? `It runs in a remote sandbox whose working directory is ${ws}: ` +
+      `${level2 ? LEASE_PROCESSES_RULE : LEASE_RULE}. There is no ` +
       `network, and files under ${ws} persist. Calls run one at a time, so batch the work.`
     : `It runs in a remote sandbox whose working directory is ${ws}. Every call is a fresh VM: no ` +
       `process survives it, there is no network, and files under ${ws} persist. Calls run one at a ` +
