@@ -415,3 +415,109 @@ func TestUIDAllocatorWithNoUIDsRefuses(t *testing.T) {
 		t.Fatalf("take returned %d from an empty range", uid)
 	}
 }
+
+func TestTrackedExitedBoundsAreTheRuling(t *testing.T) {
+	if trackedExitedKeep != 8 || trackedExitedLogCap != 64<<10 {
+		t.Fatalf("trackedExitedKeep %d, trackedExitedLogCap %d; want 8 and 64 KiB (ruling P5-R5)", trackedExitedKeep, trackedExitedLogCap)
+	}
+}
+
+// Ruling P5-R5: at most trackedExitedKeep exited entries are kept; a 9th exit evicts the
+// oldest exited entry, ring and all, and never a running one, however old.
+func TestTrackedNinthExitEvictsTheOldestExited(t *testing.T) {
+	var tt trackedTable
+	var running, exited []string
+	for i := 0; i < trackedExitedKeep+1; i++ {
+		if i%3 == 0 { // running entries interleaved, the first older than every exited one
+			running = append(running, mustStart(t, &tt, fmt.Sprintf("r%d", i), 100, 1000+i).ID)
+		}
+		e := mustStart(t, &tt, fmt.Sprintf("e%d", i), 100, 2000+i)
+		exited = append(exited, e.ID)
+		tt.markExit(e.ID, 0, 0)
+	}
+	if _, ok := tt.lookup(exited[0]); ok {
+		t.Fatal("the oldest exited entry survived the 9th exit")
+	}
+	var gotRunning, gotExited []string
+	for _, p := range tt.list() {
+		if p.State == TrackedRunning {
+			gotRunning = append(gotRunning, p.ID)
+		} else {
+			gotExited = append(gotExited, p.ID)
+		}
+	}
+	if fmt.Sprint(gotRunning) != fmt.Sprint(running) {
+		t.Fatalf("running ids %v, want every running one kept: %v", gotRunning, running)
+	}
+	if fmt.Sprint(gotExited) != fmt.Sprint(exited[1:]) {
+		t.Fatalf("exited ids %v, want the newest %d: %v", gotExited, trackedExitedKeep, exited[1:])
+	}
+}
+
+// Ruling P5-R5: at exit the ring is trimmed to its last 64 KiB, and stays bounded by
+// that for what the process's leftovers still write.
+func TestTrackedExitTrimsTheRingToItsTail(t *testing.T) {
+	var tt trackedTable
+	p := mustStart(t, &tt, "chatty", 4, 100)
+	e, _ := tt.lookup(p.ID)
+	all := numberedLines(0, (1<<20)/8) // 1 MiB of 8-byte lines
+	_, _ = e.Log.Write(all)
+	tt.markExit(p.ID, 0, 0)
+
+	e, _ = tt.lookup(p.ID)
+	held := e.Log.Tail(len(all))
+	if len(held) != trackedExitedLogCap || !bytes.Equal(held, all[len(all)-trackedExitedLogCap:]) {
+		t.Fatalf("exited ring holds %d bytes, want the last %d", len(held), trackedExitedLogCap)
+	}
+	if c := cap(e.Log.buf); c > trackedExitedLogCap {
+		t.Fatalf("exited ring capacity %d, over %d", c, trackedExitedLogCap)
+	}
+	_, _ = e.Log.Write([]byte("late\n"))
+	held = e.Log.Tail(len(all))
+	if len(held) != trackedExitedLogCap || !bytes.HasSuffix(held, []byte("late\n")) {
+		t.Fatalf("after a late write the ring holds %d bytes ending %q", len(held), held[len(held)-5:])
+	}
+	if c := cap(e.Log.buf); c > trackedExitedLogCap {
+		t.Fatalf("exited ring capacity %d after a late write, over %d", c, trackedExitedLogCap)
+	}
+}
+
+func TestTrackedExitTrimKeepsASmallRingWhole(t *testing.T) {
+	var tt trackedTable
+	p := mustStart(t, &tt, "quiet", 4, 100)
+	e, _ := tt.lookup(p.ID)
+	_, _ = e.Log.Write([]byte("a\nb\n"))
+	tt.markExit(p.ID, 1, 0)
+	if e, _ = tt.lookup(p.ID); string(e.Log.Tail(10)) != "a\nb\n" {
+		t.Fatalf("Tail = %q", e.Log.Tail(10))
+	}
+}
+
+// The table at its cap, MAX running (4) plus trackedExitedKeep exited, every field at its
+// widest, still fits one End frame. Names are 255 bytes of '<', which encoding/json
+// writes as <, six bytes each: the worst case for a 255-byte name.
+func TestTrackedEndAtTheCapFitsAFrame(t *testing.T) {
+	var tt trackedTable
+	name := func(i int) string { return fmt.Sprintf("%03d", i) + strings.Repeat("<", 252) }
+	const maxRunning = 4
+	for i := 0; i < trackedExitedKeep+3; i++ {
+		e := mustStart(t, &tt, name(i), maxRunning, 1<<22)
+		tt.markExit(e.ID, 0, 1<<30)
+	}
+	for i := 0; i < maxRunning; i++ {
+		mustStart(t, &tt, name(100+i), maxRunning, 1<<22)
+	}
+	end := End{ExitCode: -1 << 31, DroppedStdout: 1 << 62, DroppedStderr: 1 << 62, TeardownFailed: true, Tracked: tt.list()}
+	if len(end.Tracked) != maxRunning+trackedExitedKeep {
+		t.Fatalf("table holds %d entries, want %d", len(end.Tracked), maxRunning+trackedExitedKeep)
+	}
+	for i := range end.Tracked {
+		end.Tracked[i].Code, end.Tracked[i].StartedUnixMs, end.Tracked[i].MemoryBytes = -1<<62, -1<<62, -1<<62
+		end.Tracked[i].ID = "18446744073709551615"
+	}
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, KindEnd, end); err != nil {
+		t.Fatalf("the End at the cap does not fit a frame: %v", err)
+	}
+	t.Logf("End at the cap: %d of %d bytes", buf.Len()-5, MaxFrame)
+}

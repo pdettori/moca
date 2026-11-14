@@ -16,6 +16,15 @@ import (
 // the agent's memory (global constraints).
 const trackedLogCap = 4 << 20
 
+// Ruling P5-R5 bounds what exited processes hold, since every lease End carries the
+// whole table in one frame (MaxFrame) and each ring lives in agent memory: the table
+// keeps at most trackedExitedKeep exited entries, evicting the oldest exited first, and
+// an exited process's ring is trimmed to its last trackedExitedLogCap bytes.
+const (
+	trackedExitedKeep   = 8
+	trackedExitedLogCap = 64 << 10
+)
+
 // ring keeps the last max bytes of a byte stream. It is an io.Writer, safe for the
 // concurrent stdout and stderr drains of one process and a reader of its Tail.
 // Memory grows with what was written, up to max, never past it.
@@ -105,12 +114,33 @@ search:
 			seg = seg[:i]
 		}
 	}
-	out := make([]byte, 0, total-start)
+	return r.suffix(start)
+}
+
+// suffix copies the held bytes from logical offset start (0 is the oldest) to the end.
+// The caller holds mu.
+func (r *ring) suffix(start int) []byte {
+	a, b := r.buf[r.head:], r.buf[:r.head]
+	out := make([]byte, 0, len(a)+len(b)-start)
 	if start < len(a) {
 		out = append(out, a[start:]...)
 		return append(out, b...)
 	}
 	return append(out, b[start-len(a):]...)
+}
+
+// shrink lowers the ring's cap to max, keeping the newest max bytes and freeing the
+// rest. Later writes are held to the new cap. A max at or above the current cap is a
+// no-op.
+func (r *ring) shrink(max int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if max >= r.max {
+		return
+	}
+	held := len(r.buf)
+	r.buf = r.suffix(held - min(held, max)) // a fresh slice, cap == len <= max
+	r.head, r.max = 0, max
 }
 
 // trackedEntry is one tracked process: its row in the table, plus what the handlers
@@ -123,9 +153,10 @@ type trackedEntry struct {
 
 // trackedTable is the agent's table of tracked processes, oldest first. A running
 // process's name is unique among the running ones; starting a name that only an exited
-// entry holds replaces that entry. An exited entry otherwise stays until the lease
-// ends, so the agent can read why it died (spec §7). Ids are 1, 2, 3, … in start
-// order, never reused within the agent's life.
+// entry holds replaces that entry. An exited entry otherwise stays, so the agent can
+// read why it died (spec §7), until the lease ends or it is the oldest of more than
+// trackedExitedKeep exited entries (ruling P5-R5, markExit). Ids are 1, 2, 3, … in
+// start order, never reused within the agent's life.
 type trackedTable struct {
 	mu      sync.Mutex
 	seq     uint64
@@ -232,7 +263,9 @@ func (t *trackedTable) list() []TrackedProcess {
 
 // markExit records that the process id exited: killed(signal) when signal > 0, else
 // exited(code). Only a running entry changes, so a second report is ignored; so is an
-// unknown id.
+// unknown id. Ruling P5-R5: the exited process's ring is trimmed to its last
+// trackedExitedLogCap bytes, and past trackedExitedKeep exited entries the oldest
+// exited one is evicted, ring and all. A running entry is never evicted.
 func (t *trackedTable) markExit(id string, code, signal int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -245,8 +278,28 @@ func (t *trackedTable) markExit(id string, code, signal int) {
 		} else {
 			e.State, e.Code = TrackedExited, code
 		}
+		e.Log.shrink(trackedExitedLogCap)
+		t.evictExited()
 		return
 	}
+}
+
+// evictExited drops the oldest exited entries past trackedExitedKeep. The caller holds
+// mu.
+func (t *trackedTable) evictExited() {
+	excess := -trackedExitedKeep
+	for _, e := range t.entries {
+		if e.State != TrackedRunning {
+			excess++
+		}
+	}
+	t.entries = removeEntries(t.entries, func(e *trackedEntry) bool {
+		if excess <= 0 || e.State == TrackedRunning {
+			return false
+		}
+		excess--
+		return true
+	})
 }
 
 // uidAllocator hands out the tracked uids base .. base+n-1, one per tracked process
