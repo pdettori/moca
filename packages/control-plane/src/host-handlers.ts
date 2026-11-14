@@ -1027,6 +1027,13 @@ async function wantedAnswer(
   const keep: Record<string, unknown>[] = [];
   const displaced: Record<string, unknown>[] = [];
   const shared = liveSnapshots(docs);
+  // The workers with a sandbox whose egress events this host may still ship (live, or ended less
+  // than EGRESS_GRACE_S ago: egressAccepts). A retired build's worker among them is stopped but not
+  // yet removed: its `removed` drops the build from the host's holds, and with it the host's right
+  // to ship those sandboxes' last events (hostSandboxes), which the agent sends after the removal.
+  const egressOpen = new Set(
+    egressAccepts(await hostSandboxes(deps, host, nowS), nowS).map((r) => r.worker),
+  );
   for (const d of docs) {
     for (const b of d.builds) {
       if (!mine || mine.holds[b.buildId] === undefined || !hostManaged(b)) continue;
@@ -1041,7 +1048,7 @@ async function wantedAnswer(
         if (mine.refused) delete mine.refused[b.buildId];
         if (b.worker && !busy.has(b.worker)) {
           stop.push(entry);
-          remove.push(entry);
+          if (!egressOpen.has(b.worker)) remove.push(entry);
         }
         continue;
       }

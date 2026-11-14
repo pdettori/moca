@@ -1164,7 +1164,9 @@ while, so a template used again soon is warm (no memory-file read at all).
 **Retired builds are removed by the agent.** Once a client retires a template or a build (`POST
 /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`, or `mocactl sbx templates
 retire`), each host holding it gets it in its wanted state's `stop` and `remove` as soon as no live
-sandbox runs on its worker. In the same run the agent stops the worker, runs `install-host.sh
+sandbox runs on its worker and no pinned session's hold keeps it; a worker whose sandbox ended less
+than 600 s ago is in `stop` only until then, so the host still ships that sandbox's last egress
+events (`--wait` may need a `--timeout` past that). In the same run the agent stops the worker, runs `install-host.sh
 --uninstall <worker> --keep-shared` (`SBX_INSTALL_HOST`), deletes the snapshot directory and its template record
 under `/srv/sbx`, and reports `removed`: the template's provenance gains a `retire` record by
 `host:<id>`, and the build's `heldBy` (`GET /v1/templates/{id}/builds/{build}`) no longer lists the

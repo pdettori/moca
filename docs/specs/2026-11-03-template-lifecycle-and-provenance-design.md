@@ -441,7 +441,9 @@ poll:
 **Removal (step 7, #743).** The wanted state's `remove` lists the retired builds the host holds with
 no live sandbox on their worker and no pinned session's hold on it (either keeps the worker busy,
 §6.3), each also in `stop`, so a running worker is stopped first, in the
-same run. A retired build whose build id or worker a build that is not retired shares (in any
+same run. A worker whose sandbox ended less than `EGRESS_GRACE_S` (600 s) ago is in `stop` only until
+then: the host may still ship that sandbox's egress events, and the removal ends its hold on the
+build. A retired build whose build id or worker a build that is not retired shares (in any
 template: the same snapshot registered again, or a worker id kept) is in neither list, and its
 `removed` is refused `409 build_in_use`: deleting it would take the snapshot or worker that build
 needs, and drop its host from that build's `heldBy`. For each, the agent finds the snapshot from its own template record whose manifest hash

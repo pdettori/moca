@@ -11,6 +11,7 @@ import {
   workerOverheadMib,
   type HostView,
 } from '../src/activation.js';
+import { EGRESS_GRACE_S } from '../src/egress-log.js';
 import { writeError } from '../src/errors.js';
 import { exchangeCredential } from '../src/exchange.js';
 import { HANDLERS } from '../src/handlers.js';
@@ -1511,7 +1512,24 @@ describe('retire (§5.1)', () => {
     expect(await wanted(d, 'host-1')).toMatchObject({ run: [], stop: [], remove: [] });
     await HANDLERS.deleteSandbox!(ctx({ principal: alice, params: { id: sb.id } }), d);
     const entry = { template: 't1', buildId: hash('1'), worker: 'sbx_t1' };
-    expect(await wanted(d, 'host-1')).toMatchObject({ run: [], stop: [entry], remove: [entry] });
+    // Ended, but its egress events are still taken for EGRESS_GRACE_S: the worker stops, and its
+    // removal (which drops the host's hold, and so those events) waits for the grace to end.
+    expect(await wanted(d, 'host-1')).toEqual({
+      run: [],
+      starting: [],
+      stop: [entry],
+      remove: [],
+      egressSids: [expect.stringMatching(/^sbx-/)],
+    });
+    now += (EGRESS_GRACE_S + 1) * 1000;
+    await inventory(d, 'host-1', { [hash('1')]: 't1' }, 2);
+    expect(await wanted(d, 'host-1')).toEqual({
+      run: [],
+      starting: [],
+      stop: [entry],
+      remove: [entry],
+      egressSids: [],
+    });
   });
 
   it("reports a retired build's capacity while its worker still runs, and null once it stops", async () => {

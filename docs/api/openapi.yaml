@@ -3374,7 +3374,9 @@ paths:
         the session's subject is enrolled for sandboxes (combined control plane spec §3.4: the hosts'
         idle limit from that turn's credential exchange). `remove` (since 1.19.0; §6.1 step 7): the
         retired builds it holds with no live sandbox and no such hold, each listed in `stop` too, so
-        the agent stops a running worker first; it then uninstalls the worker and deletes the
+        the agent stops a running worker first (one whose sandbox ended less than 600 s ago, still in
+        `egressSids`, is in `stop` only until then: the removal ends the host's hold on the build,
+        and with it the egress events it may ship for that sandbox); it then uninstalls the worker and deletes the
         snapshot and its template record, and reports `removed`. The agent starts only workers
         already installed on the host. A build imported from SH_SANDBOX_TEMPLATES is in no list,
         retired or not: the deployment runs its worker. Nor is a retired build whose build id or

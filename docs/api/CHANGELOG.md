@@ -11,7 +11,9 @@ The host agent removes a retired build's worker and snapshot
 Every change is additive.
 
 - GET /v1/hosts/{host}/wanted gains `remove`: the retired builds the host holds with no live sandbox
-  and no pinned session's hold on their worker, each also in `stop`. The agent stops a running worker, then uninstalls it
+  and no pinned session's hold on their worker, each also in `stop`; while a sandbox that ended on
+  the worker is still in `egressSids` (less than 600 s ago), it is in `stop` only, so its last
+  egress events are still taken. The agent stops a running worker, then uninstalls it
   (`install-host.sh --uninstall --keep-shared`: its own files only), deletes the snapshot and its template record, and reports it. A
   worker with a live sandbox is in no list, nor is a retired build whose build id or worker a build
   that is not retired shares (in any template): its snapshot or worker is still needed.
