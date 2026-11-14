@@ -1725,7 +1725,8 @@ type LeaseStatus struct {
 	IdleTimeoutS uint32                 `protobuf:"varint,5,opt,name=idle_timeout_s,json=idleTimeoutS,proto3" json:"idle_timeout_s,omitempty"`
 	Pending      *LeaseEvent            `protobuf:"bytes,6,opt,name=pending,proto3" json:"pending,omitempty"`     // the last undelivered lease event (a start or an end), kept until acknowledged
 	Processes    []*TrackedProcess      `protobuf:"bytes,7,rep,name=processes,proto3" json:"processes,omitempty"` // the full tracked table, exited entries included (plan 5)
-	// The processes a set_mode downgrade stopped, reported until acknowledged (plan 5).
+	// The processes this set_mode call's downgrade stopped (plan 5), carried in that call's
+	// answer only: never stored, never acknowledged, empty on every other status.
 	Stopped       []*TrackedProcess `protobuf:"bytes,8,rep,name=stopped,proto3" json:"stopped,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

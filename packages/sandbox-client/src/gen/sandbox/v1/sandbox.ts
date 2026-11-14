@@ -521,7 +521,10 @@ export interface LeaseStatus {
     | undefined;
   /** the full tracked table, exited entries included (plan 5) */
   processes: TrackedProcess[];
-  /** The processes a set_mode downgrade stopped, reported until acknowledged (plan 5). */
+  /**
+   * The processes this set_mode call's downgrade stopped (plan 5), carried in that call's
+   * answer only: never stored, never acknowledged, empty on every other status.
+   */
   stopped: TrackedProcess[];
 }
 
