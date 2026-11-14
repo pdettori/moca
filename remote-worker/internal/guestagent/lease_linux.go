@@ -21,6 +21,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// leaseExecUser is the exec identity's passwd name, the USER and LOGNAME of every lease
+// Exec. A tracked process runs as sbxp<n> instead (uidAllocator.user).
+const leaseExecUser = "sbx"
+
 // leaseTeardownBound is how long the cgroup has to empty after cgroup.kill. Past it,
 // End carries teardown_failed and the agent is dead (spec §3.1).
 const leaseTeardownBound = 5 * time.Second
@@ -30,11 +34,16 @@ const leaseTeardownBound = 5 * time.Second
 // the per-Exec cgroup and the reaper's registration window both assume one at a time.
 // r is an atomic rather than under mu so that Close can stop the reaper while an Exec
 // is still running, instead of blocking until it ends.
+//
+// procs and uids are level 2's: the tracked processes, which outlive the Exec that
+// started them, and the uids they run as (tracked.go).
 type leaseRuntime struct {
-	mu   sync.Mutex
-	once sync.Once
-	r    atomic.Pointer[reaper]
-	seq  uint64
+	mu    sync.Mutex
+	once  sync.Once
+	r     atomic.Pointer[reaper]
+	seq   uint64
+	procs trackedTable
+	uids  *uidAllocator
 }
 
 // leasePrepare readies the guest for lease mode. NewAgent calls it when CgroupRoot is
@@ -44,6 +53,12 @@ func (a *Agent) leasePrepare() error {
 	if lo.UID <= 0 || lo.GID <= 0 || lo.Home == "" {
 		return fmt.Errorf("guest-agent: lease: uid %d, gid %d, home %q: want a non-root uid and gid and a home", lo.UID, lo.GID, lo.Home)
 	}
+	// A tracked process under the exec uid could be traced by any later Exec (spec §3.3).
+	if lo.TrackedUIDBase <= 0 || lo.MaxTrackedUIDs < 0 ||
+		(lo.UID >= lo.TrackedUIDBase && lo.UID < lo.TrackedUIDBase+lo.MaxTrackedUIDs) {
+		return fmt.Errorf("guest-agent: lease: tracked uids %d from %d: want a non-root range without the exec uid %d", lo.MaxTrackedUIDs, lo.TrackedUIDBase, lo.UID)
+	}
+	a.lease.uids = newUIDAllocator(lo.TrackedUIDBase, lo.MaxTrackedUIDs)
 	if err := os.Mkdir(lo.CgroupRoot, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("guest-agent: lease: cgroup root: %w", err)
 	}
@@ -254,7 +269,7 @@ func (a *Agent) runLease(req Request, stdin []byte, w *frameWriter, conn io.Read
 	}
 	stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW := pipes[0], pipes[1], pipes[2], pipes[3], pipes[4], pipes[5]
 
-	argv := []string{shim, ShimArg, strconv.Itoa(lo.UID), strconv.Itoa(lo.GID), lo.Home, "--", a.opts.Shell, "-c", req.Command}
+	argv := []string{shim, ShimArg, strconv.Itoa(lo.UID), strconv.Itoa(lo.GID), lo.Home, leaseExecUser, "--", a.opts.Shell, "-c", req.Command}
 	// Inherits the agent's environment on purpose; see forkShell for why R6's filter is
 	// absent here. CgroupFD places the child in its cgroup at clone time
 	// (CLONE_INTO_CGROUP), so there is no window in which it runs outside it.
@@ -521,9 +536,14 @@ func (c *execCgroup) remove() error {
 // would race this wait4(-1) for the same status: runLease registers its pid and the
 // status is handed over. A child can exit before it is registered, so a status reaped
 // in that window (between expect and await) is held in early.
+//
+// A tracked process (level 2) outlives the Exec that started it, so its registration
+// is in tracked, which neither expect nor cancel clears: runLease cancels after every
+// Exec. Its own children reparent to the agent and are reaped here as orphans.
 type reaper struct {
 	mu      sync.Mutex
 	waiting map[int]chan syscall.WaitStatus
+	tracked map[int]func(syscall.WaitStatus)
 	early   map[int]syscall.WaitStatus
 	order   []int // early's pids, oldest first, for the cap
 	pending bool  // between expect and await/cancel
@@ -539,6 +559,7 @@ const reaperEarlyCap = 1024
 func startReaper() *reaper {
 	r := &reaper{
 		waiting: map[int]chan syscall.WaitStatus{},
+		tracked: map[int]func(syscall.WaitStatus){},
 		early:   map[int]syscall.WaitStatus{},
 		sig:     make(chan os.Signal, 1),
 		quit:    make(chan struct{}),
@@ -587,6 +608,12 @@ func (r *reaper) sweep() {
 
 func (r *reaper) deliver(pid int, ws syscall.WaitStatus) {
 	r.mu.Lock()
+	if onExit, ok := r.tracked[pid]; ok {
+		delete(r.tracked, pid)
+		r.mu.Unlock()
+		onExit(ws)
+		return
+	}
 	defer r.mu.Unlock()
 	if ch, ok := r.waiting[pid]; ok {
 		delete(r.waiting, pid)
@@ -629,8 +656,29 @@ func (r *reaper) await(pid int) <-chan syscall.WaitStatus {
 	return ch
 }
 
-// cancel closes the registration window and forgets every pid still registered, once
-// the caller no longer wants its status (a failed fork, or after teardown).
+// track registers a tracked process: onExit gets its status once, whenever the reaper
+// reaps it, and at once if it was reaped before this call. Unlike await's, the
+// registration survives expect and cancel. It closes the registration window, as await
+// does. onExit runs without the reaper's lock, on whichever goroutine reaps: the
+// reaper's own, this one, or a runLease that holds lease.mu while it sweeps. So it must
+// not take lease.mu or block on anything that waits for the reaper.
+func (r *reaper) track(pid int, onExit func(syscall.WaitStatus)) {
+	r.mu.Lock()
+	ws, early := r.early[pid]
+	if !early {
+		r.tracked[pid] = onExit
+	}
+	r.pending = false
+	r.early, r.order = map[int]syscall.WaitStatus{}, nil
+	r.mu.Unlock()
+	if early {
+		onExit(ws)
+	}
+}
+
+// cancel closes the registration window and forgets every pid still registered by
+// await, once the caller no longer wants its status (a failed fork, or after teardown).
+// Tracked registrations stay.
 func (r *reaper) cancel() {
 	r.mu.Lock()
 	defer r.mu.Unlock()

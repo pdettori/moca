@@ -35,7 +35,18 @@ type LeaseOptions struct {
 	UID, GID   int    // the exec identity the shim drops to
 	Home       string // the exec identity's HOME
 	ShimPath   string // the binary that acts as the lease shim; default /proc/self/exe
+	// Tracked processes (level 2) each run under their own uid, from TrackedUIDBase up to
+	// TrackedUIDBase+MaxTrackedUIDs-1 (spec §3.3). Zero means the default.
+	TrackedUIDBase int // default DefaultTrackedUIDBase
+	MaxTrackedUIDs int // default DefaultMaxTrackedUIDs
 }
+
+// The tracked uid range's defaults (global constraints): uids 20000 to 20003, the
+// image's sbxp0 to sbxp3.
+const (
+	DefaultTrackedUIDBase = 20000
+	DefaultMaxTrackedUIDs = 4
+)
 
 // Agent serves one command per connection out of a bash that was forked BEFORE the
 // snapshot was taken and has been blocked on a pipe ever since.
@@ -82,6 +93,12 @@ func NewAgent(opts AgentOptions) (*Agent, error) {
 	}
 	if opts.ScratchDir == "" {
 		opts.ScratchDir = os.TempDir()
+	}
+	if opts.Lease.TrackedUIDBase == 0 {
+		opts.Lease.TrackedUIDBase = DefaultTrackedUIDBase
+	}
+	if opts.Lease.MaxTrackedUIDs == 0 {
+		opts.Lease.MaxTrackedUIDs = DefaultMaxTrackedUIDs
 	}
 	a := &Agent{opts: opts}
 	if opts.Lease.CgroupRoot != "" {
