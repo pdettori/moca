@@ -563,10 +563,10 @@ describe('mocactl sbx mode (lease-mode spec §8.1, §8.2)', () => {
     const other = leaseWorld({ record: { mode: 'lease' }, cwd: tmp('sbx-mode-unbound-') });
     expect(await other.run(['mode', 'per-exec', SBX])).toBe(0);
     expect(other.err()).not.toContain(HINT);
-    // lease and lease+processes share one rules block: nothing to update.
-    const same = leaseWorld({ record: { mode: 'lease' }, cwd: bound() });
-    expect(await same.run(['mode', 'lease+processes'])).toBe(0);
-    expect(same.err()).not.toContain(HINT);
+    // lease+processes has its own rules block (plan 5: the process tools): it changes too.
+    const l2 = leaseWorld({ record: { mode: 'lease' }, cwd: bound() });
+    expect(await l2.run(['mode', 'lease+processes'])).toBe(0);
+    expect(l2.err()).toContain(HINT);
     // A mode the control plane refused changed nothing.
     const refused = leaseWorld({ tty: false, record: { mode: 'per-exec' }, cwd: bound() });
     expect(await refused.run(['mode', 'lease'])).toBe(2);

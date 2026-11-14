@@ -21,12 +21,14 @@ import {
   ExecRefusedError,
   type Exec,
   type ExecResult,
+  type ProcessCall,
 } from '../src/exec-conn.js';
 import {
   FILE_TOOL_TIMEOUT_S,
   MAX_BYTES,
   MAX_STDIN_BYTES,
   MAX_LINES,
+  PROCESS_TOOL_NAMES,
   sandboxTools,
   TOOL_NAMES,
   ToolInputError,
@@ -882,5 +884,179 @@ describe('sandbox tools (SBX0 §6.4)', () => {
     const s = scripted();
     expect(txt(await t(tools, 'sandbox_info').run({}, s.exec))).toBe('template default, expires …');
     expect(s.sent).toEqual([]);
+  });
+});
+
+describe('process tools (plan 5, spec §7)', () => {
+  const l2 = () =>
+    new Map(
+      sandboxTools({ info: async () => '', mode: 'lease+processes' }).map((x) => [x.name, x]),
+    );
+  /** A scripted process call: records each op and its args, answers from `answer`. */
+  function procs(answer: (op: string, args: Record<string, unknown>) => unknown = () => []) {
+    const sent: { op: string; args: Record<string, unknown>; signal?: AbortSignal }[] = [];
+    const process = (async (
+      op: string,
+      args: Record<string, unknown>,
+      o?: { signal?: AbortSignal },
+    ) => {
+      sent.push({ op, args, ...(o?.signal ? { signal: o.signal } : {}) });
+      const a = answer(op, args);
+      if (a instanceof Error) throw a;
+      return { result: a, lease: [] };
+    }) as unknown as ProcessCall;
+    return { process, sent };
+  }
+  const view = (over: Record<string, unknown> = {}) => ({
+    id: '3',
+    name: 'web',
+    pid: 412,
+    state: 'running',
+    code: 0,
+    ageMs: 130_000,
+    memoryBytes: 12 * 1024 * 1024,
+    ...over,
+  });
+  const noExec: Exec = async () => {
+    throw new Error('a process tool never sends a command Exec');
+  };
+
+  it('serves the four process tools at lease+processes only, after the nine', () => {
+    expect(PROCESS_TOOL_NAMES).toEqual([
+      'process_start',
+      'process_list',
+      'process_logs',
+      'process_stop',
+    ]);
+    expect([...l2().keys()]).toEqual([...TOOL_NAMES, ...PROCESS_TOOL_NAMES]);
+    for (const mode of ['per-exec', 'lease'] as const) {
+      expect(sandboxTools({ info: async () => '', mode }).map((x) => x.name)).toEqual([
+        ...TOOL_NAMES,
+      ]);
+    }
+  });
+
+  it('schemas as in spec §7', () => {
+    const tools = l2();
+    expect(t(tools, 'process_start').inputSchema).toMatchObject({
+      type: 'object',
+      required: ['command'],
+      properties: {
+        command: { type: 'string' },
+        cwd: { type: 'string' },
+        name: { type: 'string' },
+      },
+    });
+    expect(t(tools, 'process_list').inputSchema).toEqual({ type: 'object', properties: {} });
+    expect(t(tools, 'process_logs').inputSchema).toMatchObject({
+      type: 'object',
+      properties: { id: { type: 'string' }, name: { type: 'string' }, tail: { type: 'integer' } },
+    });
+    expect(t(tools, 'process_stop').inputSchema).toMatchObject({
+      type: 'object',
+      properties: { id: { type: 'string' }, name: { type: 'string' }, signal: { type: 'string' } },
+    });
+    expect(t(tools, 'process_logs').description).toMatch(/default 200/);
+    expect(t(tools, 'process_stop').description).toMatch(/TERM/);
+    expect(t(tools, 'process_stop').description).toMatch(/10 s/);
+  });
+
+  it('process_start sends the command, cwd and name, and answers id, name and pid', async () => {
+    const p = procs(() => ({ id: '3', name: 'web', pid: 412 }));
+    const ac = new AbortController();
+    const r = await t(l2(), 'process_start').run(
+      { command: 'python3 -m http.server 8080', cwd: 'app', name: 'web' },
+      noExec,
+      ac.signal,
+      p.process,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(txt(r)).toBe('started 3 web (pid 412)');
+    expect(p.sent).toEqual([
+      {
+        op: 'start',
+        args: { command: 'python3 -m http.server 8080', cwd: 'app', name: 'web' },
+        signal: ac.signal,
+      },
+    ]);
+    await t(l2(), 'process_start').run({ command: 'make watch' }, noExec, undefined, p.process);
+    expect(p.sent[1]!.args).toEqual({ command: 'make watch' });
+  });
+
+  it('process_list answers one row per process, or says there are none', async () => {
+    const p = procs(() => [
+      view(),
+      view({ id: '4', name: 'p4', pid: 9, state: 'exited', code: 1, ageMs: 5_000, memoryBytes: 0 }),
+    ]);
+    expect(txt(await t(l2(), 'process_list').run({}, noExec, undefined, p.process))).toBe(
+      '3 web (pid 412): running, 2m10s, 12.0 MiB\n4 p4 (pid 9): exited(1), 5s, 0.0 MiB',
+    );
+    const none = procs(() => []);
+    expect(txt(await t(l2(), 'process_list').run({}, noExec, undefined, none.process))).toBe(
+      'no tracked processes',
+    );
+  });
+
+  it('process_logs sends the id or name and the tail, and keeps the last lines within the limits', async () => {
+    const p = procs(() => 'a\nb\n');
+    expect(
+      txt(await t(l2(), 'process_logs').run({ name: 'web' }, noExec, undefined, p.process)),
+    ).toBe('a\nb\n');
+    await t(l2(), 'process_logs').run({ id: '3', tail: 20 }, noExec, undefined, p.process);
+    expect(p.sent.map((s) => s.args)).toEqual([{ name: 'web' }, { id: '3', tail: 20 }]);
+    const empty = procs(() => '');
+    expect(
+      txt(await t(l2(), 'process_logs').run({ id: '3' }, noExec, undefined, empty.process)),
+    ).toBe('(no output)');
+    const big = procs(() => `${'x'.repeat(100)}\n`.repeat(MAX_LINES + 5));
+    expect(
+      txt(
+        await t(l2(), 'process_logs').run({ id: '3', tail: 5000 }, noExec, undefined, big.process),
+      ),
+    ).toMatch(/^\[Showing the last \d+ of \d+ lines\]/);
+  });
+
+  it('process_stop sends the id or name and the signal, and answers the final state', async () => {
+    const p = procs(() => view({ state: 'killed', code: 15, memoryBytes: 0 }));
+    expect(
+      txt(
+        await t(l2(), 'process_stop').run(
+          { name: 'web', signal: 'INT' },
+          noExec,
+          undefined,
+          p.process,
+        ),
+      ),
+    ).toBe('final state: 3 web (pid 412): killed(15), 2m10s, 0.0 MiB');
+    expect(p.sent[0]!.args).toEqual({ name: 'web', signal: 'INT' });
+  });
+
+  it('refuses malformed input, sending nothing', async () => {
+    const p = procs();
+    const tools = l2();
+    for (const [name, args] of [
+      ['process_start', {}],
+      ['process_start', { command: '' }],
+      ['process_start', { command: 'x', name: 3 }],
+      ['process_start', { command: 'x', cwd: '' }],
+      ['process_logs', {}],
+      ['process_logs', { id: '3', tail: 0 }],
+      ['process_logs', { id: '3', tail: 1.5 }],
+      ['process_stop', {}],
+      ['process_stop', { name: '' }],
+      ['process_stop', { id: '3', signal: 9 }],
+    ] as const) {
+      await expect(
+        t(tools, name).run(args as Record<string, unknown>, noExec, undefined, p.process),
+        `${name} ${JSON.stringify(args)}`,
+      ).rejects.toBeInstanceOf(ToolInputError);
+    }
+    expect(p.sent).toEqual([]);
+  });
+
+  it("rethrows the process call's own errors unchanged", async () => {
+    const boom = new ExecMachineryError('sandbox failure: worker gone');
+    const p = procs(() => boom);
+    await expect(t(l2(), 'process_list').run({}, noExec, undefined, p.process)).rejects.toBe(boom);
   });
 });

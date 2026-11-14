@@ -1,13 +1,16 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   ExecAbortedError,
   ExecMachineryError,
   ExecRefusedError,
+  ProcessError,
   SandboxExecConn,
   type Exec,
   type ExecResult,
+  type ProcessCall,
 } from '../src/exec-conn.js';
 import { LeaseEvent, SandboxMode } from '../src/gen/sandbox/v1/sandbox.js';
 import { LeaseControlError, type LeaseStatusView } from '../src/lease.js';
@@ -57,7 +60,7 @@ async function connect(over: Partial<SandboxMcpOptions> & { exec: Exec }) {
   const client = new Client({ name: 'test', version: '0' });
   await client.connect(b);
   closers.push(() => client.close());
-  return { client, records };
+  return { client, records, server };
 }
 type Res = { content: { text: string }[]; isError?: boolean };
 const call = (c: Client, name: string, args: Record<string, unknown>, signal?: AbortSignal) =>
@@ -829,7 +832,8 @@ describe('lease mode (plan 4, spec §5)', () => {
         'mode: lease+processes',
         'lease: unknown (timeout)',
         'last end: none',
-        'tracked processes: none',
+        // A failed status cannot say which processes run (plan 5).
+        'tracked processes: unknown',
       ].join('\n'),
     );
     expect(ops).toEqual(['status']);
@@ -1048,7 +1052,7 @@ describe('lease mode (plan 4, spec §5)', () => {
         'mode: lease',
         'lease: unknown (unavailable)',
         'last end: none',
-        'tracked processes: none',
+        'tracked processes: unknown',
       ].join('\n'),
     );
     expect(records).toMatchObject([{ tool: 'sandbox_info', ok: true }]);
@@ -1073,7 +1077,11 @@ describe('lease mode (plan 4, spec §5)', () => {
     const peTools = (await pe.listTools()).tools;
     expect(peTools.find((t) => t.name === 'bash')!.description).toMatch(/Every call is a fresh VM/);
     expect(peTools.find((t) => t.name === 'bash')!.description).not.toContain(PHRASE);
-    expect(sandboxRules('/workspace', 'lease+processes')).toBe(sandboxRules('/workspace', 'lease'));
+    // Level 2 keeps the lease phrase and adds its own sentence (plan 5).
+    expect(sandboxRules('/workspace', 'lease+processes')).toContain(PHRASE);
+    expect(sandboxRules('/workspace', 'lease+processes')).not.toBe(
+      sandboxRules('/workspace', 'lease'),
+    );
   });
 });
 
@@ -1122,5 +1130,394 @@ describe('execFailureText: one mapping for the MCP server and mocactl', () => {
     );
     expect(execFailureText(ending)).toBe(ending.message);
     expect(execFailureText(ending, { audience: 'cli' })).toBe(ending.message);
+  });
+});
+
+describe('level 2: tracked processes (plan 5, spec §7)', () => {
+  let tz: string | undefined;
+  beforeAll(() => {
+    tz = process.env.TZ;
+    process.env.TZ = 'UTC';
+  });
+  afterAll(() => {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  });
+  const AT = Date.UTC(2026, 10, 13, 14, 2, 30);
+  const ev = (over: Partial<LeaseEvent>): LeaseEvent =>
+    LeaseEvent.fromPartial({
+      atUnixMs: AT,
+      mode: SandboxMode.SANDBOX_MODE_LEASE_PROCESSES,
+      ...over,
+    });
+  const END_IDLE =
+    '[sandbox] guest restarted (idle, 14:02): /tmp, installs outside /workspace and background processes are gone';
+  const NINE = ['bash', 'read', 'write', 'edit', 'grep', 'find', 'ls', 'sandbox_info', 'reset'];
+  const FOUR = ['process_start', 'process_list', 'process_logs', 'process_stop'];
+  const REFUSAL =
+    'processes not enabled for this sandbox; ask the user to run: mocactl sbx mode sbx_0123abcd lease+processes';
+  const L2_SENTENCE =
+    '`&`, `nohup` and `setsid` do not survive the call, and `process_start` does, when the sandbox allows it.';
+  const view = (over: Record<string, unknown> = {}) => ({
+    id: '3',
+    name: 'web',
+    pid: 412,
+    state: 'running',
+    code: 0,
+    ageMs: 130_000,
+    memoryBytes: 12 * 1024 * 1024,
+    ...over,
+  });
+  /** A process call that records each op and answers `answer`'s result with its `lease` events. */
+  function procs(
+    answer: (op: string) => unknown = () => [],
+    lease: (op: string) => LeaseEvent[] = () => [],
+  ) {
+    const ops: string[] = [];
+    const process = (async (op: string) => {
+      ops.push(op);
+      const a = answer(op);
+      if (a instanceof Error) throw a;
+      return { result: a, lease: lease(op) };
+    }) as unknown as ProcessCall;
+    return { process, ops };
+  }
+  const neverExec: Exec = async () => {
+    throw new Error('no command Exec expected');
+  };
+  const names = async (c: Client) => (await c.listTools()).tools.map((t) => t.name);
+
+  it("lists the process tools only while the current token's mode is lease+processes (P5-R27)", async () => {
+    let minted: 'per-exec' | 'lease' | 'lease+processes' | undefined;
+    const { client } = await connect({
+      exec: neverExec,
+      mode: 'lease+processes',
+      leaseMode: () => minted,
+      sandboxId: 'sbx_0123abcd',
+    });
+    // No token yet: the record read at start decides.
+    expect(await names(client)).toEqual([...NINE, ...FOUR]);
+    minted = 'lease';
+    expect(await names(client)).toEqual(NINE);
+    minted = 'lease+processes';
+    expect(await names(client)).toEqual([...NINE, ...FOUR]);
+    minted = 'per-exec';
+    expect(await names(client)).toEqual(NINE);
+    const { client: lease } = await connect({ exec: neverExec, mode: 'lease' });
+    expect(await names(lease)).toEqual(NINE);
+  });
+
+  it('a process call at a lower mode answers the exact §7 refusal and sends nothing', async () => {
+    let minted: 'per-exec' | 'lease' | 'lease+processes' | undefined = 'lease';
+    const p = procs();
+    const execs: string[] = [];
+    const { client, records } = await connect({
+      exec: async (c) => (execs.push(c), res()),
+      process: p.process,
+      mode: 'lease+processes',
+      leaseMode: () => minted,
+      sandboxId: 'sbx_0123abcd',
+    });
+    for (const [name, args] of [
+      ['process_start', { command: 'sleep 9' }],
+      ['process_list', {}],
+      ['process_logs', { name: 'web' }],
+      ['process_stop', { id: '3' }],
+    ] as const) {
+      const r = await call(client, name, args);
+      expect(r.isError, name).toBe(true);
+      expect(text(r), name).toBe(REFUSAL);
+    }
+    expect(p.ops).toEqual([]);
+    expect(execs).toEqual([]);
+    expect(records.map((r) => [r.tool, r.execs, r.ok])).toEqual([
+      ['process_start', 0, false],
+      ['process_list', 0, false],
+      ['process_logs', 0, false],
+      ['process_stop', 0, false],
+    ]);
+    // A per-exec record and no token: refused too.
+    minted = undefined;
+    const { client: pe } = await connect({
+      exec: neverExec,
+      process: p.process,
+      sandboxId: 'sbx_0123abcd',
+    });
+    expect(text(await call(pe, 'process_list', {}))).toBe(REFUSAL);
+    expect(p.ops).toEqual([]);
+  });
+
+  it("maps the relay's or worker's processes_not_enabled to the same §7 text", async () => {
+    const p = procs(
+      () => new ProcessError('processes_not_enabled', "this sandbox's mode is lease", 'x'),
+    );
+    const { client } = await connect({
+      exec: neverExec,
+      process: p.process,
+      mode: 'lease+processes',
+      sandboxId: 'sbx_0123abcd',
+    });
+    const r = await call(client, 'process_list', {});
+    expect(r.isError).toBe(true);
+    expect(text(r)).toBe(REFUSAL);
+    expect(p.ops).toEqual(['list']);
+  });
+
+  it('maps the other process wire errors to clear tool errors', async () => {
+    const cases: [ProcessError, string][] = [
+      [
+        new ProcessError('process_not_found', 'web', ''),
+        'no tracked process web; process_list shows them',
+      ],
+      [
+        new ProcessError('process_limit', '4 running (SH_LEASE_MAX_PROCESSES)', ''),
+        'too many tracked processes: 4 running (SH_LEASE_MAX_PROCESSES); stop one with process_stop first',
+      ],
+      [
+        new ProcessError('process_name_taken', 'web', ''),
+        'a running process is already named web; choose another name, or stop it first',
+      ],
+      [
+        new ProcessError('process_cwd', '../x: outside the workspace', ''),
+        'invalid cwd: ../x: outside the workspace',
+      ],
+      [
+        new ProcessError('process_name_invalid', '"a b": want 1-64 characters', ''),
+        'invalid name: "a b": want 1-64 characters',
+      ],
+      [
+        new ProcessError('process_signal', 'unknown signal FOO', ''),
+        'invalid signal: unknown signal FOO',
+      ],
+      [
+        new ProcessError('lease_unsupported', 'the snapshot has no lease-processes-v1', ''),
+        "this sandbox's guest cannot run tracked processes: the snapshot has no lease-processes-v1",
+      ],
+    ];
+    for (const [e, want] of cases) {
+      const { client } = await connect({
+        exec: neverExec,
+        process: procs(() => e).process,
+        mode: 'lease+processes',
+      });
+      const r = await call(client, 'process_logs', { name: 'web' });
+      expect(r.isError, e.code).toBe(true);
+      expect(text(r), e.code).toBe(want);
+    }
+  });
+
+  it('runs the process tools at lease+processes, one Exec each, through the call queue', async () => {
+    const p = procs((op) =>
+      op === 'start'
+        ? { id: '3', name: 'web', pid: 412 }
+        : op === 'list'
+          ? [view()]
+          : op === 'logs'
+            ? 'serving\n'
+            : view({ state: 'exited', code: 0 }),
+    );
+    const { client, records } = await connect({
+      exec: neverExec,
+      process: p.process,
+      mode: 'lease+processes',
+    });
+    expect(text(await call(client, 'process_start', { command: 'serve', name: 'web' }))).toBe(
+      'started 3 web (pid 412)',
+    );
+    expect(text(await call(client, 'process_list', {}))).toBe(
+      '3 web (pid 412): running, 2m10s, 12.0 MiB',
+    );
+    expect(text(await call(client, 'process_logs', { name: 'web' }))).toBe('serving\n');
+    expect(text(await call(client, 'process_stop', { name: 'web' }))).toBe(
+      'final state: 3 web (pid 412): exited(0), 2m10s, 12.0 MiB',
+    );
+    expect(p.ops).toEqual(['start', 'list', 'logs', 'stop']);
+    expect(records.map((r) => [r.tool, r.execs, r.ok])).toEqual([
+      ['process_start', 1, true],
+      ['process_list', 1, true],
+      ['process_logs', 1, true],
+      ['process_stop', 1, true],
+    ]);
+  });
+
+  it("puts a process call's lease events first in its result, and a failed one's too", async () => {
+    const end = ev({ state: 'end', reason: 'idle' });
+    const failing = new ProcessError('process_not_found', 'web', 'process_not_found: web', [end]);
+    let fail = false;
+    const p = procs(
+      () => (fail ? failing : []),
+      () => [end],
+    );
+    const { client } = await connect({
+      exec: neverExec,
+      process: p.process,
+      mode: 'lease+processes',
+    });
+    expect(text(await call(client, 'process_list', {}))).toBe(`${END_IDLE}\nno tracked processes`);
+    fail = true;
+    const later = ev({ state: 'end', reason: 'reset', atUnixMs: AT + 60_000 });
+    failing.lease = [later];
+    const r = await call(client, 'process_logs', { name: 'web' });
+    expect(r.isError).toBe(true);
+    expect(text(r).split('\n')[0]).toMatch(/^\[sandbox\] guest restarted \(reset, 14:03\)/);
+  });
+
+  it('M3: a process call that resolves after its cancel keeps its notice for the next result', async () => {
+    const end = ev({ state: 'end', reason: 'idle' });
+    let first = true;
+    const process = ((_op: string, _args: unknown, o?: { signal?: AbortSignal }) =>
+      first
+        ? ((first = false),
+          new Promise((resolve) =>
+            o?.signal?.addEventListener('abort', () => resolve({ result: [], lease: [end] })),
+          ))
+        : Promise.resolve({ result: [], lease: [] })) as unknown as ProcessCall;
+    const { client } = await connect({ exec: neverExec, process, mode: 'lease+processes' });
+    const ac = new AbortController();
+    const pending = call(client, 'process_list', {}, ac.signal);
+    await sleep(10);
+    ac.abort();
+    await expect(pending).rejects.toThrow();
+    await sleep(10);
+    expect(text(await call(client, 'process_list', {}))).toBe(`${END_IDLE}\nno tracked processes`);
+    expect(text(await call(client, 'process_list', {}))).toBe('no tracked processes');
+  });
+
+  it('M3: a cancelled process call whose rejection carries events holds them for the next result', async () => {
+    const end = ev({ state: 'end', reason: 'idle' });
+    let first = true;
+    const process = ((_op: string, _args: unknown, o?: { signal?: AbortSignal }) =>
+      first
+        ? ((first = false),
+          new Promise((_r, reject) =>
+            o?.signal?.addEventListener('abort', () => {
+              const e = new ExecAbortedError(o.signal!);
+              e.lease = [end];
+              reject(e);
+            }),
+          ))
+        : Promise.resolve({ result: [], lease: [] })) as unknown as ProcessCall;
+    const { client } = await connect({ exec: neverExec, process, mode: 'lease+processes' });
+    const ac = new AbortController();
+    const pending = call(client, 'process_list', {}, ac.signal);
+    await sleep(10);
+    ac.abort();
+    await expect(pending).rejects.toThrow();
+    await sleep(10);
+    expect(text(await call(client, 'process_list', {}))).toBe(`${END_IDLE}\nno tracked processes`);
+  });
+
+  it('shows the processes_stopped notice on the next result', async () => {
+    const stopped = ev({
+      state: 'processes_stopped',
+      reason: 'mode_change',
+      processes: ['web (pid 412)'],
+    });
+    const { client } = await connect({
+      exec: async () => res({ lease: [stopped] }),
+      mode: 'lease',
+    });
+    expect(text(await call(client, 'bash', { command: 'x' }))).toBe(
+      '[sandbox] tracked processes stopped (mode_change, 14:02): web (pid 412)\nok\n',
+    );
+  });
+
+  it('declares tools.listChanged, and sends list_changed when a minted token changes the mode (P5-R27)', async () => {
+    const { client, server } = await connect({ exec: neverExec, mode: 'lease' });
+    expect(client.getServerCapabilities()?.tools?.listChanged).toBe(true);
+    let changed = 0;
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      changed++;
+    });
+    // The first mint, nothing listed yet: no notice.
+    server.tokenMinted('lease+processes');
+    await sleep(10);
+    expect(changed).toBe(0);
+    server.tokenMinted('lease+processes'); // the same mode again
+    await sleep(10);
+    expect(changed).toBe(0);
+    server.tokenMinted('lease'); // a downgrade
+    await sleep(10);
+    expect(changed).toBe(1);
+    server.tokenMinted('lease+processes'); // and back
+    await sleep(10);
+    expect(changed).toBe(2);
+  });
+
+  it('sends list_changed on the first mint only when the tools were listed under another mode', async () => {
+    for (const [listed, minted, want] of [
+      ['lease', 'lease+processes', 1],
+      ['lease', 'lease', 0],
+      ['lease+processes', 'lease', 1],
+    ] as const) {
+      const { client, server } = await connect({ exec: neverExec, mode: listed });
+      let changed = 0;
+      client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+        changed++;
+      });
+      await client.listTools();
+      server.tokenMinted(minted);
+      await sleep(10);
+      expect(changed, `${listed} -> ${minted}`).toBe(want);
+    }
+  });
+
+  it('level-2 texts: the bash description and the rules carry the §7 sentence at lease+processes only', async () => {
+    let minted: 'lease' | 'lease+processes' | undefined;
+    const { client } = await connect({ exec: neverExec, mode: 'lease', leaseMode: () => minted });
+    const bash = async () => (await client.listTools()).tools.find((t) => t.name === 'bash')!;
+    expect((await bash()).description).not.toContain(L2_SENTENCE);
+    expect((await bash()).description).toMatch(/Never start background jobs/);
+    // The descriptions are rebuilt for the mode the token now says.
+    minted = 'lease+processes';
+    const d = (await bash()).description!;
+    expect(d).toContain(L2_SENTENCE);
+    expect(d).not.toMatch(/Never start background jobs/);
+    expect(sandboxRules('/workspace', 'lease+processes')).toContain(L2_SENTENCE);
+    expect(sandboxRules('/workspace', 'lease')).not.toContain(L2_SENTENCE);
+    expect(sandboxRules('/workspace', 'per-exec')).not.toContain(L2_SENTENCE);
+    const { client: l2 } = await connect({ exec: neverExec, mode: 'lease+processes' });
+    expect(l2.getInstructions()).toBe(sandboxRules('/workspace', 'lease+processes'));
+    expect(l2.getInstructions()).not.toMatch(/Never start background jobs/);
+  });
+
+  it('sandbox_info lists the tracked processes from the lease status, exited ones included', async () => {
+    const { client } = await connect({
+      exec: neverExec,
+      mode: 'lease+processes',
+      info: async () => ({ text: 'template default', mode: 'lease+processes' }),
+      lease: async () => ({
+        mode: 'lease+processes',
+        epochKnown: true,
+        state: 'active',
+        ageMs: 61_000,
+        idleTimeoutS: 900,
+        processes: [
+          view(),
+          view({
+            id: '4',
+            name: 'p4',
+            pid: 9,
+            state: 'killed',
+            code: 9,
+            ageMs: 5_000,
+            memoryBytes: 0,
+          }),
+        ],
+      }),
+    });
+    expect(text(await call(client, 'sandbox_info', {}))).toBe(
+      [
+        'template default',
+        'mode: lease+processes',
+        'lease: active',
+        'age: 61s',
+        'idle timeout: 900s',
+        'last end: none',
+        'tracked processes:',
+        '  3 web (pid 412): running, 2m10s, 12.0 MiB',
+        '  4 p4 (pid 9): killed(9), 5s, 0.0 MiB',
+      ].join('\n'),
+    );
   });
 });

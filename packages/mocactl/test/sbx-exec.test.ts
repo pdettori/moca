@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
   ExecAbortedError,
   ExecMachineryError,
   ExecRefusedError,
   LEASE_RULE,
   LeaseControlError,
+  PROCESS_RULE,
   leaseNotice,
   MAX_STDIN_BYTES,
   RESET_ENDED_TEXT,
@@ -1050,6 +1052,7 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
     });
     const flags: boolean[] = [];
     const ops: string[] = [];
+    const processOps: string[] = [];
     const signals: (AbortSignal | undefined)[] = [];
     let keepalives = 0;
     const factory: ExecFactory = (o) => ({
@@ -1070,6 +1073,11 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
         keepalives++;
         await over.keepalive?.();
       },
+      process: (async (op: string) => {
+        await o.token({ force: false, minValidS: 60 });
+        processOps.push(op);
+        return { result: [], lease: [] };
+      }) as never,
     });
     const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
     const served = sbxMain(['mcp', '--sandbox', SBX], env, io, {
@@ -1090,6 +1098,7 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
       bash,
       flags,
       ops,
+      processOps,
       signals,
       keepalives: () => keepalives,
       connect: () => client.connect(clientSide),
@@ -1302,6 +1311,63 @@ describe('mocactl sbx mcp (SBX0 §6.4)', () => {
     } finally {
       relay.close();
     }
+  });
+
+  it("the tool list follows the minted token's mode: list_changed on a change, the process tools at lease+processes (P5-R27)", async () => {
+    const m = leaseSession(['lease', 'lease+processes', 'lease+processes', 'lease']);
+    let changed = 0;
+    m.client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      changed++;
+    });
+    await m.connect();
+    expect(m.client.getServerCapabilities()?.tools?.listChanged).toBe(true);
+    const names = async () => (await m.client.listTools()).tools.map((t) => t.name);
+    expect(await names()).not.toContain('process_start'); // the lease record, no token yet
+    await m.bash('echo'); // the first mint: lease, as listed
+    await m.bash('remint'); // the owner upgraded: lease+processes
+    await vi.waitFor(() => expect(changed).toBe(1));
+    expect(await names()).toEqual(expect.arrayContaining(['process_start', 'process_stop']));
+    const bash = (await m.client.listTools()).tools.find((t) => t.name === 'bash')!;
+    expect(bash.description).toContain(PROCESS_RULE);
+    const r = (await m.client.callTool({ name: 'process_list', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(r.content[0]!.text).toBe('no tracked processes');
+    expect(m.processOps).toEqual(['list']);
+    await m.bash('remint'); // the same mode again: nothing to tell
+    await m.bash('remint'); // a downgrade
+    await vi.waitFor(() => expect(changed).toBe(2));
+    expect(await names()).not.toContain('process_start');
+    await m.client.close();
+    await m.served;
+  });
+
+  it('a process call below lease+processes answers the §7 refusal naming the sandbox, sending nothing', async () => {
+    // The record says lease+processes, so the tools are listed; the token minted says lease.
+    const m = leaseSession(['lease'], { record: () => 'lease+processes' });
+    let changed = 0;
+    m.client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+      changed++;
+    });
+    await m.connect();
+    expect((await m.client.listTools()).tools.map((t) => t.name)).toContain('process_start');
+    const info = (await m.client.callTool({ name: 'sandbox_info', arguments: {} })) as {
+      content: { text: string }[];
+    };
+    expect(info.content[0]!.text).toContain('process_start');
+    await m.bash('echo'); // the first mint, listed under another mode: the client is told
+    await vi.waitFor(() => expect(changed).toBe(1));
+    const r = (await m.client.callTool({
+      name: 'process_start',
+      arguments: { command: 'python3 -m http.server' },
+    })) as { content: { text: string }[]; isError?: boolean };
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toBe(
+      `processes not enabled for this sandbox; ask the user to run: mocactl sbx mode ${SBX} lease+processes`,
+    );
+    expect(m.processOps).toEqual([]);
+    await m.client.close();
+    await m.served;
   });
 
   it('jwtMode reads the mode claim; anything else is per-exec', () => {

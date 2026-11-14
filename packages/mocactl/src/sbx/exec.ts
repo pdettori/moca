@@ -6,6 +6,7 @@ import {
   type ExecConnOptions,
   type LeaseOpName,
   type LeaseStatusView,
+  type ProcessCall,
   type SandboxModeName,
   type SandboxTokenGrant,
   type TokenFn,
@@ -26,12 +27,16 @@ export type LeaseControlFn = (
   opts?: { signal?: AbortSignal },
 ) => Promise<LeaseStatusView>;
 
-/** Builds the gRPC connection; a seam so tests run the commands against a fake. */
+/**
+ * Builds the gRPC connection; a seam so tests run the commands against a fake. `process` (plan 5)
+ * is optional so that a fake for commands that make no process call need not have one.
+ */
 export type ExecFactory = (o: ExecConnOptions) => {
   exec: Exec;
   close(): void;
   leaseControl: LeaseControlFn;
   leaseKeepalive: () => Promise<void>;
+  process?: ProcessCall;
 };
 const realFactory: ExecFactory = (o) => {
   const c = new SandboxExecConn(o);
@@ -40,7 +45,13 @@ const realFactory: ExecFactory = (o) => {
     close: c.close,
     leaseControl: c.leaseControl,
     leaseKeepalive: c.leaseKeepalive,
+    process: c.process,
   };
+};
+
+/** A connection without process calls (a test fake) fails a process call plainly. */
+const noProcess: ProcessCall = async () => {
+  throw new Error('this connection has no process calls');
 };
 
 /** Seconds of token life a held token must keep beyond what the connection asks (spec §6.5). */
@@ -143,6 +154,8 @@ export interface OpenedExec {
   close(): void;
   leaseControl: LeaseControlFn;
   leaseKeepalive(): Promise<void>;
+  /** The process calls (plan 5, spec §7). */
+  process: ProcessCall;
   /** The first token, minted before dialing: where to dial and which worker and workspace. */
   token: SbxToken;
   /** The token's lifetime (`exp − iat`), 0 if unreadable: the default timeout is this minus 60. */
@@ -197,6 +210,7 @@ export async function openExec(
     close: c.close,
     leaseControl: c.leaseControl,
     leaseKeepalive: c.leaseKeepalive,
+    process: c.process ?? noProcess,
     token: first,
     lifetimeS: grantOf(first).lifetimeS,
   };

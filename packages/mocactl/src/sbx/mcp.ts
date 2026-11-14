@@ -5,7 +5,9 @@ import {
   LeaseControlError,
   type Exec,
   type LeaseCall,
+  type ProcessCall,
   type SandboxModeName,
+  type SandboxMcpServer,
 } from '@moca/sandbox-client';
 import { sanitizeRemote } from '../core/sanitize.js';
 import { VERSION } from '../version.js';
@@ -47,6 +49,10 @@ export async function stdioTransport(): Promise<Transport> {
  * Keepalive (spec §4, §8.3): while the `mode` claim of the latest sandbox token minted is a lease
  * mode, Execs set `keepalive` and a 30 s interval sends `leaseKeepalive()`. A mint that says
  * per-exec (the owner downgraded) stops it; closing the server clears it.
+ *
+ * The tool list follows the same claim (plan 5): the process tools are listed at lease+processes
+ * only, and the server tells the client (`notifications/tools/list_changed`) when a mint changes
+ * the mode (`tokenMinted`).
  */
 export async function serveSbxMcp(
   c: SbxCtx,
@@ -86,11 +92,14 @@ export async function serveSbxMcp(
         );
       });
   };
+  /** Set once created: a mint happens only during a call, after the server exists. */
+  let server: SandboxMcpServer | undefined;
   const onToken = (t: SbxToken) => {
     tokenMode = jwtMode(t.token);
     leased = tokenMode !== 'per-exec';
     if (!leased) stopBeat();
     else if (!beat && !closed) beat = setInterval(keepalive, KEEPALIVE_MS);
+    server?.tokenMinted(tokenMode);
   };
   const open = () =>
     (conn ??= openExec(c.api, id, factory, {
@@ -104,11 +113,16 @@ export async function serveSbxMcp(
   const exec: Exec = async (command, opts) => (await open()).exec(command, opts);
   // The tool call's cancel signal reaches the lease call: a cancelled `reset` stops waiting.
   const lease: LeaseCall = async (op, opts) => (await open()).leaseControl(op, undefined, opts);
+  const process: ProcessCall = async (op, args, opts) => (await open()).process(op, args, opts);
   const info = async () => {
     const now = await c.api.getSandbox(id);
     const current = recordMode(now);
     const calls =
-      current === 'per-exec' ? 'every call is a fresh VM, so no process survives it' : LEASE_RULE;
+      current === 'per-exec'
+        ? 'every call is a fresh VM, so no process survives it'
+        : current === 'lease'
+          ? LEASE_RULE
+          : `${LEASE_RULE}; a process started with process_start does survive calls`;
     return {
       text:
         `Sandbox ${now.id}${now.name ? ` (${now.name})` : ''}: template ${now.template}, ${now.state}, expires ` +
@@ -117,8 +131,10 @@ export async function serveSbxMcp(
       mode: current,
     };
   };
-  const server = createSandboxMcpServer({
+  server = createSandboxMcpServer({
     exec,
+    process,
+    sandboxId: id,
     info,
     lease,
     mode,
@@ -127,12 +143,13 @@ export async function serveSbxMcp(
     expiresAt: s.expiresAt,
     version: VERSION,
   });
-  const stop = () => void server.close().catch(() => {});
+  const served = server;
+  const stop = () => void served.close().catch(() => {});
   try {
     await new Promise<void>((resolve, reject) => {
       // Protocol.onclose is the SDK's own close hook; the transport's callbacks belong to the SDK.
-      server.onclose = () => resolve();
-      server.connect(transport).catch(reject);
+      served.onclose = () => resolve();
+      served.connect(transport).catch(reject);
       if (c.signal?.aborted) stop();
       else c.signal?.addEventListener('abort', stop, { once: true });
     });
