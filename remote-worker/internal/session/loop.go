@@ -797,6 +797,8 @@ func (s *Session) runOne(ctx context.Context, connDone <-chan struct{}, send fun
 		ModeEpoch:    e.GetModeEpoch(),
 		IdleTimeoutS: e.GetIdleTimeoutS(),
 		Keepalive:    e.GetKeepalive(),
+		Kind:         specKind(e.GetKind()),
+		Process:      specProcess(e.GetProcess()),
 	}, sink)
 
 	var frame *pb.WorkerFrame

@@ -37,6 +37,10 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 	)
 	start := time.Now()
 	mode, err := specMode(s)
+	kind, kerr := specKind(s)
+	if err == nil {
+		err = kerr
+	}
 	e := Exec{
 		ReqID:       s.ReqID,
 		Command:     s.Command,
@@ -47,6 +51,11 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 		ModeEpoch:   s.ModeEpoch,
 		IdleTimeout: time.Duration(s.IdleTimeoutS) * time.Second,
 		Keepalive:   s.Keepalive,
+		Kind:        kind,
+		Process: ProcessArgs{
+			Name: s.Process.Name, ID: s.Process.ID, Cwd: s.Process.Cwd,
+			Tail: int(s.Process.Tail), Signal: s.Process.Signal,
+		},
 	}
 	if err == nil {
 		// ExecPhased, not Exec: Exec delegates to it with a throwaway Phases, so this costs
@@ -58,8 +67,12 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 	if r.Timing {
 		logExecTiming(s.ReqID, s.WorkspaceKey, start, time.Since(start), &ph, res.ExitCode, err)
 	}
+	logKind := e.Kind.String()
+	if kerr != nil {
+		logKind = s.Kind // an unknown kind is logged as the session spelled it, never as a command
+	}
 	execLog("vmpool: exec req=%d workspace_key=%q kind=%s vm=%s cold=%q exit=%d err=%v",
-		s.ReqID, s.WorkspaceKey, e.Kind, ph.VMID, string(ph.Cold), res.ExitCode, err)
+		s.ReqID, s.WorkspaceKey, logKind, ph.VMID, string(ph.Cold), res.ExitCode, err)
 
 	// Report dropped bytes even on a failure path: an aborted exec still delivered
 	// whatever the guest had already sent, and declaring that untruncated is a false
@@ -73,7 +86,9 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 
 	// Lease events ride before the result, and before an error too (stale_mode,
 	// lease_ended, a timeout): the client learns the lease ended even when this Exec failed.
-	if mode != ModePerExec {
+	// Not for an unknown kind: its refusal is answered before any lease work, so a pending
+	// event stays pending for the next Exec.
+	if mode != ModePerExec && kerr == nil {
 		r.deliverLeaseEvents(s.WorkspaceKey, sink, res.ProcessesStopped)
 	}
 
@@ -89,10 +104,10 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 	default:
 		// Refusals, key mismatches and spawn failures all become ExecError. They stay
 		// distinguishable in the message. The pool's refusals are already counted in
-		// Stats, which is what spec §7.3's "ExecErrors by cause" row reads; the one
-		// refusal built here, specMode's lease_unsupported for a mode this worker does
-		// not know, never reached the pool and is not. The lease errors take their wire
-		// strings (wireError).
+		// Stats, which is what spec §7.3's "ExecErrors by cause" row reads; the two
+		// refusals built here, specMode's and specKind's lease_unsupported for a mode or a
+		// kind this worker does not know, never reached the pool and are not. The lease
+		// errors take their wire strings (wireError).
 		return 0, wireError(err)
 	}
 }
@@ -109,6 +124,27 @@ func specMode(s wexec.Spec) (Mode, error) {
 		return ModePerExec, refusal(RefuseLeaseUnsupported, "Exec for %q: %v", s.WorkspaceKey, err)
 	}
 	return m, nil
+}
+
+// specKind is the Spec's kind as the pool's (ruling P5-R22). Only the command and the four
+// process kinds map: the session's "unknown(<n>)" and any other name -- the host-only
+// process_stop_all above all, which no Exec may carry -- are refused lease_unsupported
+// before any VM or lease work, never run as a command.
+func specKind(s wexec.Spec) (ExecKind, error) {
+	switch s.Kind {
+	case wexec.KindCommand:
+		return ExecKindCommand, nil
+	case wexec.KindProcessStart:
+		return ExecKindProcessStart, nil
+	case wexec.KindProcessList:
+		return ExecKindProcessList, nil
+	case wexec.KindProcessLogs:
+		return ExecKindProcessLogs, nil
+	case wexec.KindProcessStop:
+		return ExecKindProcessStop, nil
+	}
+	detail, _ := wexec.UnknownKind(s.Kind)
+	return ExecKindCommand, refusal(RefuseLeaseUnsupported, "%s", detail)
 }
 
 // deliverLeaseEvents reports key's lease on the Exec's response, through the session's
