@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { Hello, Exec, End, ExecRequest, ExecKind, ProcessArgs, TrackedProcess } from '../src/gen/sandbox/v1/sandbox';
+import {
+  Hello,
+  Exec,
+  End,
+  ExecRequest,
+  ExecKind,
+  ProcessArgs,
+  TrackedProcess,
+} from '../src/gen/sandbox/v1/sandbox';
 import { Chunk, Stream } from '../src/gen/sandbox/v1/sandbox.js';
 import {
   ExecEvent,
@@ -280,9 +288,7 @@ describe('sandbox/v1 process wire (additive)', () => {
   });
 
   it('decodes an Exec written before the change as a command', () => {
-    const old = Exec.decode(
-      Uint8Array.from([0x08, 0x02, 0x12, 0x04, 0x74, 0x72, 0x75, 0x65]),
-    );
+    const old = Exec.decode(Uint8Array.from([0x08, 0x02, 0x12, 0x04, 0x74, 0x72, 0x75, 0x65]));
     expect(old.kind).toBe(ExecKind.EXEC_KIND_COMMAND);
     expect(old.process).toBeUndefined();
   });
@@ -299,7 +305,13 @@ describe('sandbox/v1 process wire (additive)', () => {
       reqId: 3,
       command: 'sleep 100',
       kind: ExecKind.EXEC_KIND_PROCESS_START,
-      process: ProcessArgs.fromPartial({ name: 'srv', id: 'p1', cwd: '/workspace', tail: 200, signal: 'TERM' }),
+      process: ProcessArgs.fromPartial({
+        name: 'srv',
+        id: 'p1',
+        cwd: '/workspace',
+        tail: 200,
+        signal: 'TERM',
+      }),
     });
     expect(Exec.decode(Exec.encode(e).finish())).toEqual(e);
   });
@@ -327,18 +339,34 @@ describe('sandbox/v1 process wire (additive)', () => {
     });
     expect(LeaseEvent.decode(LeaseEvent.encode(ev).finish())).toEqual(ev);
     // tag (9 << 3) | 2 = 0x4a leads a LeaseEvent that carries only tracked.
-    expect(LeaseEvent.encode(LeaseEvent.fromPartial({ tracked: [{ id: 'p' }] })).finish()[0]).toBe(0x4a);
+    expect(LeaseEvent.encode(LeaseEvent.fromPartial({ tracked: [{ id: 'p' }] })).finish()[0]).toBe(
+      0x4a,
+    );
   });
 
   it('carries LeaseStatus.processes (field 7) and LeaseStatus.stopped (field 8)', () => {
     const st = LeaseStatus.fromPartial({
       mode: SandboxMode.SANDBOX_MODE_LEASE_PROCESSES,
       state: 'active',
-      processes: [TrackedProcess.fromPartial({ id: 'p1', name: 'srv', pid: 7, state: 'running', memoryBytes: 5 })],
-      stopped: [TrackedProcess.fromPartial({ id: 'p2', name: 'old', pid: 8, state: 'exited', code: 0 })],
+      processes: [
+        TrackedProcess.fromPartial({
+          id: 'p1',
+          name: 'srv',
+          pid: 7,
+          state: 'running',
+          memoryBytes: 5,
+        }),
+      ],
+      stopped: [
+        TrackedProcess.fromPartial({ id: 'p2', name: 'old', pid: 8, state: 'exited', code: 0 }),
+      ],
     });
     expect(LeaseStatus.decode(LeaseStatus.encode(st).finish())).toEqual(st);
-    expect(LeaseStatus.encode(LeaseStatus.fromPartial({ processes: [{ id: 'p' }] })).finish()[0]).toBe(0x3a);
-    expect(LeaseStatus.encode(LeaseStatus.fromPartial({ stopped: [{ id: 'p' }] })).finish()[0]).toBe(0x42);
+    expect(
+      LeaseStatus.encode(LeaseStatus.fromPartial({ processes: [{ id: 'p' }] })).finish()[0],
+    ).toBe(0x3a);
+    expect(
+      LeaseStatus.encode(LeaseStatus.fromPartial({ stopped: [{ id: 'p' }] })).finish()[0],
+    ).toBe(0x42);
   });
 });
