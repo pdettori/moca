@@ -13,7 +13,17 @@ import {
   type HostStart,
   type HostView,
 } from './activation.js';
-import { isLive } from './sandbox-store.js';
+import { isEnrolledForSandbox } from './sandbox-config.js';
+import { isLive, type SandboxRecord } from './sandbox-store.js';
+import {
+  EGRESS_DROP_REPORT_MAX,
+  EGRESS_DROP_WINDOW_S,
+  EGRESS_GRACE_S,
+  EGRESS_POST_MAX,
+  egressLine,
+  parseEgressEvent,
+  type EgressGroup,
+} from './egress-log.js';
 
 /**
  * The template host agent's routes (template lifecycle spec §6.1): a KVM host's `sbx-host-agent`
@@ -37,6 +47,8 @@ import { isLive } from './sandbox-store.js';
  *                                            not attached yet (`starting`, for the start limit),
  *                                            and those kept in its idle grace (`graced`)
  *   POST /v1/hosts/{host}/workers/report     {buildId, event: attached | refused | detached, reason?}
+ *   POST /v1/hosts/{host}/egress             {events, cursor}: the egress proxy's audit events, as it
+ *                                            wrote them, into each sandbox's egress log
  *
  * Readiness itself is never taken from a report: `active` is the relay's attached record (§3.3).
  * The worker reports are provenance: who ran what, where, when.
@@ -44,6 +56,8 @@ import { isLive } from './sandbox-store.js';
 
 const MANIFEST_HASH_RE = /^sha256:[0-9a-f]{64}$/;
 const CLAIM_MAX = 4;
+/** The host agent's journal cursor, opaque here: printable ASCII, bounded. */
+const CURSOR_RE = /^[\x21-\x7e]{1,512}$/;
 
 /**
  * The spec a host agent hands template-build.sh for a claimed build. The API takes the guest's size as
@@ -64,6 +78,46 @@ export function buildJobSpec(
   // The template's own id and the create's image come last, so a spec key of the same name (which
   // the create does not refuse) can't rename the build or swap its image in the job.
   return { ...rest, ...(guest !== undefined ? { guest_ram_mb: guest } : {}), id, image };
+}
+
+/**
+ * The workers of the builds a host holds (its last inventory): whose sandboxes it may report. The
+ * inventory is the host's own claim, not checked against placement or the attaching host: hosts
+ * are trusted, so a host's events reach only its own sandboxes when its inventory is true, and a
+ * host that claims a build it does not run can write into that build's sandboxes' egress logs.
+ */
+async function hostWorkers(deps: CpDeps, host: string): Promise<Set<string>> {
+  const holds = deps.hosts?.get(host)?.holds ?? {};
+  const out = new Set<string>();
+  for (const d of (await deps.templates?.list()) ?? [])
+    for (const b of d.builds) if (b.worker && holds[b.buildId] !== undefined) out.add(b.worker);
+  return out;
+}
+
+const endOf = (r: SandboxRecord) => r.deletedAt ?? r.expiresAt;
+
+/**
+ * The sandboxes whose egress events this host may ship: every sandbox on a worker of
+ * a build this host holds (hostSandboxes), live or ended less than EGRESS_GRACE_S ago
+ * (egressAccepts). hostEgress accepts events for exactly these, and hostWanted hands their workspace
+ * keys to the agent (`egressSids`), which sends nothing else, so the events of the proxy's other
+ * clients (a Moca P6 session) never leave the host.
+ */
+async function hostSandboxes(deps: CpDeps, host: string, nowS: number): Promise<SandboxRecord[]> {
+  if (!deps.sandboxes || !deps.egress) return [];
+  const workers = await hostWorkers(deps, host);
+  if (!workers.size) return [];
+  return (await deps.sandboxes.listAll(nowS)).filter((r) => workers.has(r.worker));
+}
+
+/** Of a host's sandboxes, the ones whose events are taken now: live, or ended within the grace. */
+const egressAccepts = (rs: SandboxRecord[], nowS: number): SandboxRecord[] =>
+  rs.filter((r) => nowS < endOf(r) + EGRESS_GRACE_S);
+
+/** An event's time in epoch seconds; `fallback` when it does not parse. */
+function eventSeconds(e: Record<string, unknown>, fallback: number): number {
+  const t = typeof e.time === 'string' ? Date.parse(e.time) : NaN;
+  return Number.isFinite(t) ? Math.floor(t / 1000) : fallback;
 }
 
 export interface HostState {
@@ -106,6 +160,12 @@ export interface HostState {
 /** In-memory host state; the inventory is re-sent on every poll, so a restart loses nothing durable. */
 export class HostRegistry {
   private readonly hosts = new Map<string, HostState>();
+  /**
+   * buildId -> its worker, and until when (epoch s) a turn of a session pinned to it keeps that
+   * worker as a live sandbox does (busyWorkers): set by each turn's credential exchange
+   * (holdPinnedWorker). In memory, as the host state: a restart forgets it until the next turn.
+   */
+  private readonly sessionUse = new Map<string, { worker: string; until: number }>();
   set(id: string, st: HostState): void {
     this.hosts.set(id, st);
   }
@@ -114,6 +174,34 @@ export class HostRegistry {
   }
   all(): [string, HostState][] {
     return [...this.hosts.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
+  }
+  /**
+   * How long a pinned session's turn keeps its build's worker: the largest idle limit of the fresh
+   * hosts holding the build, 3600 s when none reports one, clamped to 60-86400 s (the same rule as a
+   * lease's default length, takeLease).
+   */
+  sessionHoldSeconds(buildId: string, nowS: number): number {
+    const idle = [...this.hosts.values()]
+      .filter((h) => nowS - h.at <= HOST_STALE_S && h.holds[buildId] !== undefined)
+      .map((h) => h.limits.idleLimitSeconds);
+    return Math.min(86_400, Math.max(60, Math.max(0, ...idle) || 3600));
+  }
+  /** The worker a pinned session's turn last kept for `buildId`, if that hold has not run out. */
+  sessionWorker(buildId: string, nowS: number): string | undefined {
+    const u = this.sessionUse.get(buildId);
+    return u && u.until > nowS ? u.worker : undefined;
+  }
+  markSessionUse(buildId: string, worker: string, until: number): void {
+    this.sessionUse.set(buildId, { worker, until });
+  }
+  /** The workers a pinned session's turn keeps now; the holds that ran out are dropped. */
+  sessionWorkers(nowS: number): string[] {
+    const out: string[] = [];
+    for (const [b, u] of this.sessionUse) {
+      if (u.until > nowS) out.push(u.worker);
+      else this.sessionUse.delete(b);
+    }
+    return out;
   }
 }
 
@@ -144,13 +232,52 @@ export function hostViewsOf(deps: CpDeps): HostView[] {
   }));
 }
 
-/** The workers with a live sandbox: never stopped under one, so they drain and keep their slot. */
+/**
+ * The workers with a live sandbox, or with a recent turn of a session pinned to their build
+ * (HostRegistry.sessionUse): never stopped under one, so they drain and keep their slot. A session
+ * keeps a worker that runs; it never starts one (only a lease does).
+ */
 export async function busyWorkers(deps: CpDeps, nowS: number): Promise<Set<string>> {
   const busy = new Set<string>();
   if (deps.sandboxes) {
     for (const r of await deps.sandboxes.listAll(nowS)) if (isLive(r, nowS)) busy.add(r.worker);
   }
+  for (const w of deps.hosts?.sessionWorkers(nowS) ?? []) busy.add(w);
   return busy;
+}
+
+/**
+ * A turn of a session pinned to a host-managed build (its credential exchange) keeps that build's
+ * worker for the hold (sessionHoldSeconds) from now, as a live sandbox keeps its worker, so the
+ * worker outlives the first-use lease while the session is in use. Only when the session's owner
+ * is enrolled for sandboxes (the rule first-use leases follow, combined spec §3.4): a turn of a
+ * subject who is not runs while the worker is up but extends nothing, so it cannot keep a build
+ * running after every lease on it has gone (deactivate, the host's capacity). Best effort: a
+ * failure is logged and never fails the turn. Reads the catalog only for the first turn of a hold.
+ */
+export async function holdPinnedWorker(
+  rec: { owner: string; sandboxBuildId?: string },
+  deps: CpDeps,
+): Promise<void> {
+  const build = rec.sandboxBuildId;
+  const hosts = deps.hosts;
+  if (!hosts || !deps.templates || !build?.startsWith('sha256:')) return;
+  try {
+    if (!isEnrolledForSandbox(rec.owner, deps.identity.rolesFor(rec.owner), deps.config)) return;
+    const nowS = seconds(deps);
+    let worker = hosts.sessionWorker(build, nowS);
+    if (worker === undefined) {
+      worker = (await deps.templates.list())
+        .flatMap((d) => d.builds)
+        .find((b) => b.buildId === build && b.status === 'registered')?.worker;
+    }
+    if (worker) hosts.markSessionUse(build, worker, nowS + hosts.sessionHoldSeconds(build, nowS));
+  } catch (err) {
+    console.error(
+      `[control-plane] holding the worker of build ${build} for a session turn failed: ` +
+        `${(err as Error)?.message ?? String(err)}`,
+    );
+  }
 }
 
 /** The hosts whose last inventory is at most HOST_STALE_S old, by id. */
@@ -350,18 +477,116 @@ function reportable(y: TemplateBuild, host: string): void {
 
 export const HOST_HANDLERS: Record<string, Handler> = {
   /**
+   * The egress proxy's audit events from this host's journal. An event is stored in
+   * a sandbox's log only when its `sid` is the workspace key (`wsk`) of a sandbox on a worker of a
+   * build this host holds, and the sandbox has not ended more than EGRESS_GRACE_S ago; every other
+   * event is refused and counted. An event naming such a sandbox that is not exactly a proxy Event
+   * is not stored, and counted as dropped in that sandbox's log, as is each `oversized` sid (an event
+   * the agent kept back for its size). An `audit_dropped` event (no VM)
+   * is charged to every sandbox on this host's workers live within EGRESS_DROP_WINDOW_S before it
+   * (egress-log.ts). Idempotent by (host, cursor): the agent's retry of a post repeats its cursor.
+   */
+  hostEgress: async (ctx, deps) => {
+    const host = hostOf(ctx);
+    const b = asRecord(ctx.body);
+    if (typeof b.cursor !== 'string' || !CURSOR_RE.test(b.cursor))
+      throw new CpError('invalid_request', 'cursor must be the journal cursor, printable ASCII');
+    const oversized = b.oversized ?? [];
+    if (
+      !Array.isArray(b.events) ||
+      !Array.isArray(oversized) ||
+      b.events.length + oversized.length > EGRESS_POST_MAX
+    )
+      throw new CpError(
+        'invalid_request',
+        `events and oversized must be arrays of at most ${EGRESS_POST_MAX} in all`,
+      );
+    const nowS = seconds(deps);
+    const retentionS = deps.config.sandbox?.retentionS ?? 0;
+    // Every sandbox of the host's workers for the drop rule; only egressAccepts' for events.
+    const mine = await hostSandboxes(deps, host, nowS);
+    const byWsk = new Map(egressAccepts(mine, nowS).map((r) => [r.wsk, r]));
+    const groups = new Map<string, EgressGroup>();
+    const group = (r: SandboxRecord) => {
+      let g = groups.get(r.id);
+      if (!g) {
+        g = {
+          sandboxId: r.id,
+          lines: [],
+          proxyDropped: 0,
+          invalid: 0,
+          expireAtS: endOf(r) + retentionS,
+        };
+        groups.set(r.id, g);
+      }
+      return g;
+    };
+    let refused = 0;
+    let dropped = 0;
+    for (const raw of b.events) {
+      const o = asRecord(raw);
+      if (raw === o && o.decision === 'audit_dropped' && !o.sid) {
+        const n = Math.min(nonNeg(o.dropped) ?? 0, EGRESS_DROP_REPORT_MAX);
+        const t = eventSeconds(o, nowS);
+        dropped += n;
+        for (const r of mine)
+          if (r.createdAt <= t && endOf(r) >= t - EGRESS_DROP_WINDOW_S) group(r).proxyDropped += n;
+        continue;
+      }
+      const r = typeof o.sid === 'string' ? byWsk.get(o.sid) : undefined;
+      if (!r) {
+        refused += 1;
+        continue;
+      }
+      const e = parseEgressEvent(raw);
+      const line = e && egressLine(e);
+      if (line) group(r).lines.push(line);
+      else group(r).invalid += 1;
+    }
+    // Events the agent did not send because they were too long (over 8 KiB): only their sid comes,
+    // and each is counted as dropped in its sandbox's log, as an event that is not an Event.
+    for (const sid of oversized) {
+      const r = typeof sid === 'string' ? byWsk.get(sid) : undefined;
+      if (!r) refused += 1;
+      else group(r).invalid += 1;
+    }
+    if (!deps.egress) {
+      return {
+        status: 200,
+        body: {
+          accepted: 0,
+          refused,
+          capped: 0,
+          overBudget: 0,
+          invalid: 0,
+          dropped,
+          cursor: b.cursor,
+        },
+      };
+    }
+    const answer = await deps.egress.append(host, b.cursor, [...groups.values()], refused, dropped);
+    return { status: 200, body: answer };
+  },
+
+  /**
    * The wanted state (§6.3, §6.5): `run`, the registered builds this host holds that are leased
    * and placed on it (the same placement activate judges by), in start order; `stop`, the ones it
    * holds with no live lease and no idle grace, or that it runs while placement keeps them on
    * another host; `starting`, those placed but not yet attached; and `graced`, those kept running
    * through their idle grace (see wantedAnswer). A worker is never stopped under a live sandbox: it
    * drains first, so a build with one is in no stop list.
+   * `egressSids`: the workspace keys of the sandboxes whose egress events the agent ships
+   * (hostSandboxes), and no others.
    */
   hostWanted: async (ctx, deps) => {
     const host = hostOf(ctx);
     const nowS = seconds(deps);
     const grace = (deps.hosts?.get(host)?.idleGraceSeconds ?? 0) > 0;
-    return wantedAnswer(deps, host, nowS, hostViewsOf(deps), grace);
+    const answer = await wantedAnswer(deps, host, nowS, hostViewsOf(deps), grace);
+    const egressSids = egressAccepts(await hostSandboxes(deps, host, nowS), nowS)
+      .map((r) => r.wsk)
+      .sort();
+    return { ...answer, body: { ...answer.body, egressSids } };
   },
 
   /**

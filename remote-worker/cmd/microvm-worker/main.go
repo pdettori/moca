@@ -953,7 +953,9 @@ func main() {
 	// advertises nothing rather than lying. HelloCapabilities adds the reserved
 	// sbx:lease-processes-v1 when this worker serves the process kinds (ruling P5-R37), so
 	// the relay never forwards one to a worker that cannot.
-	labels := session.TierLabels(os.LookupEnv, "microvm")
+	// moca.dev/build: the manifest hash verified above, so a session pinned to a build runs only here
+	// (combined control plane spec §3.4).
+	labels := session.WithBuild(session.Labels(os.LookupEnv, "microvm"), man.Hash)
 	sess := session.New(session.Config{
 		SandboxID:     env(get, "SANDBOX_ID", "sbx-microvm-1"),
 		Image:         env(get, "SANDBOX_IMAGE", ""),

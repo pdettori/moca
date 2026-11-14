@@ -3,7 +3,14 @@ import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { MAX_STDIN_BYTES, q, WORKSPACE, type SandboxModeName } from '@moca/sandbox-client';
-import { loadConfig, normalizeUrl, resolvePaths, type Paths, type TuiConfig } from '../config.js';
+import {
+  loadConfig,
+  normalizeUrl,
+  resolvePaths,
+  storedLoginUrl,
+  type Paths,
+  type TuiConfig,
+} from '../config.js';
 import { sanitizeRemote } from '../core/sanitize.js';
 import type { Io, LoginHelpers } from '../headless.js';
 import { buildRuntime, ensureRuntimeAuth, type Runtime } from '../runtime.js';
@@ -11,6 +18,7 @@ import { SandboxApiClient, type SbxSandboxCreate } from './api.js';
 import {
   cmdCreate,
   cmdEditTemplate,
+  cmdEgress,
   cmdEnv,
   cmdLogin,
   cmdLogout,
@@ -178,6 +186,13 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
                                                  print a fresh sandbox token (15 minutes by default);
                                                  --renew-every: a new line every S seconds until stopped
   mocactl sbx env [ID]                           shell exports for a direct sandbox/v1 client
+  mocactl sbx egress [ID] [--json | --ndjson | --verify]
+                                                 what the sandbox reached through its host's egress
+                                                 proxy: per host, and whether the log is complete;
+                                                 --ndjson prints the log whose sha256 its end record names;
+                                                 --verify checks the log served against the control
+                                                 plane's summary of it (sha256 and count; once the log
+                                                 is sealed, 10 minutes after the end, it is final)
   mocactl sbx run [--sandbox ID] [--timeout S] [-- CMD ...]   run CMD (or the script on stdin) in /workspace
                                                  (CMD's words are quoted, so they run exactly as typed:
                                                  for pipes, $VARS or globs use stdin or -- sh -c '...';
@@ -242,8 +257,8 @@ export const SBX_USAGE = `usage (the sandbox service, SBX0):
 --record F (every command that calls the API but token, login, logout and credentials): one
 NDJSON line per HTTP attempt appended to F (0600), with no token, host or free text in it.
 ID (or --sandbox ID) defaults to the sandbox in the nearest .sbx/sandbox.json. The control plane
-comes from --control-plane-url, MOCACTL_SBX_URL, the bound sandbox's, or the one remembered at
-login. The login is kept apart from \`mocactl login\`'s, so both can be active at once.
+comes from --control-plane-url, MOCACTL_SBX_URL, the bound sandbox's, the one remembered at
+login, or the login's own (a login minted by an operator). The login is kept apart from \`mocactl login\`'s, so both can be active at once.
 exit: 0 ok, 1 failed, 2 usage, 3 log in first, 4 control plane unreachable, 5 a wait timed out,
 130 interrupted (Ctrl-C)`;
 
@@ -287,8 +302,19 @@ export function resolveSbxUrl(
   flag: string | undefined,
   env: NodeJS.ProcessEnv,
   config: TuiConfig,
+  login?: string,
 ): string | undefined {
-  return normalizeUrl(flag || env.MOCACTL_SBX_URL || config.sbxControlPlaneUrl);
+  return normalizeUrl(flag || env.MOCACTL_SBX_URL || config.sbxControlPlaneUrl || login);
+}
+
+/**
+ * The control plane the sandbox-service login itself names (`sbx-auth.json`'s `controlPlaneUrl`):
+ * the last fallback, for a login file present without `sbx login`'s config.json entry (one copied
+ * from another machine, say), since `sbx login` also remembers its URL in config.json.
+ */
+export function loginControlPlaneUrl(env: NodeJS.ProcessEnv, home: string): string | undefined {
+  const u = storedLoginUrl(sbxPaths(resolvePaths(env, home)).authFile);
+  return u && /^https?:\/\//.test(u) ? u : undefined;
 }
 
 /** Where resolveSbxUrl's answer came from, by the same precedence (and the same `||`). */
@@ -296,10 +322,12 @@ export function sbxUrlSource(
   flag: string | undefined,
   env: NodeJS.ProcessEnv,
   config: TuiConfig,
-): 'flag' | 'env' | 'config' | undefined {
+  login?: string,
+): 'flag' | 'env' | 'config' | 'login' | undefined {
   if (flag) return 'flag';
   if (env.MOCACTL_SBX_URL) return 'env';
-  return config.sbxControlPlaneUrl ? 'config' : undefined;
+  if (config.sbxControlPlaneUrl) return 'config';
+  return login ? 'login' : undefined;
 }
 
 /**
@@ -356,13 +384,14 @@ export async function openSbx(
   } = {},
 ): Promise<{ rt: Runtime; api: SandboxApiClient; url: string; explicitUrl?: string } | number> {
   const remembered = loadConfig(resolvePaths(env, deps.home ?? homedir())).config;
-  const url = resolveSbxUrl(flags.controlPlaneUrl, env, remembered);
+  const fromLogin = loginControlPlaneUrl(env, deps.home ?? homedir());
+  const url = resolveSbxUrl(flags.controlPlaneUrl, env, remembered, fromLogin);
   if (!url) {
     io.err('sbx: no sandbox control plane: pass --control-plane-url URL, or set MOCACTL_SBX_URL');
     return SBX_EXIT.usage;
   }
-  const explicitUrl =
-    sbxUrlSource(flags.controlPlaneUrl, env, remembered) === 'config' ? undefined : url;
+  const source = sbxUrlSource(flags.controlPlaneUrl, env, remembered, fromLogin);
+  const explicitUrl = source === 'config' || source === 'login' ? undefined : url;
   const opened = {
     ...openSbxRuntime(url, env, deps),
     url,
@@ -436,7 +465,7 @@ const TEMPLATE_ONE_ID = ['build', 'show', 'follow', 'cancel', 'edit', 'activate'
 const TAKES_BUILD = ['show', 'follow', 'cancel', 'tag', 'activate'];
 const TAKES_TIMEOUT = ['follow', 'create', 'build', 'activate'];
 /** The commands that act on one sandbox: `[ID]` as an argument (or `--sandbox ID`). */
-const TAKES_ID_ARG = new Set(['rm', 'token', 'env', 'get', 'reset']);
+const TAKES_ID_ARG = new Set(['rm', 'token', 'env', 'get', 'reset', 'egress']);
 /** The commands that act on one sandbox through `--sandbox ID` only. */
 const TAKES_SANDBOX_FLAG = new Set([
   'run',
@@ -574,6 +603,8 @@ async function sbxMainWith(
         label: { type: 'string', multiple: true },
         all: { type: 'boolean' },
         json: { type: 'boolean' },
+        ndjson: { type: 'boolean' },
+        verify: { type: 'boolean' },
         sandbox: { type: 'string' },
         timeout: { type: 'string' },
         lease: { type: 'string' },
@@ -639,6 +670,7 @@ async function sbxMainWith(
     'pull',
     'doctor',
     'credentials',
+    'egress',
     'quota',
     'policy',
     'get',
@@ -658,6 +690,18 @@ async function sbxMainWith(
   }
   if (values.sandbox !== undefined && !TAKES_SANDBOX_FLAG.has(command)) {
     io.err(`sbx: --sandbox does not apply to ${command}\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if ((values.ndjson || values.verify) && command !== 'egress') {
+    io.err(`sbx: --ndjson and --verify only apply to egress\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if (values.ndjson && values.json) {
+    io.err(`sbx: egress takes --json or --ndjson, not both\n${SBX_USAGE}`);
+    return SBX_EXIT.usage;
+  }
+  if (values.verify && values.ndjson) {
+    io.err(`sbx: egress takes --ndjson or --verify, not both\n${SBX_USAGE}`);
     return SBX_EXIT.usage;
   }
   // `templates SUB`: the template subcommand, for the flags that apply to some of them only.
@@ -834,8 +878,8 @@ async function sbxMainWith(
     }
     maxPush = n * 2 ** 20;
   }
-  // `run` takes everything after the command (after `--`) as CMD; `put` exactly one PATH; rm, token
-  // and env at most one ID; every other command no argument at all.
+  // `run` takes everything after the command (after `--`) as CMD; `put` exactly one PATH; rm, token,
+  // env and egress at most one ID; every other command no argument at all.
   const argsOk =
     // run quotes its CMD; claude and codex forward their own flags and prompt to the child.
     command === 'run' ||
@@ -1210,6 +1254,8 @@ async function sbxMainWith(
       return cmdDoctor(ctx, root, id, deps.execFactory, deps.claudeVersion, deps.agentop);
     case 'token':
       return cmdToken(ctx, id!, renewEvery);
+    case 'egress':
+      return cmdEgress(ctx, id!, values.ndjson === true, values.verify === true);
     case 'run':
       return cmdRun(ctx, id!, script!, timeout, deps.execFactory, runRetry(env, deps, ctx));
     case 'put':

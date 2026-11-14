@@ -4,6 +4,7 @@ import {
   auditBestEffort,
   isAdmin,
   requireEnrolledPrincipal,
+  requireReader,
   seconds,
 } from './handler-util.js';
 import type { CpDeps, Handler, RequestCtx } from './handlers.js';
@@ -15,7 +16,7 @@ import {
   type ProvenanceStore,
 } from './provenance.js';
 import { MEMBER_SUBJECT_FORMS, MEMBER_SUBJECT_RE } from './identity.js';
-import { isEnrolled, MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
+import { isEnrolledForSandbox, MIN_IDLE_TIMEOUT_S, type SandboxConfig } from './sandbox-config.js';
 import {
   hostManaged,
   lastLeaseEnd,
@@ -61,6 +62,13 @@ import {
   type SandboxView,
 } from './sandbox-store.js';
 import { mintSandboxToken, mintSetModeToken } from './sandbox-token.js';
+import {
+  allLines,
+  EGRESS_GRACE_S,
+  ENTRY_ID_RE,
+  summarize,
+  type EgressStore,
+} from './egress-log.js';
 import type { TokenClaims } from './token.js';
 
 /**
@@ -348,8 +356,86 @@ async function sandboxEnded(
       reason,
       expiresAt: rec.expiresAt,
       ...(reason === 'deleted' ? { endedAt: nowS } : {}),
+      ...(deps.egress ? { egress: await egressDigest(deps.egress, rec.id) } : {}),
     },
   });
+}
+
+/**
+ * What a `sandbox` record names of the egress log: its digest, and its completeness
+ * with the reasons (`droppedBy`: proxy, cap, budget, invalid).
+ */
+async function egressDigest(store: EgressStore, id: string) {
+  const s = await summarize(store, id);
+  return {
+    events: s.total,
+    sha256: s.sha256,
+    dropped: s.dropped,
+    droppedBy: s.droppedBy,
+    complete: s.complete,
+  };
+}
+
+/** The egress log's NDJSON export, a store page at a time: each line and its `\n`. */
+async function* ndjson(store: EgressStore, id: string): AsyncGenerator<string> {
+  let chunk = '';
+  let n = 0;
+  for await (const line of allLines(store, id)) {
+    chunk += `${line}\n`;
+    if (++n % EGRESS_STREAM_LINES === 0) {
+      yield chunk;
+      chunk = '';
+    }
+  }
+  if (chunk) yield chunk;
+}
+const EGRESS_STREAM_LINES = 1000;
+
+/**
+ * Seals each ended sandbox's egress log once its grace has passed (egress-log.ts EGRESS_GRACE_S),
+ * in the janitor's sweep after recordExpiries. A log that changed after its end record named it
+ * (events that arrived in the grace) gets one more `sandbox` record, `state: 'egress'`, naming the
+ * final log: the newest `sandbox` record of a sandbox that carries `egress` is its log's digest.
+ *
+ * The seal comes last, after the record is written: a sweep that fails before it (the chain, the
+ * digest or the append) leaves the log unsealed, so the next sweep does the work again. Past the
+ * grace the host post takes no events for the sandbox, so the log no longer changes, and the
+ * compare with the chain's newest record keeps a repeated sweep from writing a second record.
+ */
+async function sealEgress(deps: CpDeps, recs: SandboxRecord[], nowS: number): Promise<void> {
+  const store = deps.egress;
+  const retentionS = deps.config.sandbox?.retentionS ?? 0;
+  if (!store) return;
+  const due = recs.filter(
+    (r) => !isLive(r, nowS) && nowS >= (r.deletedAt ?? r.expiresAt) + EGRESS_GRACE_S,
+  );
+  const chains = new Map<string, Awaited<ReturnType<ProvenanceStore['chain']>>>();
+  for (const r of due) {
+    if ((await store.meta(r.id)).sealed) continue;
+    if (deps.provenance) {
+      const stream = `template/${r.template}`;
+      if (!chains.has(stream)) chains.set(stream, await deps.provenance.chain(stream));
+      const named = chains
+        .get(stream)!
+        .filter(
+          (x) =>
+            x.kind === 'sandbox' &&
+            (x.body as { sandboxId?: string }).sandboxId === r.id &&
+            (x.body as { egress?: unknown }).egress !== undefined,
+        )
+        .pop()?.body.egress as { sha256?: string; dropped?: number } | undefined;
+      const now = await egressDigest(store, r.id);
+      if (!named || named.sha256 !== now.sha256 || named.dropped !== now.dropped) {
+        await deps.provenance.append({
+          stream,
+          kind: 'sandbox',
+          subject: 'janitor',
+          body: { sandboxId: r.id, buildId: r.buildId ?? null, state: 'egress', egress: now },
+        });
+      }
+    }
+    await store.seal(r.id, (r.deletedAt ?? r.expiresAt) + retentionS);
+  }
 }
 
 /**
@@ -480,7 +566,7 @@ async function readinessFacts(deps: CpDeps, docs?: TemplateDoc[]): Promise<Readi
     }
   }
   const queue = placement && attached ? startQueue(list, hosts, placement, attached, nowS) : null;
-  if (deps.config.routeProfile !== 'sandbox' || !deps.sandboxes) {
+  if ((deps.config.routeProfile ?? 'harness') === 'harness' || !deps.sandboxes) {
     return { attached, inUse: null, lastUsed: null, placement, queue, hosts, nowS, trusted };
   }
   const inUse = new Map<string, number>();
@@ -581,7 +667,7 @@ function templateBody(d: TemplateDoc, f: ReadinessFacts, full: boolean) {
  * or build, one the caller cannot see, or a build not registered is `400 unknown_template`, as an
  * unknown id always was. Whether the build is active is requireActive's question (§6.4).
  */
-async function resolveForUse(
+export async function resolveForUse(
   deps: CpDeps,
   p: TokenClaims,
   ref: string,
@@ -1467,12 +1553,18 @@ export const FIRST_USE_RETRY_S = 30;
  * host down), readiness is the worker's presence alone: an attached worker serves, and an absent one is refused rather
  * than left to wait at the relay. A build imported from SH_SANDBOX_TEMPLATES (no snapshot, so no
  * host ever holds it) is never gated: the deployment runs its worker.
+ *
+ * `mayActivate` false (a session's create by a subject not enrolled for sandboxes, combined spec
+ * §3.4) never takes a lease: activation is enrolled-only, as on the activate route. Such a caller
+ * waits (409) on a build another subject's lease is starting, and is refused (403 not_enrolled) one
+ * nobody is starting, which only an enrolled subject can.
  */
-async function requireActive(
+export async function requireActive(
   deps: CpDeps,
   p: TokenClaims,
   t: { doc: TemplateDoc; build: TemplateBuild },
   activate: boolean,
+  mayActivate = true,
 ): Promise<void> {
   if (hostViewsOf(deps).length === 0 && !deps.config.templateHosts?.length) return;
   // A build imported from SH_SANDBOX_TEMPLATES is the deployment's to run, never a host's: no gate,
@@ -1486,8 +1578,18 @@ async function requireActive(
   // A caller that already holds a live lease on the build (a retry of its own first use, say) is
   // only told to wait: no renewal and no new `activate` record on every retry.
   const leased = liveLeases(t.build, facts.nowS).some((l) => l.subject === p.sub);
+  if (activate && !mayActivate && !leased && readiness !== 'activating') {
+    throw new CpError(
+      'not_enrolled',
+      `template '${t.doc.id}' is ${readiness}, and this account (${p.sub}) is not enrolled in the ` +
+        'sandbox service, so it cannot activate it: an enrolled user must activate it first',
+      undefined,
+      { readiness },
+    );
+  }
   if (
     activate &&
+    mayActivate &&
     !leased &&
     (readiness === 'inactive' || readiness === 'deactivating' || readiness === 'activating')
   ) {
@@ -1785,7 +1887,7 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
   if (typeof owner !== 'string' || !MEMBER_SUBJECT_RE.test(owner))
     throw new CpError('invalid_request', `owner must be a subject, ${MEMBER_SUBJECT_FORMS}`);
   // The new owner must be able to act on it: enrolled now (the allow list, or an admin).
-  if (!isEnrolled(owner, deps.identity.rolesFor(owner), deps.config))
+  if (!isEnrolledForSandbox(owner, deps.identity.rolesFor(owner), deps.config))
     throw new CpError(
       'invalid_request',
       `${owner} is not enrolled: add them to SH_ALLOWED_SUBJECTS first`,
@@ -1820,11 +1922,11 @@ async function transferTemplateOwner(ctx: RequestCtx, deps: CpDeps) {
 }
 
 export const SANDBOX_HANDLERS: Record<string, Handler> = {
-  // The template reads (template lifecycle spec §4), on both route profiles (§4.1): on `harness`
-  // requireEnrolled admits any logged-in subject. The worker id is deployment plumbing; a client
-  // names a template, never a worker.
+  // The template reads (template lifecycle spec §4), on every route profile (§4.1): on `harness`
+  // and `combined` requireReader admits any logged-in subject. The worker id is deployment
+  // plumbing; a client names a template, never a worker.
   listTemplates: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const docs = await visibleTemplates(deps, p);
     const live = await readinessFacts(deps);
     const templates = docs.map((d) => templateBody(d, live, false));
@@ -1834,7 +1936,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   listTemplateTags: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const tags = Object.entries(d.tags)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1846,20 +1948,20 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   getTemplate: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     return { status: 200, body: templateBody(d, await readinessFacts(deps), true) };
   },
 
   listTemplateBuilds: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const live = await readinessFacts(deps);
     return { status: 200, body: { builds: d.builds.map((b) => buildBody(d, b, live, true)) } };
   },
 
   getTemplateBuild: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const d = await visibleTemplate(deps, p, ctx.params.id ?? '');
     const ref = ctx.params.build ?? '';
     const b = d.builds.find((x) => x.buildId === ref || x.handle === ref);
@@ -1885,7 +1987,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   // The policy (§8): any enrolled client reads it; only an admin sets it, and each set is a
   // `policy` record naming who.
   getPolicy: async (ctx, deps) => {
-    requireEnrolled(ctx, deps);
+    requireReader(ctx, deps.config);
     const { policy, record } = await policyStore(deps).current();
     // The general-gate schema rides along, so a client's dry run applies X1.offline as this
     // deployment does.
@@ -1936,7 +2038,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
   },
 
   getQuota: async (ctx, deps) => {
-    const p = requireEnrolled(ctx, deps);
+    const p = requireReader(ctx, deps.config);
     const { cat, policy } = writable(deps);
     const { policy: pol } = await policy.current();
     const u = await usage(cat, p.sub);
@@ -2059,6 +2161,8 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     if (outcome === 'not_found') throw new CpError('sandbox_not_found', 'no such sandbox');
     if (outcome === 'deleted') {
       await audit(deps, ctx.principal!.sub, rec.id, 'sandbox_deleted');
+      // The egress log is kept as long as the record, whose retention now runs from the delete.
+      await deps.egress?.expireAt(rec.id, now + cfg.retentionS);
       await sandboxEnded(deps, rec, ctx.principal!.sub, 'deleted', now);
     }
     // Idempotent: a second delete, or a delete after expiry, reports how it actually ended.
@@ -2066,6 +2170,46 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
     return {
       status: 200,
       body: { id: rec.id, state: 'terminated', reason: ended.reason ?? 'deleted' },
+    };
+  },
+
+  /**
+   * A sandbox's egress log, for whoever may read the sandbox (GET /v1/sandboxes/{id}):
+   * `{events, next, summary}` a page at a time (`after` is the last page's `next`; `summary` on the
+   * first page, null after it), or with
+   * `format=ndjson` the whole log, whose sha256 is `summary.sha256` and the end record's.
+   */
+  getSandboxEgress: async (ctx, deps) => {
+    const rec = await assertSandboxOwner(ctx, deps, { admin: true });
+    if (!deps.egress) throw new CpError('internal_error', 'the egress log is not configured');
+    const format = ctx.query.get('format');
+    if (format !== null && format !== 'json' && format !== 'ndjson')
+      throw new CpError('invalid_request', "format must be 'json' or 'ndjson'");
+    if (format === 'ndjson') {
+      // Streamed a store page at a time (server.ts writeStream), never built whole in memory.
+      return {
+        status: 200,
+        body: ndjson(deps.egress, rec.id),
+        contentType: 'application/x-ndjson',
+      };
+    }
+    const after = ctx.query.get('after');
+    if (after !== null && !ENTRY_ID_RE.test(after))
+      throw new CpError('invalid_request', "after must be a page's next");
+    const rawLimit = ctx.query.get('limit');
+    const limit = rawLimit === null ? 100 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+      throw new CpError('invalid_request', 'limit must be 1-1000');
+    const page = await deps.egress.page(rec.id, after, limit);
+    return {
+      status: 200,
+      body: {
+        events: page.map((e) => JSON.parse(e.line) as unknown),
+        next: page.length === limit ? page[page.length - 1]!.id : null,
+        // On the first page only: the summary reads the whole log, so a page after it (`after`)
+        // costs that page alone, and paging a log through is linear in its length.
+        summary: after === null ? await summarize(deps.egress, rec.id) : null,
+      },
     };
   },
 
@@ -2170,6 +2314,7 @@ export const SANDBOX_HANDLERS: Record<string, Handler> = {
       else terminated.push({ wsk: v.wsk, wrk: v.worker, terminatedAt: v.terminatedAt! });
     }
     await recordExpiries(deps, all, now);
+    await sealEgress(deps, all, now);
     return { status: 200, body: { live, terminated } };
   },
 };
