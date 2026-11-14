@@ -1688,6 +1688,8 @@ exit 0`, epoch)
 	t.Run("oom_keeps_the_lease", func(t *testing.T) {
 		const key = "lease-proc-oom"
 		v := lease(t, key)
+		// The earlier parts' resets are counted too; only this part's ends matter.
+		endsBefore := leaseEndTotal(g.p.Stats())
 		hog := g.startTracked(t, key, "hog", `exec python3 -c 'b = []
 while True: b.append(b"x" * (16 << 20))'`, epoch)
 		if tp := waitExited(t, key, hog.ID, 60*time.Second); tp.stateText() != "killed(9)" {
@@ -1698,8 +1700,9 @@ while True: b.append(b"x" * (16 << 20))'`, epoch)
 		if tp := row(t, key, after.ID); !tp.running() {
 			t.Fatalf("a start after the OOM: row %+v, want running", tp)
 		}
-		if s := g.p.Stats(); leaseEndTotal(s) != 0 {
-			t.Fatalf("LeaseEnds = %v, want none: a tracked OOM ends the process, not the lease", s.LeaseEnds)
+		if s := g.p.Stats(); leaseEndTotal(s) != endsBefore {
+			t.Fatalf("LeaseEnds = %v (%d before the OOM), want no new end: a tracked OOM ends the process, not the lease",
+				s.LeaseEnds, endsBefore)
 		}
 	})
 }
