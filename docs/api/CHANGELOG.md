@@ -3,6 +3,57 @@
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
+## 1.19.0
+
+The host agent removes a retired build's worker and snapshot
+([#743](https://github.com/rossoctl/moca/issues/743)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §6.1 step 7.
+Every change is additive.
+
+- GET /v1/hosts/{host}/wanted gains `remove`: the retired builds the host holds with no live sandbox
+  and no pinned session's hold on their worker, each also in `stop`; while a sandbox that ended on
+  the worker is still in `egressSids` (less than 600 s ago), it is in `stop` only, so its last
+  egress events are still taken. The agent stops a running worker, then uninstalls it
+  (`install-host.sh --uninstall --keep-shared`: its own files only), deletes the snapshot and its template record, and reports it. A
+  worker with a live sandbox is in no list, nor is a retired build whose build id or worker a build
+  that is not retired shares (in any template): its snapshot or worker is still needed.
+- POST /v1/hosts/{host}/workers/report takes `removed` for a retired build the host holds: a `retire`
+  record by `host:<id>` with `event: removed` and `buildRecord` (the digest of the build's `build`
+  record). The host no longer holds the build, so TemplateBuild's `heldBy` drops it at once, before
+  the host's next inventory. A `removed` for a build the wanted state leaves out because a build not
+  retired shares it is refused `409 build_in_use`.
+
+## 1.18.0
+
+Retire a template, or one build of it ([#749](https://github.com/rossoctl/moca/issues/749)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §5.1. Every
+change is additive; the routes mount on both route profiles and need `SH_PROVENANCE_DIR` (else
+`400 invalid_request`).
+
+- New POST /v1/templates/{id}/retire `{reason?}` (the owner, or an admin): every build not yet
+  retired becomes `retired`, its activation leases go, and each writes a `retire` record naming the
+  caller, `from` (the status before), `buildRecord` (the digest of the build's `build` record, null
+  for one never built) and the reason; earlier records stay. Answers
+  `{templateId, subject, status, builds}`, each build a new `RetiredBuild`
+  `{build, buildId, readiness, record}`. Idempotent: an already retired build is listed with
+  `record: null` and no second record. Not reversible: a new build is the way back, and the id
+  stays its owner's.
+- New DELETE /v1/templates/{id}/builds/{build}: retires one build, by build id or handle, answering
+  one `RetiredBuild` with `templateId`, `subject` and `status`.
+- New codes: `409 build_in_use`, a retire refused while a live sandbox runs on the build;
+  `410 template_retired`, a sandbox create or an activation naming a retired build, a tag of one, or
+  a template whose every build is retired (was `400 unknown_template` or `409 template_unavailable`).
+- Readiness gains `retired` (Template, TemplateBuild). TemplateBuild gains `heldBy`, the hosts whose
+  last inventory holds its snapshot, a host gone silent too (null without host agents). A retired build whose worker still
+  holds a presence record reports `capacity` `{running, inUse}`, as an active one does (null once
+  its worker is stopped; `running: null` when presence cannot be read). TemplateBuild gains
+  `shared`, true for a retired build whose snapshot or worker a build that is not retired also
+  uses: its worker is kept for that build, and its `capacity` is null.
+- GET /v1/hosts/{host}/wanted: `stop` also lists the retired builds the host holds with no live
+  sandbox, except a `shared` one; and one worker id is never in both `run` and `stop` (two
+  registered builds from one image share it); POST /v1/hosts/{host}/workers/report takes `detached` for a retired build. Removing a
+  retired build's worker and snapshot from its host is not part of this version.
+
 ## 1.17.0
 
 A session's seed from its build, its workspace's patch, its records, and its queued turns on its
