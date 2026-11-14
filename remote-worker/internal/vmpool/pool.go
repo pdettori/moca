@@ -56,7 +56,7 @@ const (
 	ExecKindProcessStop  ExecKind = ga.RequestKindProcessStop
 
 	// execKindProcessStopAll is host-only: the pool sends it when a lease leaves level 2
-	// (stopTrackedLocked), and no Exec carries it. Not a process kind (isProcess).
+	// (stopTrackedUnderGate), and no Exec carries it. Not a process kind (isProcess).
 	execKindProcessStopAll ExecKind = ga.RequestKindProcessStopAll
 )
 

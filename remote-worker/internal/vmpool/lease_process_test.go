@@ -818,7 +818,83 @@ func TestDowngradeStopAllTeardownFailedEndsLease(t *testing.T) {
 // expiring, that event is never acknowledged nor stored as the pending one (P5-R19): the
 // pending start rides beside it and is acknowledged as before, and the next Exec carries
 // no processes_stopped and sends no second stop-all.
+//
+// Subtests (review minors 2-3): a stop-all that fails on the Exec path ends the lease
+// teardown_failed, and the Exec runs in a fresh lease, its response carrying that end and
+// no processes_stopped; with nothing running, the stop-all is still sent and the response
+// carries no processes_stopped.
 func TestExecRelevelStopsTrackedAndNotifies(t *testing.T) {
+	t.Run("stops and notifies", testExecRelevelStopsAndNotifies)
+	t.Run("a failing stop-all ends the lease and the Exec runs in a fresh one", testExecRelevelStopAllFails)
+	t.Run("nothing running: no notice", testExecRelevelNothingRunning)
+}
+
+func testExecRelevelStopAllFails(t *testing.T) {
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	lc.setRunFn(func(_ *fakeVM, c Command, _ Sink) (Result, error) {
+		if c.Kind == execKindProcessStopAll {
+			res := Result{TeardownFailed: true, Tracked: tab.get()} // web still running
+			tab.set()                                               // the next guest is a fresh one
+			return res, nil
+		}
+		return Result{Tracked: tab.get()}, nil
+	})
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	tab.set(running("1", "web", 412, clk.Now()))
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+	vm := vmID(leaseAlive(t, p, "after the start").vm)
+
+	sink := newLeaseSink()
+	if _, err := (Runner{Pool: p}).Run(t.Context(), leaseSpec(1, 2), sink); err != nil {
+		t.Fatalf("Run: %v, want the Exec to run in a fresh lease", err)
+	}
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, execKindProcessStopAll, ExecKindCommand}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q", got, want)
+	}
+	l := leaseAlive(t, p, "after the Exec")
+	if got := vmID(l.vm); got == vm || lc.count("restore ") != 2 || l.mode != ModeLease {
+		t.Fatalf("lease = %s at %s (restores %d), want a fresh lease at lease, not %s", got, l.mode, lc.count("restore "), vm)
+	}
+	evs := sink.got()
+	if len(evs) != 1 || evs[0].GetState() != leaseEventEnd || evs[0].GetReason() != string(LeaseEndTeardownFailed) {
+		t.Fatalf("events = %v, want only the teardown_failed end", evs)
+	}
+	if want := []string{"web (pid 412)"}; !slices.Equal(evs[0].GetProcesses(), want) {
+		t.Fatalf("end processes = %q, want %q", evs[0].GetProcesses(), want)
+	}
+	if st := p.Stats(); st.LeaseEnds[LeaseEndTeardownFailed] != 1 || leaseEndTotal(st) != 1 {
+		t.Fatalf("LeaseEnds = %v, want exactly one teardown_failed", st.LeaseEnds)
+	}
+}
+
+func testExecRelevelNothingRunning(t *testing.T) {
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	stopAllGuest(lc, tab)
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	tab.set(TrackedProcess{ID: "1", Name: "build", PID: 414, State: "exited", Started: clk.Now()})
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "build"}, 1))
+	vm := vmID(leaseAlive(t, p, "after the start").vm)
+
+	sink := newLeaseSink()
+	if _, err := (Runner{Pool: p}).Run(t.Context(), leaseSpec(1, 2), sink); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, execKindProcessStopAll, ExecKindCommand}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q: the stop-all is sent with nothing running", got, want)
+	}
+	for _, ev := range sink.got() {
+		if ev.GetState() == leaseEventProcessesStopped {
+			t.Fatalf("events carry %+v, want no processes_stopped: nothing was stopped", ev)
+		}
+	}
+	if got := vmID(leaseAlive(t, p, "after the relevel").vm); got != vm {
+		t.Fatalf("lease VM = %s, want %s kept", got, vm)
+	}
+}
+
+func testExecRelevelStopsAndNotifies(t *testing.T) {
 	logs := captureLog(t)
 	p, lc, clk := processPool(t)
 	tab := &fakeTable{}
@@ -993,5 +1069,142 @@ func TestDowngradeStopsALeaseStartedAtLevel2WhileItWaited(t *testing.T) {
 	}
 	if s := loadLeaseState(p.cfg.WorkspaceRoot, "k"); s.Open == nil || s.Open.Mode != ModeLease {
 		t.Fatalf("state file open lease = %+v, want it recorded at lease", s.Open)
+	}
+}
+
+// Review Important 1: the set_mode wait cuts the lease at the grace limit only while the
+// stop is still owed. Here a lease Exec at the downgrade's epoch, queued before the
+// set_mode, gets the gate first and does the stop (P5-R21), then runs past the grace
+// limit: the wait returns at the grace point without cutting, the Exec's result is its
+// own, and the lease is kept.
+func TestDowngradeGraceDoesNotCutAfterAnExecStopped(t *testing.T) {
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	enteredA, releaseA := make(chan struct{}, 1), make(chan struct{})
+	enteredB, releaseB := make(chan struct{}, 1), make(chan struct{})
+	lc.setRunFn(func(_ *fakeVM, c Command, out Sink) (Result, error) {
+		var entered, release chan struct{}
+		switch {
+		case c.Kind == execKindProcessStopAll:
+			answerStopAll(tab, out)
+		case c.Command == "a":
+			entered, release = enteredA, releaseA
+		case c.Command == "b":
+			entered, release = enteredB, releaseB
+		}
+		if entered != nil {
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-c.ctxDone:
+				return Result{}, ErrAborted
+			}
+		}
+		return Result{Tracked: tab.get()}, nil
+	})
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	tab.set(running("1", "web", 412, clk.Now()))
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+	vm := vmID(leaseAlive(t, p, "after the start").vm)
+
+	errA := execAsync(p, "k", Exec{Command: "a", TimeoutS: MaxExecTimeoutS, Mode: ModeLeaseProcesses, ModeEpoch: 1})
+	recvWithin(t, enteredA, "A's Run")
+	errB := execAsync(p, "k", Exec{Command: "b", TimeoutS: MaxExecTimeoutS, Mode: ModeLease, ModeEpoch: 2})
+	waitFor(t, func() bool { return pinnedCount(p, "k") == 2 }) // B queued on the gate
+	type setResult struct {
+		stopped []TrackedProcess
+		err     error
+	}
+	setc := make(chan setResult, 1)
+	deadline := clk.Now().Add(p.cfg.LeaseGraceLimit)
+	go func() {
+		stopped, err := p.SetMode("k", ModeLease, 2)
+		setc <- setResult{stopped, err}
+	}()
+	waitFor(t, func() bool { return pinnedCount(p, "k") == 3 && timerArmed(clk, deadline) })
+
+	close(releaseA)
+	if err := recvWithin(t, errA, "A"); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	recvWithin(t, enteredB, "B's Run")
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, ExecKindCommand, execKindProcessStopAll, ExecKindCommand}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q: B did the stop", got, want)
+	}
+
+	clk.Advance(p.cfg.LeaseGraceLimit)
+	res := recvWithin(t, setc, "SetMode at the grace limit")
+	if res.err != nil || len(res.stopped) != 0 {
+		t.Fatalf("SetMode = %+v, %v; want (nil, nil): the stop was B's", res.stopped, res.err)
+	}
+	if c := leaseCut(p, leaseAlive(t, p, "at the grace limit")); c != "" {
+		t.Fatalf("lease cut %q at the grace limit, want no cut: nothing was owed", c)
+	}
+	close(releaseB)
+	if err := recvWithin(t, errB, "B"); err != nil {
+		t.Fatalf("B: %v, want its own clean result", err)
+	}
+	if got := vmID(leaseAlive(t, p, "after B").vm); got != vm {
+		t.Fatalf("lease VM = %s, want %s kept", got, vm)
+	}
+	if ev := p.LeaseStatus("k").Pending; ev != nil && ev.State == leaseEventEnd {
+		t.Fatalf("pending = %+v, want no end", ev)
+	}
+	if n := pinnedCount(p, "k"); n != 0 {
+		t.Fatalf("pins at the end = %d, want 0", n)
+	}
+}
+
+// The stop the set_mode owes is bounded by the grace limit, as a downgrade to per-exec's
+// end is: a level-2 Exec still in flight then is cut, the lease ends mode_change (which
+// stops everything with it), no process_stop_all is sent, and SetMode returns (nil, nil).
+func TestDowngradeStopIsBoundedByTheGraceLimit(t *testing.T) {
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	entered := make(chan struct{}, 1)
+	lc.setRunFn(func(_ *fakeVM, c Command, out Sink) (Result, error) {
+		switch {
+		case c.Kind == execKindProcessStopAll:
+			answerStopAll(tab, out)
+		case c.Command == "long":
+			entered <- struct{}{}
+			<-c.ctxDone
+			return Result{}, ErrAborted
+		}
+		return Result{Tracked: tab.get()}, nil
+	})
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	tab.set(running("1", "web", 412, clk.Now()))
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+	errc := execAsync(p, "k", Exec{Command: "long", TimeoutS: MaxExecTimeoutS, Mode: ModeLeaseProcesses, ModeEpoch: 1})
+	recvWithin(t, entered, "the in-flight Exec's Run")
+
+	type setResult struct {
+		stopped []TrackedProcess
+		err     error
+	}
+	setc := make(chan setResult, 1)
+	deadline := clk.Now().Add(p.cfg.LeaseGraceLimit)
+	go func() {
+		stopped, err := p.SetMode("k", ModeLease, 2)
+		setc <- setResult{stopped, err}
+	}()
+	waitFor(t, func() bool { return timerArmed(clk, deadline) })
+	clk.Advance(p.cfg.LeaseGraceLimit)
+
+	var le *LeaseEndedError
+	if err := recvWithin(t, errc, "the cut Exec"); !errors.As(err, &le) || le.Reason != LeaseEndModeChange {
+		t.Fatalf("the in-flight Exec: %v, want lease_ended(mode_change)", err)
+	}
+	res := recvWithin(t, setc, "SetMode")
+	if res.err != nil || res.stopped != nil {
+		t.Fatalf("SetMode = %+v, %v; want (nil, nil)", res.stopped, res.err)
+	}
+	if slices.Contains(commandKinds(lc), execKindProcessStopAll) {
+		t.Fatalf("guest requests = %q, want no process_stop_all: the end stopped them", commandKinds(lc))
+	}
+	leaseEnded(t, p, lc, LeaseEndModeChange)
+	if ev := p.LeaseStatus("k").Pending; ev == nil || !slices.Equal(ev.Processes, []string{"web (pid 412)"}) {
+		t.Fatalf("pending = %+v, want the mode_change end listing web", ev)
 	}
 }

@@ -164,7 +164,8 @@ func (p *pool) EndLease(key string, reason LeaseEndReason) error {
 // is, because every later lease Exec is refused stale-mode (execLease). Until such a
 // lease exists there is nothing to cut, and the wait is the starting Exec's.
 func (p *pool) endLeaseWaiting(key string, reason LeaseEndReason, starting bool) error {
-	return p.waitLeaseGate(key, reason, starting, func(rp *runPool, target *vmLease) {
+	always := func(*runPool) bool { return true }
+	return p.waitLeaseGate(key, reason, starting, always, func(rp *runPool, target *vmLease) {
 		p.mu.Lock()
 		var v *leaseVictim
 		if l := rp.lease; l != nil && (l == target || target == nil) {
@@ -184,13 +185,22 @@ func (p *pool) endLeaseWaiting(key string, reason LeaseEndReason, starting bool)
 // included), and its holder stops the lease's tracked processes (stopTrackedUnderGate)
 // unless a lease Exec that got the gate first already has. It returns what the stop
 // stopped, for that set_mode's answer only (ruling P5-R19). At LeaseGraceLimit the lease
-// is cut with mode_change instead: the processes must not outlive the downgrade by more
-// than the grace limit, and an end stops them all.
+// is cut with mode_change instead, while the stop is still owed: the processes must not
+// outlive the downgrade by more than the grace limit, and an end stops them all. Once
+// another gate holder has stopped them (a lease Exec at the new epoch, P5-R21), nothing is
+// owed, and the wait returns at the grace point without cutting, (nil, nil): the lease is
+// kept and that Exec runs on (review Important 1).
 //
 // A lease a pinned Exec installed at level 2 after the downgrade was stored (the starting
 // case) is re-levelled here first, which marks it to stop.
 func (p *pool) stopTrackedWaiting(key string) (stopped []TrackedProcess, err error) {
-	err = p.waitLeaseGate(key, LeaseEndModeChange, true, func(rp *runPool, _ *vmLease) {
+	// owed: the lease still has its stop to take, or is a lease a starting Exec installed at
+	// level 2 after the downgrade was stored (the re-level below would mark it). Under p.mu.
+	owed := func(rp *runPool) bool {
+		l := rp.lease
+		return l != nil && (l.stopTracked || (l.mode == ModeLeaseProcesses && rp.state.Known && rp.state.Mode == ModeLease))
+	}
+	err = p.waitLeaseGate(key, LeaseEndModeChange, true, owed, func(rp *runPool, _ *vmLease) {
 		p.mu.Lock()
 		l := rp.lease
 		if l != nil && p.closed {
@@ -224,8 +234,12 @@ func (p *pool) stopTrackedWaiting(key string) (stopped []TrackedProcess, err err
 // waitLeaseGate is endLeaseWaiting's wait, for whatever its caller does to key's lease
 // under the run's gate: once it holds the gate it calls onGate, which must release it, and
 // returns. At LeaseGraceLimit it cuts the lease with cut instead, and returns once the
-// lease is gone. target is the lease live at the call, nil only when starting.
-func (p *pool) waitLeaseGate(key string, cut LeaseEndReason, starting bool, onGate func(rp *runPool, target *vmLease)) error {
+// lease is gone -- if owed(rp), checked under p.mu, still holds there; if not, the
+// caller's work was done under someone else's gate, and it returns without cutting. A
+// starting wait whose lease is not installed yet still cuts it once it is (owed is not
+// asked then). target is the lease live at the call, nil only when starting.
+func (p *pool) waitLeaseGate(key string, cut LeaseEndReason, starting bool, owed func(*runPool) bool,
+	onGate func(rp *runPool, target *vmLease)) error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -259,6 +273,10 @@ func (p *pool) waitLeaseGate(key string, cut LeaseEndReason, starting bool, onGa
 		case <-grace:
 			grace = nil
 			p.mu.Lock()
+			if rp.lease != nil && !owed(rp) {
+				p.mu.Unlock()
+				return nil
+			}
 			if target == nil {
 				target = rp.lease
 			}
