@@ -91,6 +91,7 @@ const RESET_END = {
   ageMs: 5_000,
   processes: [],
   endsByUnixMs: 0,
+  tracked: [],
 };
 
 /** TOKEN's lifetime is 900 s: the default timeout and the cap are 840 s (spec §6.5). */
@@ -583,6 +584,7 @@ describe('mocactl sbx run lease notices (spec §5)', () => {
     ageMs: 60_000,
     processes: [],
     endsByUnixMs: 0,
+    tracked: [],
   };
   const start = { ...end, state: 'start', reason: '', atUnixMs: end.atUnixMs + 5 };
   const runIt = async (s: ReturnType<typeof setup>, answer: () => ExecResult | Error) => {

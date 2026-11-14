@@ -412,6 +412,7 @@ const ev = (over: Partial<LeaseEvent>): LeaseEvent => ({
   ageMs: 60_000,
   processes: [],
   endsByUnixMs: 0,
+  tracked: [],
   ...over,
 });
 const ACTIVE: LeaseStatusView = { ...APPLIED, state: 'active', ageMs: 42_000 };

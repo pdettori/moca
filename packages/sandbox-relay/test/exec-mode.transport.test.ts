@@ -148,6 +148,7 @@ describe('lease events reach the caller (lease-mode §4)', () => {
       ageMs: 0,
       processes: [],
       endsByUnixMs: 0,
+      tracked: [],
     });
     const kinds = res.events.map((ev) => Object.entries(ev).flatMap(([k, v]) => (v ? [k] : [])));
     expect(kinds).toEqual([['lease'], ['chunk'], ['end']]);
