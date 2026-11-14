@@ -1,10 +1,8 @@
 import {
   LeaseControlError,
-  processRow,
   type LeaseEvent,
   type LeaseStatusView,
   type SandboxModeName,
-  type TrackedProcessView,
 } from '@moca/sandbox-client';
 import { ApiError } from '../api/errors.js';
 import { describeError } from '../core/messages.js';
@@ -21,6 +19,7 @@ import {
   UPGRADE_NEEDS_TTY,
 } from './mode.js';
 import { printNotices } from './notices.js';
+import { processDisplay, processRowText } from './proc.js';
 
 /**
  * `mocactl sbx mode`, `reset` and `get` (lease-mode spec §5, §8): a sandbox's mode, changed and
@@ -136,8 +135,9 @@ export async function cmdMode(
     // call's answer lists them, and none when a racing lease Exec did the stop (P5-R21, P5-R30).
     const stopped = r.status.stopped ?? [];
     if (stopped.length > 0) {
+      const what = stopped.length === 1 ? 'process' : 'processes';
       c.io.out(
-        `stopped ${stopped.length} tracked processes: ${stopped.map(processDisplay).join(', ')}\n`,
+        `stopped ${stopped.length} tracked ${what}: ${stopped.map(processDisplay).join(', ')}\n`,
       );
     }
     return SBX_EXIT.ok;
@@ -153,10 +153,6 @@ export async function cmdMode(
     x.close();
   }
 }
-
-/** A process as notices show it (spec §7): `<name> (pid <n>)`, `p<id>` when it has no name. */
-const processDisplay = (v: TrackedProcessView): string =>
-  `${sanitizeRemote(v.name || `p${v.id}`)} (pid ${v.pid})`;
 
 /** Ctrl-C during a set_mode: the mode is stored, as for a worker that could not be reached. */
 function pendingByCtrlC(c: SbxCtx, s: SbxSandbox): number {
@@ -289,9 +285,7 @@ export async function cmdGet(c: SbxCtx, id: string, factory?: ExecFactory): Prom
   // The tracked processes, exited ones included (P5-R16): at lease+processes, or whenever the
   // worker has some; one per line, ids as `sbx proc` takes them (p<id>).
   if (lease !== null && !('error' in lease) && (s.mode === 'lease+processes' || lease.processes)) {
-    const ps = (lease.processes ?? []).map((v) =>
-      sanitizeRemote(processRow({ ...v, id: `p${v.id}` })),
-    );
+    const ps = (lease.processes ?? []).map(processRowText);
     rows.push(['processes', ps.length ? ps.join(`\n${' '.repeat(14)}`) : 'none']);
   }
   for (const [k, v] of rows) c.io.out(`${k.padEnd(14)}${v}\n`);

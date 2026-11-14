@@ -377,17 +377,26 @@ func (a *uidAllocator) user(uid int) string { return "sbxp" + strconv.Itoa(uid-a
 // bounds the End frame and keeps a name safe in logs and in `<name> (pid <n>)`.
 var processNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
-// validateProcessName refuses a name outside ruling P5-R8 with process_name_invalid. An
-// empty name is an unnamed process, which is allowed. A name too long is described, not
-// echoed, so the refusal always fits one frame.
+// idShapedNameRE is ruling P5-R33: a name shaped like an id (n, or p<n> as clients show
+// ids) is refused, because an id wins over a name in lookups (P5-R6), so such a name
+// could make a client's p<n> address another process than the one it shows.
+var idShapedNameRE = regexp.MustCompile(`^p?[0-9]+$`)
+
+// processNameWant is the rule as a refusal names it; the clients' copy is identical
+// (sandbox-client processNameProblem).
+const processNameWant = "want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)"
+
+// validateProcessName refuses a name outside rulings P5-R8 and P5-R33 with
+// process_name_invalid. An empty name is an unnamed process, which is allowed. A name too
+// long is described, not echoed, so the refusal always fits one frame.
 func validateProcessName(name string) error {
-	if name == "" || processNameRE.MatchString(name) {
+	if name == "" || (processNameRE.MatchString(name) && !idShapedNameRE.MatchString(name)) {
 		return nil
 	}
 	if len(name) > 64 {
-		return fmt.Errorf("process_name_invalid: a name of %d bytes: want 1-64 characters of [A-Za-z0-9._-]", len(name))
+		return fmt.Errorf("process_name_invalid: a name of %d bytes: %s", len(name), processNameWant)
 	}
-	return fmt.Errorf("process_name_invalid: %q: want 1-64 characters of [A-Za-z0-9._-]", name)
+	return fmt.Errorf("process_name_invalid: %q: %s", name, processNameWant)
 }
 
 // clip shortens s for an error message, which must fit one frame (MaxFrame).

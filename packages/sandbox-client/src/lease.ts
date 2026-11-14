@@ -90,10 +90,16 @@ export function ageText(ms: number): string {
 
 const MIB = 1024 * 1024;
 
-/** One process as a client lists it (P5-R27): `id name (pid n): state, age, memory`. */
+/** How a process id is shown (P5-R6): `p<id>`; `processSelector` reads it back. */
+export const shownProcessId = (id: string): string => `p${id}`;
+
+/**
+ * One process as a client lists it (P5-R27): `p<id> name (pid n): state, age, memory`. The name is
+ * the worker's text: a client sanitizes the row before a terminal shows it.
+ */
 export function processRow(v: TrackedProcessView): string {
   return (
-    `${v.id} ${v.name} (pid ${v.pid}): ${processStateText(v)}, ${ageText(v.ageMs)}, ` +
+    `${shownProcessId(v.id)} ${v.name} (pid ${v.pid}): ${processStateText(v)}, ${ageText(v.ageMs)}, ` +
     `${(v.memoryBytes / MIB).toFixed(1)} MiB`
   );
 }

@@ -4,8 +4,11 @@ import {
   ExecMachineryError,
   ExecRefusedError,
   ProcessError,
+  processNameProblem,
   processRow,
+  processSelector,
   q,
+  shownProcessId,
   type LeaseEvent,
   type ProcessSelector,
   type TrackedProcessView,
@@ -46,21 +49,15 @@ export const PROC_FLAG_OWNER = {
   signal: 'stop',
 } as const satisfies Record<string, ProcSub>;
 
+/** One process as `proc ls`, `proc stop` and `get` show it: `processRow`, sanitized. */
+export const processRowText = (v: TrackedProcessView): string => sanitizeRemote(processRow(v));
+
 /**
- * A process as the user names it (P5-R6): `p<n>` or a decimal `n` is the id (an id wins over an
- * equal name, as the guest looks it up), anything else a name.
+ * A process as notices name it (spec §7): `<name> (pid <n>)`, its id (`p<id>`) when it has no
+ * name; sanitized.
  */
-export function processSelector(given: string): ProcessSelector {
-  const m = /^p?(\d+)$/.exec(given);
-  return m ? { id: m[1]! } : { name: given };
-}
-
-/** How a process id is shown: `p<id>`, the form `processSelector` reads back. */
-const shownId = (id: string): string => `p${id}`;
-
-/** A row, its id shown as `p<id>` and the worker's name sanitized. */
-const rowText = (v: TrackedProcessView): string =>
-  sanitizeRemote(processRow({ ...v, id: shownId(v.id) }));
+export const processDisplay = (v: { id: string; name: string; pid: number }): string =>
+  `${sanitizeRemote(v.name || shownProcessId(v.id))} (pid ${v.pid})`;
 
 /**
  * `proc SUB ...`'s arguments: `rest` the positionals after SUB and before `--`, `command` those
@@ -92,6 +89,9 @@ export function parseProcArgs(
     case 'start': {
       if (!command?.length) return 'proc start needs a command: mocactl sbx proc start [ID] -- CMD';
       if (rest.length > 1) return tooMany;
+      // The guest's name rule, id-shaped names refused (P5-R33), in the guest's words.
+      const bad = v.name !== undefined ? processNameProblem(v.name) : undefined;
+      if (bad !== undefined) return `invalid name: ${sanitizeRemote(bad)}`;
       // Each word quoted, as `run` quotes its CMD: `-- sh -c '...'` for shell syntax.
       return {
         args: {
@@ -144,8 +144,15 @@ function carried(err: unknown): LeaseEvent[] {
     : [];
 }
 
-/** The exit for a failed proc call, said in a person's words (the CLI audience). */
-function procFailed(c: SbxCtx, id: string, sub: ProcSub, err: unknown): number {
+/**
+ * The exit for a failed proc call, said in a person's words (the CLI audience). `sent`: the
+ * process Exec went out, so an interrupted start or stop may still have acted.
+ */
+function procFailed(c: SbxCtx, id: string, sub: ProcSub, err: unknown, sent: boolean): number {
+  if (c.signal?.aborted && !sent) {
+    if (sub === 'start' || sub === 'stop') c.io.err('sbx: interrupted: nothing was sent');
+    return SBX_EXIT.interrupted;
+  }
   if (err instanceof ApiError) return failed(c, err);
   if (c.signal?.aborted) {
     if (sub === 'start' || sub === 'stop') {
@@ -182,8 +189,10 @@ export async function cmdProc(
   try {
     x = await openExec(c.api, id, factory, c.signal ? { signal: c.signal } : {});
   } catch (err) {
-    return procFailed(c, id, a.sub, err);
+    return procFailed(c, id, a.sub, err, false);
   }
+  // Set just before the process Exec goes out: what an interrupt may have left behind.
+  let sent = false;
   const opts = c.signal ? { signal: c.signal } : {};
   try {
     if (jwtMode(x.token.token) !== 'lease+processes') {
@@ -197,21 +206,26 @@ export async function cmdProc(
           ...(a.name !== undefined ? { name: a.name } : {}),
           ...(a.cwd !== undefined ? { cwd: a.cwd } : {}),
         };
+        sent = true;
         const r = await x.process('start', args, opts);
         printNotices(c, id, r.lease);
         const p = r.result;
-        c.io.out(`${shownId(p.id)} ${sanitizeRemote(p.name || shownId(p.id))} pid ${p.pid}\n`);
+        c.io.out(
+          `${shownProcessId(p.id)} ${sanitizeRemote(p.name || shownProcessId(p.id))} pid ${p.pid}\n`,
+        );
         return SBX_EXIT.ok;
       }
       case 'ls': {
+        sent = true;
         const r = await x.process('list', {}, opts);
         printNotices(c, id, r.lease);
         if (c.json) c.io.out(JSON.stringify(r.result) + '\n');
         else if (r.result.length === 0) c.io.out('no tracked processes\n');
-        else for (const v of r.result) c.io.out(rowText(v) + '\n');
+        else for (const v of r.result) c.io.out(processRowText(v) + '\n');
         return SBX_EXIT.ok;
       }
       case 'logs': {
+        sent = true;
         const r = await x.process(
           'logs',
           { ...a.process, ...(a.tail !== undefined ? { tail: a.tail } : {}) },
@@ -223,19 +237,20 @@ export async function cmdProc(
         return SBX_EXIT.ok;
       }
       case 'stop': {
+        sent = true;
         const r = await x.process(
           'stop',
           { ...a.process, ...(a.signal !== undefined ? { signal: a.signal } : {}) },
           opts,
         );
         printNotices(c, id, r.lease);
-        c.io.out(rowText(r.result) + '\n');
+        c.io.out(processRowText(r.result) + '\n');
         return SBX_EXIT.ok;
       }
     }
   } catch (err) {
     printNotices(c, id, carried(err));
-    return procFailed(c, id, a.sub, err);
+    return procFailed(c, id, a.sub, err, sent);
   } finally {
     x.close();
   }

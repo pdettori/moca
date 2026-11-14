@@ -611,14 +611,16 @@ func TestTrackedMaxRunningZeroMeansTheDefault(t *testing.T) {
 }
 
 // Ruling P5-R8: a name is 1-64 chars of [A-Za-z0-9._-]; empty means unnamed. A long
-// name is described, not echoed, so the refusal always fits one frame.
+// name is described, not echoed, so the refusal always fits one frame. Ruling P5-R33: a
+// name shaped like an id (p<n> or n) is refused, so an id-wins lookup cannot address
+// another process than the one the user named.
 func TestProcessNameRules(t *testing.T) {
-	for _, ok := range []string{"", "web", "a", "dev-server_2.1", strings.Repeat("x", 64), "123"} {
+	for _, ok := range []string{"", "web", "a", "dev-server_2.1", strings.Repeat("x", 64), "p", "p3x", "3p", "P3", "p-3", "1.5"} {
 		if err := validateProcessName(ok); err != nil {
 			t.Errorf("validateProcessName(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{strings.Repeat("x", 65), "a b", "a/b", "../x", "név", "a\nb", "$(id)", strings.Repeat("y", 1<<20)} {
+	for _, bad := range []string{strings.Repeat("x", 65), "a b", "a/b", "../x", "név", "a\nb", "$(id)", strings.Repeat("y", 1<<20), "123", "3", "p3", "p0", "p007"} {
 		err := validateProcessName(bad)
 		if err == nil || !strings.HasPrefix(err.Error(), "process_name_invalid: ") {
 			t.Errorf("validateProcessName(%.20q) = %v, want process_name_invalid:", bad, err)
@@ -627,6 +629,12 @@ func TestProcessNameRules(t *testing.T) {
 		if len(err.Error()) > 200 {
 			t.Errorf("refusal of a %d-byte name is %d bytes: it must not echo the name", len(bad), len(err.Error()))
 		}
+		if !strings.HasSuffix(err.Error(), "want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)") {
+			t.Errorf("validateProcessName(%.20q) = %v: the refusal must name the rule", bad, err)
+		}
+	}
+	if err := validateProcessName("p3"); err == nil || err.Error() != `process_name_invalid: "p3": want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)` {
+		t.Errorf("validateProcessName(p3) = %v", err)
 	}
 }
 

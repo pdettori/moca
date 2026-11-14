@@ -696,6 +696,13 @@ describe('mocactl sbx mode (lease-mode spec §8.1, §8.2)', () => {
     });
     expect(await r.run(['mode', 'lease', SBX])).toBe(0);
     expect(r.out()).toBe('mode lease (epoch 3)\n');
+    // One stopped: singular (fix round 1).
+    const one = leaseWorld({
+      record: { mode: 'lease+processes', modeEpoch: 2 },
+      lease: () => ({ ...ACTIVE, stopped: [proc()] }),
+    });
+    expect(await one.run(['mode', 'lease', SBX])).toBe(0);
+    expect(one.out()).toBe('mode lease (epoch 3)\nstopped 1 tracked process: web (pid 412)\n');
     // The worker's names are sanitized.
     const x = leaseWorld({
       record: { mode: 'lease+processes' },

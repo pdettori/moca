@@ -1,10 +1,18 @@
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
-import type { Exec, ExecResult, ProcessCall } from './exec-conn.js';
+import {
+  processNameError,
+  processSelector,
+  type Exec,
+  type ExecResult,
+  type ProcessCall,
+  type ProcessSelector,
+} from './exec-conn.js';
 import type { LeaseEvent } from './gen/sandbox/v1/sandbox.js';
 import {
   LeaseControlError,
   processRow,
+  shownProcessId,
   type LeaseStatusView,
   type SandboxModeName,
 } from './lease.js';
@@ -746,12 +754,17 @@ function need(process: ProcessCall | undefined): ProcessCall {
   return process;
 }
 
-/** `id` or `name`, at least one: the process a call selects. */
-function selector(a: Record<string, unknown>): { id?: string; name?: string } {
+/**
+ * `id` or `name`, at least one: the process a call selects, read as `mocactl sbx proc` reads it
+ * (processSelector). The id wins, as in the guest; `p<n>` (as the rows show ids) or `n` is the id
+ * even for a named process, which the guest's lookup alone would not find by `p<n>`.
+ */
+function selector(a: Record<string, unknown>): ProcessSelector {
   const id = optStr(a, 'id');
   const name = optStr(a, 'name');
-  if (id === undefined && name === undefined) throw new ToolInputError('id or name is required');
-  return { ...(id !== undefined ? { id } : {}), ...(name !== undefined ? { name } : {}) };
+  const given = id ?? name;
+  if (given === undefined) throw new ToolInputError('id or name is required');
+  return processSelector(given);
 }
 
 /** The four tools of level 2 (spec §7): each one process call, a tracked process in the guest. */
@@ -779,12 +792,16 @@ function processTools(ws: string): SandboxTool[] {
       const command = str(a, 'command');
       const cwd = optStr(a, 'cwd');
       const name = optStr(a, 'name');
+      // Refused here as the guest would refuse it (P5-R33): nothing is sent.
+      const bad = name !== undefined ? processNameError(name) : undefined;
+      if (bad) throw bad;
       const r = await need(process)(
         'start',
         { command, ...(cwd !== undefined ? { cwd } : {}), ...(name !== undefined ? { name } : {}) },
         { signal },
       );
-      return ok(`started ${r.result.id} ${r.result.name} (pid ${r.result.pid})`);
+      const p = r.result;
+      return ok(`started ${shownProcessId(p.id)} ${p.name || shownProcessId(p.id)} (pid ${p.pid})`);
     },
   };
   const list: SandboxTool = {

@@ -19,10 +19,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   ExecMachineryError,
   ExecRefusedError,
+  ProcessError,
+  processNameProblem,
+  processSelector,
   type Exec,
   type ExecResult,
   type ProcessCall,
 } from '../src/exec-conn.js';
+import { execFailureText } from '../src/mcp-server.js';
 import {
   FILE_TOOL_TIMEOUT_S,
   MAX_BYTES,
@@ -971,7 +975,7 @@ describe('process tools (plan 5, spec §7)', () => {
       p.process,
     );
     expect(r.isError).toBeFalsy();
-    expect(txt(r)).toBe('started 3 web (pid 412)');
+    expect(txt(r)).toBe('started p3 web (pid 412)');
     expect(p.sent).toEqual([
       {
         op: 'start',
@@ -989,7 +993,7 @@ describe('process tools (plan 5, spec §7)', () => {
       view({ id: '4', name: 'p4', pid: 9, state: 'exited', code: 1, ageMs: 5_000, memoryBytes: 0 }),
     ]);
     expect(txt(await t(l2(), 'process_list').run({}, noExec, undefined, p.process))).toBe(
-      '3 web (pid 412): running, 2m10s, 12.0 MiB\n4 p4 (pid 9): exited(1), 5s, 0.0 MiB',
+      'p3 web (pid 412): running, 2m10s, 12.0 MiB\np4 p4 (pid 9): exited(1), 5s, 0.0 MiB',
     );
     const none = procs(() => []);
     expect(txt(await t(l2(), 'process_list').run({}, noExec, undefined, none.process))).toBe(
@@ -1027,8 +1031,45 @@ describe('process tools (plan 5, spec §7)', () => {
           p.process,
         ),
       ),
-    ).toBe('final state: 3 web (pid 412): killed(15), 2m10s, 0.0 MiB');
+    ).toBe('final state: p3 web (pid 412): killed(15), 2m10s, 0.0 MiB');
     expect(p.sent[0]!.args).toEqual({ name: 'web', signal: 'INT' });
+  });
+
+  it('a p<n> or decimal id (and an id-shaped name) reaches the guest as the id (P5-R6, P5-R33)', async () => {
+    const p = procs((op) => (op === 'logs' ? 'log\n' : view({ state: 'killed', code: 15 })));
+    for (const args of [{ id: 'p3' }, { id: '3' }, { name: 'p3' }, { id: 'p3', name: 'web' }]) {
+      await t(l2(), 'process_stop').run(args, noExec, undefined, p.process);
+      await t(l2(), 'process_logs').run(args, noExec, undefined, p.process);
+    }
+    expect(p.sent.map((s) => s.args)).toEqual(Array(8).fill({ id: '3' }));
+    await t(l2(), 'process_logs').run({ name: 'web' }, noExec, undefined, p.process);
+    expect(p.sent.at(-1)!.args).toEqual({ name: 'web' });
+    expect(processSelector('p3')).toEqual({ id: '3' });
+    expect(processSelector('3')).toEqual({ id: '3' });
+    expect(processSelector('web')).toEqual({ name: 'web' });
+    expect(processSelector('p3x')).toEqual({ name: 'p3x' });
+  });
+
+  it('process_start refuses a name the guest would, id-shaped ones included, sending nothing (P5-R33)', async () => {
+    const p = procs();
+    const WANT = 'want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)';
+    for (const [name, detail] of [
+      ['p3', `"p3": ${WANT}`],
+      ['12', `"12": ${WANT}`],
+      ['a b', `"a b": ${WANT}`],
+      ['x'.repeat(65), `a name of 65 bytes: ${WANT}`],
+    ] as const) {
+      const err = await t(l2(), 'process_start')
+        .run({ command: 'x', name }, noExec, undefined, p.process)
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProcessError);
+      expect(err).toMatchObject({ code: 'process_name_invalid', detail });
+      expect(execFailureText(err)).toBe(`invalid name: ${detail}`);
+      expect(processNameProblem(name)).toBe(detail);
+    }
+    expect(p.sent).toEqual([]);
+    for (const ok of ['web', 'p3x', 'dev-server_2.1'])
+      expect(processNameProblem(ok)).toBeUndefined();
   });
 
   it('refuses malformed input, sending nothing', async () => {

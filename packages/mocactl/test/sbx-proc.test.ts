@@ -403,4 +403,87 @@ describe('mocactl sbx proc: refusals, failures, notices', () => {
     expect(w.out()).toBe('');
     expect(w.closed()).toBe(1);
   });
+
+  it('Ctrl-C during ls, logs or stop exits 130: silent for ls and logs, "may have stopped" for stop', async () => {
+    for (const [argv, said] of [
+      [['proc', 'ls', SBX], undefined],
+      [['proc', 'logs', 'web', SBX], undefined],
+      [
+        ['proc', 'stop', 'web', SBX],
+        'sbx: interrupted: the process may have stopped; mocactl sbx proc ls shows it',
+      ],
+    ] as const) {
+      const w = world({
+        answer: (_op, _a, signal) =>
+          new Promise((_res, rej) =>
+            signal?.addEventListener('abort', () => rej(new Error('cancelled')), { once: true }),
+          ),
+      });
+      const p = w.run([...argv]);
+      await vi.waitFor(() => expect(w.calls).toHaveLength(1));
+      w.ac.abort();
+      expect(await p, argv.join(' ')).toBe(130);
+      expect(w.io.errs, argv.join(' ')).toEqual(said === undefined ? [] : [said]);
+      expect(w.out()).toBe('');
+    }
+  });
+
+  it('Ctrl-C before the call was sent (during the token mint) says nothing was sent (fix round 1)', async () => {
+    for (const argv of [
+      ['proc', 'start', SBX, '--', 'sleep', '100'],
+      ['proc', 'stop', 'web', SBX],
+    ]) {
+      const s = setup();
+      let hung = 0;
+      const fetchImpl = (async (_input: string | URL, init?: RequestInit) => {
+        hung++;
+        return new Promise<Response>((_res, rej) => {
+          const stop = () => rej(new DOMException('aborted', 'AbortError'));
+          if (init?.signal?.aborted) stop();
+          init?.signal?.addEventListener('abort', stop, { once: true });
+        });
+      }) as typeof fetch;
+      let dialled = 0;
+      const ac = new AbortController();
+      const p = sbxMain(argv, s.env, s.io, {
+        home: s.home,
+        fetchImpl,
+        execFactory: () => {
+          dialled++;
+          throw new Error('not dialled');
+        },
+        signal: ac.signal,
+        cwd: tmp('sbx-proc-cwd-'),
+      });
+      await vi.waitFor(() => expect(hung).toBe(1));
+      ac.abort();
+      expect(await p, argv.join(' ')).toBe(130);
+      expect(dialled).toBe(0);
+      expect(s.io.errs, argv.join(' ')).toEqual(['sbx: interrupted: nothing was sent']);
+    }
+  });
+
+  it('ls --json stdout stays pure JSON when the call carries a lease event: the notice is on stderr', async () => {
+    const end = ev({ reason: 'idle' });
+    const w = world({ lease: [end] });
+    expect(await w.run(['proc', 'ls', SBX, '--json'])).toBe(0);
+    expect(JSON.parse(w.out())).toEqual([row()]);
+    expect(w.io.errs).toEqual([leaseNotice(end, Date.now())]);
+  });
+
+  it('start --name refuses a name the guest would, id-shaped ones included, before any request (P5-R33)', async () => {
+    const WANT = 'want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)';
+    const w = world();
+    for (const [name, detail] of [
+      ['p3', `"p3": ${WANT}`],
+      ['7', `"7": ${WANT}`],
+      ['a b', `"a b": ${WANT}`],
+    ] as const) {
+      expect(await w.run(['proc', 'start', '--name', name, SBX, '--', 'true'])).toBe(2);
+      // The line, then the usage.
+      expect(w.io.errs[0]!.split('\n')[0]).toBe(`sbx: invalid name: ${detail}`);
+    }
+    expect(w.cp.calls).toEqual([]);
+    expect(await w.run(['proc', 'start', '--name', 'p3x', SBX, '--', 'true'])).toBe(0);
+  });
 });

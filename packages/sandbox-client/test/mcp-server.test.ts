@@ -1323,14 +1323,14 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
       mode: 'lease+processes',
     });
     expect(text(await call(client, 'process_start', { command: 'serve', name: 'web' }))).toBe(
-      'started 3 web (pid 412)',
+      'started p3 web (pid 412)',
     );
     expect(text(await call(client, 'process_list', {}))).toBe(
-      '3 web (pid 412): running, 2m10s, 12.0 MiB',
+      'p3 web (pid 412): running, 2m10s, 12.0 MiB',
     );
     expect(text(await call(client, 'process_logs', { name: 'web' }))).toBe('serving\n');
     expect(text(await call(client, 'process_stop', { name: 'web' }))).toBe(
-      'final state: 3 web (pid 412): exited(0), 2m10s, 12.0 MiB',
+      'final state: p3 web (pid 412): exited(0), 2m10s, 12.0 MiB',
     );
     expect(p.ops).toEqual(['start', 'list', 'logs', 'stop']);
     expect(records.map((r) => [r.tool, r.execs, r.ok])).toEqual([
@@ -1562,8 +1562,8 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
         'idle timeout: 900s',
         'last end: none',
         'tracked processes:',
-        '  3 web (pid 412): running, 2m10s, 12.0 MiB',
-        '  4 p4 (pid 9): killed(9), 5s, 0.0 MiB',
+        '  p3 web (pid 412): running, 2m10s, 12.0 MiB',
+        '  p4 p4 (pid 9): killed(9), 5s, 0.0 MiB',
       ].join('\n'),
     );
   });
@@ -1603,7 +1603,7 @@ describe('the §7 refusal clears once the user upgrades (fix round 1, P5-R29)', 
     });
     const r = await call(client, 'process_start', { command: 'serve', name: 'web' });
     expect(r.isError).toBeFalsy();
-    expect(text(r)).toBe('started 1 web (pid 7)');
+    expect(text(r)).toBe('started p1 web (pid 7)');
     expect(refreshes).toHaveLength(1);
     expect(refreshes[0]).toBeInstanceOf(AbortSignal);
     expect(p.ops).toEqual(['start']);

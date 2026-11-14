@@ -158,6 +158,39 @@ export interface ProcessSelector {
   id?: string;
   name?: string;
 }
+
+/**
+ * A process as a client is given it (P5-R6): `p<n>` (an id as clients show it) or a decimal `n` is
+ * the id; anything else a name. No name is shaped like an id (P5-R33), so an id-shaped name can
+ * only mean the id. The MCP tools and `mocactl sbx proc` both read their selector through this.
+ */
+export function processSelector(given: string): ProcessSelector {
+  const m = /^p?(\d+)$/.exec(given);
+  return m ? { id: m[1]! } : { name: given };
+}
+
+const PROCESS_NAME_WANT = 'want 1-64 characters of [A-Za-z0-9._-], not shaped like an id (p<n>)';
+
+/**
+ * Why `name` is refused as a process name, as the guest's `process_name_invalid:` detail says it
+ * (rulings P5-R8, P5-R33; guestagent validateProcessName): undefined when it is allowed. Clients
+ * check it before sending, with the same text.
+ */
+export function processNameProblem(name: string): string | undefined {
+  if (/^[A-Za-z0-9._-]{1,64}$/.test(name) && !/^p?[0-9]+$/.test(name)) return undefined;
+  const bytes = Buffer.byteLength(name);
+  return bytes > 64
+    ? `a name of ${bytes} bytes: ${PROCESS_NAME_WANT}`
+    : `${JSON.stringify(name)}: ${PROCESS_NAME_WANT}`;
+}
+
+/** A process name refused before sending, as the guest would have refused it. */
+export function processNameError(name: string): ProcessError | undefined {
+  const d = processNameProblem(name);
+  return d === undefined
+    ? undefined
+    : new ProcessError('process_name_invalid', d, `process_name_invalid: ${d}`);
+}
 export interface ProcessArgsByOp {
   /** `cwd` is inside the workspace (default /workspace); `name` is unique among running ones. */
   start: { command: string; name?: string; cwd?: string };
