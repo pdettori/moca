@@ -66,8 +66,15 @@ them to `sbx-settings`, which the control plane reads:
 [SBX security review](../../docs/sbx/security-review.md) has its lease section (lease-mode spec
 §11). A microVM worker serves lease mode on its own once its snapshot advertises `lease-v1`, so the
 control plane's list is the only switch. After that gate, an operator opts in to level 1 with
-`SBX_MODES_ALLOWED=per-exec,lease` and a re-run of `setup.sh`. Keep `lease+processes` off until the
-security review covers it.
+`SBX_MODES_ALLOWED=per-exec,lease` and a re-run of `setup.sh`.
+
+**Keep `lease+processes` (level 2) off** until the security review's level-2 section,
+[§7](../../docs/sbx/security-review.md#7-lease-mode-level-2-sbx03-draft), is signed off (it is a
+draft that needs the security owner's sign-off) and live smoke step 9 has passed (RUNBOOK §13).
+Level 1's section comes first. Level 2 also needs the relay and every worker on the level-2 code,
+and template snapshots that advertise `lease-processes-v1`: an older relay or worker would run a
+`process_start` as a plain command. Then add `lease+processes` to `SBX_MODES_ALLOWED` and re-run
+`setup.sh`.
 
 Narrowing the policy downgrades existing sandboxes at their next token mint, so the list stays the
 switch for sandboxes created before the change. Remove `lease` from `SBX_MODES_ALLOWED` and

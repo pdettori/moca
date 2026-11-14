@@ -183,7 +183,8 @@ Rows for the user-scoped credential injection. The live acceptance (plan Task 15
 > `SH_SANDBOX_MODES_ALLOWED`) defaults to `per-exec`, and the change that adds this draft does not
 > change that. The [lease-mode spec](../specs/2026-11-08-sbx-lease-mode-design.md) §8.1 and §11 allow
 > `per-exec,lease` only after this section is signed off and live smoke step 8 has passed. Level 2
-> (`lease+processes`) needs a section of its own: it is out of scope here and stays off.
+> (`lease+processes`) has a section of its own, §7, also a draft: it is out of scope here and stays
+> off.
 
 **What level 1 is.** A sandbox in mode `lease` keeps its microVM between Execs of that one sandbox,
 so the guest's tmpfs (`/tmp`, `/var`) and its page cache last until the lease ends. Every process an
@@ -213,7 +214,8 @@ manual-only and need `/dev/kvm` and a `lease-v1` snapshot; §6.2 gives their sta
 | Lease notices and audit lines                                                                                                             | A notice carries an end reason, a time, a mode and, at level 2, process names; no command text and no token. Every `LeaseControl` writes a `sandbox_lease_control` line, refusals included; every mode change writes `sandbox_mode_changed`. A keepalive is not audited                                                                                                                  | spec §5, §8.1, §8.3; `packages/sandbox-relay/test/lease-control.transport.test.ts`                                                                                                                                                                                                                                                                                            | Tested (the audit lines); by construction (the notice fields, `proto/sandbox/v1/sandbox.proto` `LeaseEvent`) |
 
 Spec §11's two level-2 rows (a process that survives between Execs, and a tracked process that runs
-code it loads from the workspace) are out of scope here, because `lease+processes` stays off.
+code it loads from the workspace) are out of scope here, because `lease+processes` stays off. §7.1
+covers them.
 
 ### 6.2 The gates (spec §9)
 
@@ -277,6 +279,132 @@ deployed, and record its date and snapshot here.
   re-run of `setup.sh` (`deploy/sbx/README.md`).
 
 ### 6.5 Security owner sign-off (level 1 only)
+
+| Field    | Entry |
+| -------- | ----- |
+| Reviewer |       |
+| Date     |       |
+| Findings |       |
+| Decision |       |
+
+## 7. Lease mode, level 2 (SBX0.3): DRAFT
+
+> **Draft: needs the security owner's sign-off.** Nothing in this section is signed off, and §7.6 is
+> empty. Level 2 stays off by default: `SBX_MODES_ALLOWED` (the control plane's
+> `SH_SANDBOX_MODES_ALLOWED`) defaults to `per-exec`, and the change that adds this draft does not
+> change that. The [lease-mode spec](../specs/2026-11-08-sbx-lease-mode-design.md) §8.1 and §11
+> allow `lease+processes` only after this section is signed off. This section builds on §6: every
+> level-1 row there holds at level 2 unless §7.1 says otherwise, so level 1's sign-off (§6.5) comes
+> first.
+
+**What level 2 is.** A sandbox in mode `lease+processes` is a level-1 lease in which an Exec of a
+process kind (`process_start`) starts a **tracked process**, which outlives the Exec. Every other
+process an Exec starts still dies at its end, `&`, `nohup` and `setsid` included. The agent manages
+tracked processes with four MCP tools (`process_start`, `process_list`, `process_logs`,
+`process_stop`), and a user with `mocactl sbx proc`. A later Exec reaches a tracked process inside
+the guest only: on a localhost port, or through files in the workspace. The guest still has no
+network. The design is the lease-mode spec §7, and what was built is in its "As built (plan 5)"
+blocks (§5, §7, §8.2, §8.3, §9).
+
+The evidence statuses are §1's. "KVM gate" means a gate in
+`remote-worker/internal/vmpool/gates_lease_kvm_test.go` or `gates_lease_pool_kvm_test.go`, and
+"guest root test" a test in `remote-worker/internal/guestagent/tracked_linux_test.go`, which needs
+Linux, root and cgroup v2. Both are manual-only; §7.2 gives their status.
+
+### 7.1 What changes against level 1, and what bounds it (spec §7, §11)
+
+| Change                                                                                                                          | Bound                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Evidence                                                                                                                                                                                                                                                                                                                                                                                                                                             | Status                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| A process can survive and keep working between Execs                                                                            | Only through a process kind, which the relay refuses before forwarding unless the token's `mode` claim is `lease+processes` (`processes_not_enabled:`), and the worker refuses again under the lease's run gate. The strict rule: every process alive in the guest outside an Exec is in a `tracked/p<id>` cgroup and listed, a double-forked daemon included. Each one is visible in the tool call, in `process_list`, `sandbox_info`, `mocactl sbx get` and `sbx proc ls`, and in the audit. A level-2 lease's `max_duration` is 4 h (level 1: 8 h), then the grace limit; the idle timeout, `reset` and a downgrade end or stop them. `SH_LEASE_MAX_PROCESSES` caps the running ones (default 4; the worker refuses to boot above 4, the tracked uids an image has) | `TestGateLeaseExecKillsProcesses` (level-2 subtest), `TestGateLeaseProcessLifecycle` (KVM gates); `TestTrackedSurvivesExecKill`, `TestTrackedDoubleForkStaysInCgroup`, `TestProcessLimitCountsRunningOnly` (guest root tests); `packages/sandbox-relay/test/exec-mode.transport.test.ts` "mode claim %s: every process kind is refused before the worker"; `remote-worker/internal/vmpool/lease_process_test.go` `TestProcessKindRefusedBelowLevel2` | Tested; KVM gates and guest root tests: §7.2                      |
+| A later Exec could attack a running tracked process: a signal, `ptrace`, `process_vm_writev`, a write to `/proc/<pid>/mem`      | Each tracked process runs under a uid of its own from 20000 to 20003 (`sbxp0`..`sbxp3`), never the Exec uid, through the same shim as an Exec: no capabilities, `no_new_privs`, the seccomp filter on `ptrace` and `process_vm_*`. Its cgroup is root-owned and not delegated                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `TestGateLeasePrivilege` (the tracked half, KVM gate); `TestExecCannotTouchTrackedProcess` (guest root test)                                                                                                                                                                                                                                                                                                                                         | KVM gate and guest root test: §7.2                                |
+| A tracked process shares the workspace (group `sbx-ws`, umask `0002`), so it can change what a later start sees                 | `cwd` is resolved beneath the workspace with `openat2` (no symlinks, no magic links, no mount crossing) and entered with `fchdir` after the privilege drop, so a directory swapped for a symlink between the check and the start cannot move a new process outside the workspace. A `cwd` the tracked uid cannot search fails safe: the process exits 127                                                                                                                                                                                                                                                                                                                                                                                                              | `TestProcessCwdMustStayInWorkspace`, `TestProcessCwdSwapAfterTheCheckCannotLeaveTheWorkspace` (guest root tests); the cwd check in `TestGateLeaseProcessLifecycle`                                                                                                                                                                                                                                                                                   | Guest root tests and KVM gate: §7.2                               |
+| A tracked uid or HOME could be reused or squatted                                                                               | Uids are handed out fresh, and a uid is not reused while any cgroup it was given still holds a process, even after its table entry was dropped. When the table drops an entry (eviction, or a new process taking an exited one's name), whatever is left in its cgroup is killed. HOME is `/tmp/sbx-proc/<uid>`, made afresh at each start (0700, owned by that uid), under a root-owned `/tmp/sbx-proc` (0711) the agent makes when the lease starts, so no other uid can create one first                                                                                                                                                                                                                                                                            | `TestTrackedUIDNotReusedWhilePopulated`, `TestTrackedDroppedEntryLeavesNothingRunning`, `TestProcessStartRunsUnderItsOwnUIDAndCgroup` (guest root tests); uid reuse in `TestGateLeaseProcessLifecycle`                                                                                                                                                                                                                                               | Guest root tests and KVM gate: §7.2                               |
+| A tracked process could exhaust the guest's memory, or the agent's                                                              | Its cgroup is capped like an Exec's. An OOM inside it shows `killed(9)`, and the lease and the next Exec go on. The ring logs live in the agent's memory: 4 MiB per running process, trimmed to its last 64 KiB at exit, and at most 8 exited entries are kept, about 16.5 MiB in all                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `TestTrackedOOMKeepsTheLease` (guest root test); the OOM and ring parts of `TestGateLeaseProcessLifecycle`; `remote-worker/internal/guestagent/tracked_test.go` (the ring and the table bounds)                                                                                                                                                                                                                                                      | Tested; guest root test and KVM gate: §7.2                        |
+| A component that does not know the process kinds could run a `process_start` as a plain command                                 | Compat first: the worker refuses a process kind with `lease_unsupported:` unless its snapshot advertises `lease-processes-v1` on the Firecracker arm; the container tier refuses every non-command kind; the guest agent and both worker tiers refuse an unknown kind. None runs the command. The harness path forces every Exec to a plain command and drops the process arguments. Cloud Hypervisor images are unchanged. **Residual**: see §7.4, components older than level 2                                                                                                                                                                                                                                                                                      | `TestProcessKindRefusedWithoutFeature` (`vmpool`), `TestBashRunnerRefusesProcessKinds` (`internal/exec`), `TestAgentRefusesAnUnknownKindWithoutRunningIt`, `TestLeaseUnknownKindIsRefusedNotRun` (guest); `packages/sandbox-relay/test/exec-mode.transport.test.ts` "the harness path zeroes kind and process"                                                                                                                                       | Tested                                                            |
+| A downgrade must not leave a process running at level 1                                                                         | `lease+processes` to `lease` stops every tracked process under the run gate (the host-only `process_stop_all`, sent even when nothing is listed as running), exactly once, by whichever of the `set_mode` and a racing lease Exec takes the gate first, with a stop audit line for each. A stop that fails ends the lease (`teardown_failed`), and a guest that refuses it ends the lease (`mode_change`). To `per-exec` the lease ends                                                                                                                                                                                                                                                                                                                                | `TestGateLeaseStaleEpoch` (level-2 subtest, KVM gate); `TestDowngradeStopsTrackedKeepsLease`, `TestDowngradeStopAllTeardownFailedEndsLease`, `TestExecRelevelStopsTrackedAndNotifies` (`vmpool`); `TestProcessStopAllStopsEveryProcessAndLeftover` (guest root test); smoke step 9 (`deploy/sbx/smoke.sh`, offline-tested in `deploy/sbx/tests/smoke.test.sh`)                                                                                       | KVM gate: §7.2. Step 9: offline-tested only; **live run pending** |
+| A name could be read as another process's id                                                                                    | A name is 1 to 64 characters of `[A-Za-z0-9._-]`, and one shaped like an id (`^p?[0-9]+$`) is refused (`process_name_invalid:`), in the guest and, with the same text, in both clients. Ids display as `p<id>` everywhere, and one shared selector reads `p<n>` or `n` as the id. The name rule also keeps names safe in logs and notices; the clients sanitize a worker's text before a terminal shows it                                                                                                                                                                                                                                                                                                                                                             | `TestProcessNameRules`, `TestTrackedLookupByIDOrName` (`remote-worker/internal/guestagent/tracked_test.go`); `packages/mocactl/test/sbx-proc.test.ts` "start --name refuses a name the guest would, id-shaped ones included, before any request (P5-R33)"                                                                                                                                                                                            | Tested                                                            |
+| Audit lines and notices name tracked processes                                                                                  | The relay's `sandbox_exec` line adds `kind` and `process` (`p<id>`, else the name), never the command, which appears only in the `cmd` prefix the operator's `SH_SANDBOX_AUDIT_COMMANDS=1` adds to every Exec. The worker writes a `lease_process` line for each start, stop and exit (id, name, pid, state, code, mode), and a lease end's line lists its tracked processes. A notice carries names, pids and the end reason, no command text and no token                                                                                                                                                                                                                                                                                                            | `packages/sandbox-relay/test/exec-mode.transport.test.ts` "the audit line has kind, and process as p<id> or the name, never its command", "a refused process kind is audited with its kind and process"; `TestProcessExitAudited` (`vmpool`)                                                                                                                                                                                                         | Tested                                                            |
+| A tracked process runs code it loads from the workspace (a dev server with hot reload), so a later Exec can change what it runs | Accepted (spec §11). The workspace is the channel the agent works through. The strict rule bounds which processes exist and are visible, not what code a visible process loads. `process_list` shows each one; `process_stop`, a downgrade and `reset` end it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | `TestTrackedFileEditableByLaterExec` (guest root test)                                                                                                                                                                                                                                                                                                                                                                                               | Accepted by design                                                |
+
+### 7.2 The gates and their status
+
+The level-2 halves of four KVM gates, and one new gate:
+
+| Gate                              | Level-2 property                                                                                                                                                                                                      |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TestGateLeaseExecKillsProcesses` | A `process_start` process and its child are the only survivors of an Exec                                                                                                                                             |
+| `TestGateLeaseStaleEpoch`         | A downgrade to `lease` stops the tracked processes and keeps the lease                                                                                                                                                |
+| `TestGateLeasePrivilege`          | `ptrace`, `process_vm_writev`, a `/proc/<pid>/mem` write and signals from an Exec to a running tracked process all fail, and its memory and command are unchanged                                                     |
+| `TestGateLeaseNotice`             | Every end lists the tracked processes it stopped                                                                                                                                                                      |
+| `TestGateLeaseProcessLifecycle`   | Start, list, logs and stop; a later Exec reaching the process on `127.0.0.1`; the refusals; `TERM` then the kill after 10 s; the 4 MiB ring; the running cap; 8 exited entries kept; uid reuse; an OOM as `killed(9)` |
+
+**Status.** On 2026-11-14 the controller ran them on a KVM rig, against a snapshot built from the
+plan-5 branch that advertises `lease-v1` and `lease-processes-v1`. The guest root tests passed
+(81 of 81), and the whole `-run TestGate` suite passed at the branch's commit `7bcd2e97`: 76
+passed, none failed, none skipped, and no Firecracker process was left. One later commit,
+`41a62a3a`, makes an `agent_dead` lease end sync the guest too; it is covered by a unit test, not by
+a gate re-run. The reviewer should ask for a re-run at the commit to be deployed, and record its
+date and snapshot here.
+
+### 7.3 Robustness findings the gates caught, fixed before the passing run
+
+The first rig run passed 18 of the 25 level-2 checks. The failures came from two defects, both fixed
+on the branch before the second run:
+
+- **PID 1 could exit.** The guest agent treated an interrupted `accept` on its vsock listener as
+  fatal. When a tracked process exited while the agent sat idle in `accept`, the `SIGCHLD` turned
+  into `EINTR`, the agent exited, and the guest kernel panicked with PID 1 gone. So any tracked
+  process could end its own sandbox's guest just by exiting: an availability fault, confined to
+  that one sandbox's lease. The agent now retries `EINTR` and
+  `ECONNABORTED` at once, and its serve loop survives any other accept error, a closed listener
+  aside, with a back-off (ruling P5-R35; `TestAcceptRetryable`,
+  `TestServeKeepsServingAfterAnAcceptError`; `remote-worker/internal/guestagent/agent.go`).
+- **The host wrapped the process kinds.** The worker put a `process_start`'s command inside its
+  per-Exec template, so the reported pid was the wrapper's, an OOM kill read `exited(137)` instead
+  of `killed(9)`, and the template's `cd /workspace` overrode the requested `cwd`. The process kinds
+  now go to the guest exactly as given: the process is the command (ruling P5-R34;
+  `TestProcessKindsAreSentUnwrapped`). The template also ran `sync` at the end of each command,
+  which is what made a lease's workspace writes durable. Tracked processes write between Execs, so
+  a level-2 lease's end, or any lease end with tracked processes, now runs `sync` in the guest
+  before the VM is destroyed, bounded at 30 s (about 40 s with the vsock connect). Only a
+  `teardown_failed` end skips it (ruling P5-R36; `TestLevel2LeaseEndSyncsBeforeDestroy`). This is
+  an integrity property of the user's own files, not a confidentiality bound.
+
+### 7.4 What level 2 does not claim
+
+- **That only the agent's intended processes run between Execs.** Whatever `process_start` is given
+  runs until it exits, is stopped, or the lease ends, and it can start children, which stay in its
+  cgroup and die with it. The bound is visibility (§7.1), not intent.
+- **That a tracked process's code is fixed.** It may load code from the workspace that a later Exec
+  changes (§7.1, accepted).
+- **That components older than level 2 refuse a process kind.** A relay or worker that predates
+  `Exec.kind` drops the field, and would run a `process_start`'s command as a plain command. That
+  gives no process more than per-Exec rules (it dies with its Exec), but the call misbehaves. The
+  deployment must run level-2 code in the relay and every worker before it allows
+  `lease+processes` (§7.5).
+- **That a downgrade's caller always sees the stopped list.** When a racing lease Exec does the
+  stop, that Exec carries the `processes_stopped` notice and `mocactl sbx mode` prints no list; the
+  audit has the stop lines either way. A `set_mode` reply that is lost also loses the list.
+- **That an end never waits.** A lease end with tracked processes waits up to about 40 s on a
+  wedged guest for its `sync`.
+- Everything §6.3 does not claim for level 1.
+
+### 7.5 Open items for the security owner
+
+- **Smoke step 9 has not run live.** It is tested offline only. It needs a deployment that allows
+  `lease+processes` and a template whose snapshot advertises `lease-v1` and `lease-processes-v1`.
+  Because the policy is deployment-wide, run it on a test deployment, or list `lease+processes` for
+  the run only (`deploy/sbx/RUNBOOK.md` §13).
+- **The KVM gates and guest root tests at the deployed commit** (§7.2).
+- **Deployment order.** Level 2 must be allowed only once the relay and every worker run the
+  level-2 code, and the templates' snapshots advertise `lease-processes-v1` (§7.4). Decide whether
+  that needs an automated check.
+- **The downgrade-report residual** (§7.4): accept it, or ask for the stopped list to be kept.
+- **Level 1 first.** §6 must be signed off before this section.
+- **Turning level 2 on is a separate change** after sign-off: `lease+processes` added to
+  `SBX_MODES_ALLOWED` and a re-run of `setup.sh` (`deploy/sbx/README.md`).
+
+### 7.6 Security owner sign-off (level 2)
 
 | Field    | Entry |
 | -------- | ----- |
