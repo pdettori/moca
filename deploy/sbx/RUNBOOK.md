@@ -807,7 +807,7 @@ What each step does:
    that its `set_mode` was applied. `sbx proc start --name web` of
    `python3 -m http.server 8080 --bind 127.0.0.1` must print `p<id> web pid <n>`. A later `sbx run`
    of `curl -s --max-time 5 http://127.0.0.1:8080/` must get the directory listing: the tracked
-   process outlived the command that started it (the step tries up to 10 times, 1 s apart, while
+   process outlived the command that started it (10 tries, 1 s apart (each try up to 5 s), while
    the server binds). `sbx proc ls` must show `web` running with that pid, and `sbx mode lease`
    must print `stopped 1 tracked process: web (pid <n>)` on stdout. The same `curl` must then
    fail. Then it deletes the sandbox.

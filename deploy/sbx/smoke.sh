@@ -88,7 +88,8 @@
 #   9. lease mode, level 2 (the lease-mode spec §7, §8.2): `sbx create --mode lease+processes` on a
 #      pseudo-terminal, its set_mode applied; `sbx proc start --name web -- python3 -m http.server
 #      8080 --bind 127.0.0.1` prints `p<id> web pid <n>`; a later `sbx run -- curl` of
-#      http://127.0.0.1:8080/ gets the directory listing (polled for up to 10 s while it binds);
+#      http://127.0.0.1:8080/ gets the directory listing (10 tries, 1 s apart (each try up to 5 s),
+#      while it binds);
 #      `sbx proc ls` shows web running with that pid; `sbx mode lease` prints
 #      `stopped 1 tracked process: web (pid <n>)`; the same curl then fails. A create refused as not
 #      allowed (403 mode_not_allowed: lease+processes is off, the default) is a SKIP. Needs `script`.
@@ -946,7 +947,8 @@ step9() {
   [[ "$RC" == 0 ]] || fail "sbx proc start: exit $RC: $(lastline "$LOGS/procs-start.err")" || return 1
   pid="$(sed -nE 's/^p[0-9]+ web pid ([0-9]+)$/\1/p' "$LOGS/procs-start.out" | tail -n 1)"
   [[ -n "$pid" ]] || fail "sbx proc start printed '$(lastline "$LOGS/procs-start.out")', not 'p<id> web pid <n>'" || return 1
-  # A later command reaches it: polled, since the server may still be binding (the gate waits 10 s).
+  # A later command reaches it: 10 tries, 1 s apart (each try up to 5 s), since the server may still
+  # be binding.
   for i in 1 2 3 4 5 6 7 8 9 10; do
     procs_reach procs-reach "$id"
     if listed procs-reach || ((i == 10)); then break; fi

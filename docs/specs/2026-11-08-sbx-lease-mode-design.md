@@ -423,8 +423,8 @@ port in the static client (`remote-worker/cmd/sbx/notice.go`):
 **As built (plan 5).**
 
 - **An `end` names the tracked processes it stopped:** the ones still running when the lease
-  ended. `processes` holds their display strings, `<name> (pid <n>)`, with an unnamed process
-  shown by its id, `p<id>` (ruling P5-R6). The new `LeaseEvent.tracked = 9` holds the same
+  ended, as the end's `sync` found them (§7, P5-R38). `processes` holds their display strings,
+  `<name> (pid <n>)`, with an unnamed process shown by its id, `p<id>` (ruling P5-R6). The new `LeaseEvent.tracked = 9` holds the same
   processes as `TrackedProcess` rows (§8.3). The `end` line adds `; stopped: <name> (pid <n>)` for
   each.
 - **A new state, `processes_stopped`,** reports a level 2→1 downgrade (§8.2) that stopped the
@@ -435,9 +435,12 @@ port in the static client (`remote-worker/cmd/sbx/notice.go`):
   When the `set_mode` call does the stop itself, its answer's `LeaseStatus.stopped` lists the
   processes, and no event is made (§8.2).
 - **`sandbox_info`** shows the full tracked table, exited entries included (P5-R16), one row per
-  process: `tracked processes:`, then `p<id> <name> (pid <n>): <state>, <age>, <memory> MiB`. With
-  none it shows `tracked processes: none`, and when the status call fails,
-  `tracked processes: unknown`.
+  process: `tracked processes (as of the last call):`, then
+  `p<id> <name> (pid <n>): <state>, <age>, <memory> MiB`, where an exited or killed row has no age
+  (it would count from the start). The rows are the worker's mirror (§7), so an exit since the
+  last call is not shown yet: a status sends nothing to the guest, which would touch the lease's
+  idle clock (P5-R38). With none it shows `tracked processes: none`, and when the status call
+  fails, `tracked processes: unknown`.
 
 ## 6. Admission and reclaim
 
@@ -552,7 +555,12 @@ New MCP tools, offered only when the mode is `lease+processes` (at other modes a
   characters of `[A-Za-z0-9._-]`. A name shaped like an id (`^p?[0-9]+$`) is refused, since an id
   wins in every lookup (P5-R8, P5-R33): the guest answers `process_name_invalid: <detail>`, and the
   clients refuse it with the same text before sending. A name held only by an exited entry can be
-  started again, and the new process replaces that entry.
+  started again, and the new process replaces that entry. Leading zeros name the same id (`p007`
+  is `7`). A refusal names an id as the rows do: `no tracked process p3`. `process_start` answers
+  `started p<id> <name> (pid <n>)`, or `started p<id> (pid <n>)` for an unnamed process. A process
+  call queues on the lease's one run gate behind a running command, and that wait counts against
+  its 60 s timeout, so a timeout says `timed out waiting for the sandbox (another command may still
+be running)`.
 - **The process is the command.** The guest runs `process_start`'s command as `bash -c CMD`. The
   host sends the process kinds unwrapped: its per-`Exec` template (`cd /workspace`, then `sync` at
   the end) wraps commands only (P5-R34). So the pid reported is the command's, an OOM kill reads
@@ -587,13 +595,22 @@ New MCP tools, offered only when the mode is `lease+processes` (at other modes a
   lease. Only `process_start` starts one.
 - **The worker keeps a mirror** of the guest's table, refreshed from every lease `End` and saved
   with the open lease. A worker restart's `worker_restart` end therefore lists the processes that
-  were running.
+  were running. Between calls the mirror does not change, so a status (`sandbox_info`,
+  `mocactl sbx get`) shows the table as of the last call.
 - **A level-2 lease's end syncs the guest first.** Tracked processes write to the workspace between
   Execs, and no command wrapper syncs those writes. So the end of a `lease+processes` lease, or of
   any lease with tracked processes, runs `sync` in the guest before the VM is destroyed, bounded
   by 30 s. With a vsock connect of up to 10 s, an end can wait about 40 s on a wedged guest. An
   `agent_dead` end syncs too, since it also covers the host's own deadline and an abort, where the
-  guest lives on. Only `teardown_failed` skips the sync (P5-R36).
+  guest lives on (P5-R36), and so does `memory_reclaim`: losing a tracked process's writes is worse
+  than a reclaim that waits on a wedged guest. `teardown_failed` skips the sync, and so does
+  `sandbox_deleted`, whose workspace is going away (P5-R39).
+- **The end's sync refreshes the end** (P5-R38). The sync's `End` carries the guest's whole table,
+  like every lease `End`. A process that exited since the last call is then dropped from the end's
+  stopped list (the pending event and its copy on disk, or, for a closed pool's detach, the open
+  record a `worker_restart` end is built from), and gets its `lease_process` exit line. An end a
+  client acknowledged meanwhile is not brought back. After a failed sync, and for the ends that do
+  not sync, the end lists what the mirror showed running.
 - **Audit.** The worker writes a `lease_process` line for each start, stop and exit (the
   workspace key, the mode, id, name, pid, state and code), and a lease end's line lists its tracked
   processes. A stop line may come before the exit line of the same process (P5-R18). The relay's
@@ -791,10 +808,11 @@ give them to an agent (§7). Results go to stdout, and notices and diagnostics t
 terminal. The sandbox ID is optional: without it, the sandbox the repository is bound to
 (`.sbx/sandbox.json`) is used, or it fails (P5-R31).
 
-- **`proc start [--name N] [--cwd D] [ID] -- CMD…`** prints `p<id> <name> pid <n>`, with the id as
-  the name of an unnamed process. CMD's words are quoted as `run` quotes them.
+- **`proc start [--name N] [--cwd D] [ID] -- CMD…`** prints `p<id> <name> pid <n>`, or
+  `p<id> pid <n>` for an unnamed process. CMD's words are quoted as `run` quotes them.
 - **`proc ls [ID] [--json]`** prints one row per process, exited ones included,
-  `p<id> <name> (pid <n>): <state>, <age>, <memory> MiB`, or `no tracked processes`. `--json`
+  `p<id> <name> (pid <n>): <state>, <age>, <memory> MiB` (no age on an exited or killed row), or
+  `no tracked processes`. `--json`
   prints the rows as JSON, with each `id` as the bare decimal string.
 - **`proc logs (NAME|ID) [--tail N] [ID]`** prints the process's last N lines (default 200) as
   they are.
@@ -803,7 +821,8 @@ terminal. The sandbox ID is optional: without it, the sandbox the repository is 
   claim: `sbx: processes not enabled for this sandbox; run: mocactl sbx mode <id> lease+processes`
   (P5-R32). The relay and the worker refuse it as well.
 - **`mocactl sbx get`** adds a `processes` row at `lease+processes`, or whenever the worker
-  reports processes: the full tracked table, one process per line.
+  reports processes: the full tracked table, one process per line, then `(as of the last call)`:
+  the worker's mirror, which a status does not refresh (§7, P5-R38).
 
 ### 8.3 New calls on `sandbox/v1` (additive)
 

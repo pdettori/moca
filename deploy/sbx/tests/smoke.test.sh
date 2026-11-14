@@ -257,7 +257,10 @@ proc)
     echo "p$n ${CREATE_NAME:-p$n} pid $((4200 + n))" ;;
   ls)
     [[ -s "$P" ]] || { echo 'no tracked processes'; exit 0; }
-    while read -r pi pn pp ps; do echo "p$pi $pn (pid $pp): $ps, 0s, 12.0 MiB"; done <"$P" ;;
+    # An exited row has no age, as processRow shows it.
+    while read -r pi pn pp ps; do
+      if [[ "$ps" == running ]]; then echo "p$pi $pn (pid $pp): $ps, 0s, 12.0 MiB"; else echo "p$pi $pn (pid $pp): $ps, 12.0 MiB"; fi
+    done <"$P" ;;
   *) echo "mock mocactl: unexpected: proc ${args[*]}" >&2; exit 99 ;;
   esac ;;
 token) live "${args[0]}"; echo "tok.$user.${args[0]}.$(($(now) + ${MOCK_TTL:-900}))" ;;
