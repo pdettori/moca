@@ -1208,3 +1208,84 @@ func TestDowngradeStopIsBoundedByTheGraceLimit(t *testing.T) {
 		t.Fatalf("pending = %+v, want the mode_change end listing web", ev)
 	}
 }
+
+// Task 11 fix round 1 (item 2, durability): an Exec's own wrapper syncs at its end, but a
+// tracked process writes between Execs, and process kinds are sent unwrapped (P5-R34), so
+// a level-2 lease's end syncs the guest before its VM is destroyed: every end whose guest
+// may still be alive, the closed pool's detach (worker_restart) included. A level-1 lease
+// needs none (nothing outlives an Exec's sync), nor does a guest the end found unfit.
+func TestLevel2LeaseEndSyncsBeforeDestroy(t *testing.T) {
+	started := time.Unix(1_700_000_000, 0)
+	for _, tc := range []struct {
+		name     string
+		level2   bool
+		end      func(t *testing.T, p *pool, lc *leaseLauncher, tab *fakeTable)
+		wantSync bool
+	}{
+		{"reset", true, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
+			if err := p.EndLease("k", LeaseEndReset); err != nil {
+				t.Fatalf("EndLease: %v", err)
+			}
+		}, true},
+		{"mode_change to per-exec", true, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
+			mustSetMode(t, p, "k", ModePerExec, 2)
+		}, true},
+		{"worker_restart (Close)", true, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
+			if err := p.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		}, true},
+		{"teardown_failed", true, func(t *testing.T, p *pool, lc *leaseLauncher, tab *fakeTable) {
+			lc.setRunFn(func(_ *fakeVM, c Command, _ Sink) (Result, error) {
+				return Result{TeardownFailed: true, Tracked: tab.get()}, nil
+			})
+			_, _ = p.Exec(t.Context(), "k", level2Exec("ls", 1), &capturingSink{})
+		}, false},
+		{"level 1 reset", false, func(t *testing.T, p *pool, _ *leaseLauncher, _ *fakeTable) {
+			if err := p.EndLease("k", LeaseEndReset); err != nil {
+				t.Fatalf("EndLease: %v", err)
+			}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, lc, _ := processPool(t)
+			tab := &fakeTable{}
+			reportTable(lc, tab)
+			if tc.level2 {
+				mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+				tab.set(running("1", "web", 412, started))
+				mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+			} else {
+				mustSetMode(t, p, "k", ModeLease, 1)
+				mustExec(t, p, "k", leaseExec("ls", 1))
+			}
+			vm := vmID(leaseAlive(t, p, "before the end").vm)
+			tc.end(t, p, lc, tab)
+
+			var syncAt, destroyAt = -1, -1
+			for i, ev := range lc.eventLog() {
+				switch ev {
+				case "sync " + vm:
+					syncAt = i
+				case "destroyed " + vm:
+					destroyAt = i
+				}
+			}
+			if destroyAt < 0 {
+				t.Fatalf("events %q: the lease VM was not destroyed", lc.eventLog())
+			}
+			if !tc.wantSync {
+				if syncAt >= 0 {
+					t.Fatalf("events %q: a sync step, want none", lc.eventLog())
+				}
+				return
+			}
+			if syncAt < 0 || syncAt > destroyAt {
+				t.Fatalf("events %q: want the sync step before the destroy", lc.eventLog())
+			}
+			if s := lc.syncCommands(); len(s) != 1 || !s[0].Lease || s[0].Kind != ExecKindCommand || s[0].TimeoutS == 0 {
+				t.Fatalf("sync steps %+v, want one bounded lease command", s)
+			}
+		})
+	}
+}

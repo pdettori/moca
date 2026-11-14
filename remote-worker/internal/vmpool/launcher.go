@@ -56,6 +56,20 @@ type Command struct {
 	ctxDone <-chan struct{}
 }
 
+// wrapForGuest is c as a launcher sends it to the guest: a command's Command in wrap, the
+// launcher's per-Exec template (wrapCommand, chvWrapCommand), and every other kind's
+// exactly as given (ruling P5-R34). The guest runs process_start's command as `bash -c CMD`
+// after the shim's fchdir into the requested cwd (spec §7: the process is the command); a
+// wrapper around it would make the reported pid the wrapper's, an OOM kill of the command
+// read exited(137) instead of killed(9), and the wrapper's `cd /workspace` override the
+// cwd. The list, logs, stop and stop-all kinds carry no command at all.
+func wrapForGuest(c Command, wrap func(string) string) Command {
+	if c.Kind == ExecKindCommand {
+		c.Command = wrap(c.Command)
+	}
+	return c
+}
+
 // Sink receives output as it is produced (spec §4.1). Never called concurrently,
 // and never after Run returns.
 type Sink interface {

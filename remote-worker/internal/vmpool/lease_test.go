@@ -34,6 +34,14 @@ type leaseLauncher struct {
 	// lease takes. normaliseFn, when set, answers it; otherwise it succeeds.
 	normalises  []Command
 	normaliseFn func(Command) (Result, error)
+	// syncs is every lease end's sync step (destroyLeaseVictim), recorded as "sync <id>".
+	syncs []Command
+}
+
+func (l *leaseLauncher) syncCommands() []Command {
+	l.rec.Lock()
+	defer l.rec.Unlock()
+	return slices.Clone(l.syncs)
 }
 
 func (l *leaseLauncher) normaliseCommands() []Command {
@@ -135,6 +143,16 @@ func (v *leaseFakeVM) Run(ctx context.Context, c Command, out Sink) (Result, err
 			c.ctxDone = ctx.Done()
 			return fn(c)
 		}
+		return Result{}, nil
+	}
+	if c.Kind == ExecKindCommand && c.Command == leaseEndSyncCommand {
+		// A lease end's sync step (destroyLeaseVictim), recorded as "sync <id>" rather
+		// than in cmds and "run <id>", as the normalise step is, so that a suite counting
+		// an Exec's Runs is not thrown by the step a level-2 lease's end takes.
+		v.l.rec.Lock()
+		v.l.syncs = append(v.l.syncs, c)
+		v.l.rec.Unlock()
+		v.l.record("sync " + v.id)
 		return Result{}, nil
 	}
 	v.l.rec.Lock()

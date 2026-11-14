@@ -102,6 +102,10 @@ type leaseVictim struct {
 	vm     VM
 	gate   chan struct{}
 	reason LeaseEndReason
+	// sync is set when the guest's page cache may hold workspace writes no Exec has synced:
+	// a level-2 lease, or one with tracked processes, whose guest may still be alive. The
+	// VM is then synced before it is destroyed (destroyLeaseVictim).
+	sync bool
 	// rp is set for a victim of the lease sweep, which pins the run until the VM is
 	// destroyed (destroySweptLeases): the sweep holds the gate but is no Exec, and an
 	// unpinned run with no lease would not be busy, so WorkspaceIdle or Reclaim could
@@ -263,7 +267,7 @@ func (p *pool) perExecUnderGate(rp *runPool) error {
 	err := p.markRootWroteLocked(rp)
 	p.mu.Unlock()
 	if v != nil {
-		p.destroyLeaseVM(v.key, v.vm)
+		p.destroyLeaseVictim(v)
 	}
 	return err
 }
@@ -404,7 +408,7 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 	stop := l != nil && rp.lease == l && l.stopTracked // not a lease ended above (per-exec served)
 	p.mu.Unlock()
 	if v != nil {
-		p.destroyLeaseVM(key, v.vm)
+		p.destroyLeaseVictim(v)
 	}
 	if closed {
 		return Result{}, ErrClosed
@@ -417,7 +421,7 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 		var sv *leaseVictim
 		notice, sv = p.stopTrackedUnderGate(rp, l)
 		if sv != nil {
-			p.destroyLeaseVM(key, sv.vm)
+			p.destroyLeaseVictim(sv)
 			p.mu.Lock()
 			closed, cut = p.closed, l.cut
 			p.mu.Unlock()
@@ -678,7 +682,7 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 		v := p.endLeaseLocked(rp, cut)
 		p.mu.Unlock()
 		t1 := p.clk.Now()
-		p.destroyLeaseVM(v.key, v.vm)
+		p.destroyLeaseVictim(v)
 		if ph != nil {
 			ph.Destroy = p.clk.Now().Sub(t1)
 		}
@@ -704,7 +708,7 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 		}
 		p.mu.Unlock()
 		if v != nil {
-			p.destroyLeaseVM(v.key, v.vm)
+			p.destroyLeaseVictim(v)
 		}
 		return Result{}, notRun
 	}
@@ -795,7 +799,7 @@ func (p *pool) runLease(ctx, runCtx context.Context, rp *runPool, vm VM, e Exec,
 
 	if v != nil {
 		t1 := p.clk.Now()
-		p.destroyLeaseVM(v.key, v.vm)
+		p.destroyLeaseVictim(v)
 		if ph != nil {
 			ph.Destroy = p.clk.Now().Sub(t1)
 		}
@@ -849,6 +853,9 @@ func (p *pool) endLeaseLocked(rp *runPool, reason LeaseEndReason) *leaseVictim {
 		return nil
 	}
 	v.reason = reason
+	if reason == LeaseEndAgentDead || reason == LeaseEndTeardownFailed {
+		v.sync = false // the guest is not fit to answer; the end does not wait on it
+	}
 	now := p.clk.Now()
 	age := now.Sub(l.started)
 	s := p.leaseStateLocked(rp)
@@ -887,7 +894,8 @@ func (p *pool) detachLeaseLocked(rp *runPool) *leaseVictim {
 	}
 	rp.lease = nil
 	close(l.gone)
-	return &leaseVictim{key: rp.key, vm: l.vm, gate: rp.execGate, reason: LeaseEndWorkerRestart}
+	return &leaseVictim{key: rp.key, vm: l.vm, gate: rp.execGate, reason: LeaseEndWorkerRestart,
+		sync: l.mode == ModeLeaseProcesses || len(l.tracked) > 0}
 }
 
 // endOrDetachLocked is endLeaseLocked, or detachLeaseLocked on a closed pool. Caller
@@ -899,11 +907,41 @@ func (p *pool) endOrDetachLocked(rp *runPool, reason LeaseEndReason) *leaseVicti
 	return p.endLeaseLocked(rp, reason)
 }
 
+// leaseEndSyncCommand is the command a level-2 lease's end runs before its VM is destroyed,
+// bounded by LeaseEndSyncTimeout.
+//
+// Why (Task 11 fix round 1): every command Exec's wrapper syncs at its end
+// (wrapCommand), which is what made a level-1 lease durable -- nothing outlives an Exec.
+// A tracked process does, and writes to the workspace between Execs, and the process
+// kinds are sent unwrapped (ruling P5-R34), so without this its writes since the last
+// Exec would die with the guest's page cache.
+const leaseEndSyncCommand = "sync"
+
+// LeaseEndSyncTimeout bounds a lease end's sync step. Past it the VM is destroyed anyway:
+// an end must not hang on a guest that cannot answer.
+const LeaseEndSyncTimeout = 30 * time.Second
+
+// destroyLeaseVictim is destroyLeaseVM for an ended (or detached) lease: a victim marked
+// sync has its guest synced first. A failed sync is logged; the destroy goes ahead.
+func (p *pool) destroyLeaseVictim(v *leaseVictim) error {
+	if v.sync {
+		ctx, cancel := context.WithTimeout(context.Background(), LeaseEndSyncTimeout)
+		res, err := v.vm.Run(ctx, Command{Command: leaseEndSyncCommand, Lease: true,
+			TimeoutS: uint32(LeaseEndSyncTimeout / time.Second), CapBytes: OutputCapBytes}, discardingSink{})
+		cancel()
+		if err != nil || res.ExitCode != 0 {
+			log.Printf("vmpool: lease end sync workspace_key=%q vm=%s: exit %d, %v; destroying it anyway",
+				v.key, vmID(v.vm), res.ExitCode, err)
+		}
+	}
+	return p.destroyLeaseVM(v.key, v.vm)
+}
+
 // destroyLeaseVictims destroys each victim's VM, then releases its gate: the order that
 // keeps a queued Exec from mounting the workspace while the old VM still holds it.
 func (p *pool) destroyLeaseVictims(vs []*leaseVictim) {
 	for _, v := range vs {
-		p.destroyLeaseVM(v.key, v.vm)
+		p.destroyLeaseVictim(v)
 		<-v.gate
 	}
 }
@@ -924,7 +962,7 @@ func (p *pool) destroyLeaseVM(key string, vm VM) error {
 // the pin the sweep took, once the gate is released.
 func (p *pool) destroySweptLeases(vs []*leaseVictim) {
 	for _, v := range vs {
-		p.destroyLeaseVM(v.key, v.vm)
+		p.destroyLeaseVictim(v)
 		<-v.gate
 		p.unpin(v.rp)
 	}

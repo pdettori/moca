@@ -1032,7 +1032,7 @@ func (p *pool) Close() error {
 		}
 	}
 	for _, v := range leases {
-		if err := p.destroyLeaseVM(v.key, v.vm); err != nil && firstErr == nil {
+		if err := p.destroyLeaseVictim(v); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		<-v.gate
