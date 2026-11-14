@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -605,4 +608,241 @@ func TestTrackedMaxRunningZeroMeansTheDefault(t *testing.T) {
 	if err == nil || err.Error() != "process_limit: 4 running (SH_LEASE_MAX_PROCESSES)" {
 		t.Fatalf("fifth start err = %v, want process_limit: 4 running (SH_LEASE_MAX_PROCESSES)", err)
 	}
+}
+
+// Ruling P5-R8: a name is 1-64 chars of [A-Za-z0-9._-]; empty means unnamed. A long
+// name is described, not echoed, so the refusal always fits one frame.
+func TestProcessNameRules(t *testing.T) {
+	for _, ok := range []string{"", "web", "a", "dev-server_2.1", strings.Repeat("x", 64), "123"} {
+		if err := validateProcessName(ok); err != nil {
+			t.Errorf("validateProcessName(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{strings.Repeat("x", 65), "a b", "a/b", "../x", "név", "a\nb", "$(id)", strings.Repeat("y", 1<<20)} {
+		err := validateProcessName(bad)
+		if err == nil || !strings.HasPrefix(err.Error(), "process_name_invalid: ") {
+			t.Errorf("validateProcessName(%.20q) = %v, want process_name_invalid:", bad, err)
+			continue
+		}
+		if len(err.Error()) > 200 {
+			t.Errorf("refusal of a %d-byte name is %d bytes: it must not echo the name", len(bad), len(err.Error()))
+		}
+	}
+}
+
+// Ruling P5-R6: an unknown kind is refused with lease_unsupported and never runs as a
+// command; a process kind is a lease request or nothing.
+func TestRequestKindRules(t *testing.T) {
+	for _, req := range []Request{
+		{}, {Kind: RequestKindCommand}, {Lease: true}, {Lease: true, Kind: RequestKindCommand},
+		{Lease: true, Kind: RequestKindProcessStart}, {Lease: true, Kind: RequestKindProcessList},
+		{Lease: true, Kind: RequestKindProcessLogs}, {Lease: true, Kind: RequestKindProcessStop},
+		{Lease: true, Kind: RequestKindProcessStopAll},
+	} {
+		if err := checkRequestKind(req); err != nil {
+			t.Errorf("checkRequestKind(%+v) = %v, want nil", req, err)
+		}
+	}
+	for _, tc := range []struct {
+		req  Request
+		want string
+	}{
+		{Request{Kind: "bogus"}, "lease_unsupported: unknown kind bogus"},
+		{Request{Lease: true, Kind: "bogus"}, "lease_unsupported: unknown kind bogus"},
+		{Request{Lease: true, Kind: "Command"}, "lease_unsupported: unknown kind Command"},
+		{Request{Kind: RequestKindProcessStart}, "lease_unsupported: process_start needs a lease request"},
+		{Request{Kind: RequestKindProcessStopAll}, "lease_unsupported: process_stop_all needs a lease request"},
+	} {
+		if err := checkRequestKind(tc.req); err == nil || err.Error() != tc.want {
+			t.Errorf("checkRequestKind(%+v) = %v, want %q", tc.req, err, tc.want)
+		}
+	}
+	long := strings.Repeat("k", MaxFrame)
+	if err := checkRequestKind(Request{Lease: true, Kind: long}); err == nil || len(err.Error()) > 200 ||
+		!strings.HasPrefix(err.Error(), "lease_unsupported: unknown kind kkk") {
+		t.Errorf("a %d-byte kind: %.80v; want a clipped lease_unsupported refusal", len(long), err)
+	}
+}
+
+func TestDisplayNameFallsBackToTheID(t *testing.T) {
+	if got := displayName(TrackedProcess{ID: "3"}); got != "p3" {
+		t.Errorf("unnamed: %q, want p3", got)
+	}
+	if got := displayName(TrackedProcess{ID: "3", Name: "web"}); got != "web" {
+		t.Errorf("named: %q, want web", got)
+	}
+}
+
+// The cwd must resolve inside the workspace, symlinks included; relative is relative
+// to the workspace, and empty is the workspace itself. The result is symlink-free.
+func TestResolveProcessCwd(t *testing.T) {
+	work := t.TempDir()
+	outside := t.TempDir()
+	realWork, err := filepath.EvalSymlinks(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"sub", "sub/deep"} {
+		if err := os.Mkdir(filepath.Join(work, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(work, "file"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{"in": "sub", "esc": outside, "up": "..", "dangling": "nope"} {
+		if err := os.Symlink(target, filepath.Join(work, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for cwd, want := range map[string]string{
+		"":                                realWork,
+		work:                              realWork,
+		"sub":                             filepath.Join(realWork, "sub"),
+		"sub/deep/..":                     filepath.Join(realWork, "sub"),
+		filepath.Join(work, "sub/deep"):   filepath.Join(realWork, "sub/deep"),
+		"in":                              filepath.Join(realWork, "sub"),
+		filepath.Join(work, "in", "deep"): filepath.Join(realWork, "sub/deep"),
+	} {
+		got, err := resolveProcessCwd(work, cwd)
+		if err != nil || got != want {
+			t.Errorf("resolveProcessCwd(%q) = %q, %v; want %q", cwd, got, err, want)
+		}
+	}
+	for _, cwd := range []string{
+		"/", outside, filepath.Dir(work), "..", "sub/../..", "esc", "up", "dangling", "nope", "file",
+		filepath.Join(work, "esc"), work + "x",
+	} {
+		got, err := resolveProcessCwd(work, cwd)
+		if err == nil || !strings.HasPrefix(err.Error(), "process_cwd: ") {
+			t.Errorf("resolveProcessCwd(%q) = %q, %v; want a process_cwd: refusal", cwd, got, err)
+		}
+	}
+}
+
+// writeCgroupEvents fakes a cgroup directory's cgroup.events.
+func writeCgroupEvents(t *testing.T, dir string, populated bool) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	v := "0"
+	if populated {
+		v = "1"
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte("populated "+v+"\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCgroupPopulated(t *testing.T) {
+	dir := t.TempDir()
+	if p, err := cgroupPopulated(filepath.Join(dir, "gone")); p || err != nil {
+		t.Errorf("a removed cgroup: %v, %v; want false, nil", p, err)
+	}
+	writeCgroupEvents(t, filepath.Join(dir, "a"), true)
+	writeCgroupEvents(t, filepath.Join(dir, "b"), false)
+	if p, err := cgroupPopulated(filepath.Join(dir, "a")); !p || err != nil {
+		t.Errorf("populated 1: %v, %v", p, err)
+	}
+	if p, err := cgroupPopulated(filepath.Join(dir, "b")); p || err != nil {
+		t.Errorf("populated 0: %v, %v", p, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a", "cgroup.events"), []byte("frozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cgroupPopulated(filepath.Join(dir, "a")); err == nil {
+		t.Error("cgroup.events without a populated line: want an error")
+	}
+}
+
+// Ruling P5-R9: populated is answered from the cgroup of every uid ever handed out, not
+// from the table; an unreadable cgroup counts as populated (fail closed), a removed one
+// as empty, and a uid's record moves to its new cgroup only once the old one is empty.
+func TestTrackedCgroupsAnswerPopulatedPerUID(t *testing.T) {
+	dir := t.TempDir()
+	var c trackedCgroups
+	if c.populated(20000) {
+		t.Error("a uid never handed out reports populated")
+	}
+	p1 := filepath.Join(dir, "p1")
+	writeCgroupEvents(t, p1, true)
+	c.assign(20000, p1)
+	if !c.populated(20000) {
+		t.Error("uid 20000's cgroup is populated, but populated says no")
+	}
+	writeCgroupEvents(t, p1, false)
+	if c.populated(20000) {
+		t.Error("uid 20000's cgroup emptied, but populated says yes")
+	}
+	if err := os.WriteFile(filepath.Join(p1, "cgroup.events"), []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !c.populated(20000) {
+		t.Error("an unreadable cgroup.events must count as populated")
+	}
+	writeCgroupEvents(t, p1, false)
+	// A fake cgroup dir holds a regular file, so the old dir's rmdir fails here; the
+	// record moves regardless (take saw it empty, and nothing can enter it again).
+	p5 := filepath.Join(dir, "p5")
+	writeCgroupEvents(t, p5, true)
+	c.assign(20000, p5)
+	if !c.populated(20000) {
+		t.Error("after reassigning uid 20000 to p5, its populated cgroup is not seen")
+	}
+	c.assign(20001, filepath.Join(dir, "p6"))
+	got := c.paths()
+	slices.Sort(got)
+	if want := []string{p5, filepath.Join(dir, "p6")}; !slices.Equal(got, want) {
+		t.Errorf("paths = %q, want %q", got, want)
+	}
+}
+
+func TestTrackedExitSignals(t *testing.T) {
+	var s exitSignals
+	ch := s.add("1")
+	select {
+	case <-ch:
+		t.Fatal("fired before the exit")
+	default:
+	}
+	s.fire("1")
+	s.fire("1") // a second report is harmless
+	s.fire("9") // so is an unknown id
+	select {
+	case <-ch:
+	default:
+		t.Fatal("not fired after the exit")
+	}
+	if s.get("1") != ch || s.get("2") != nil {
+		t.Error("get returns the wrong channel")
+	}
+	s.add("2")
+	s.retain(map[string]bool{"2": true})
+	if s.get("1") != nil || s.get("2") == nil {
+		t.Error("retain kept the wrong ids")
+	}
+}
+
+func TestTrackedCgroupsAndExitSignalsUnderRace(t *testing.T) {
+	dir := t.TempDir()
+	var c trackedCgroups
+	var s exitSignals
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprint(i)
+			p := filepath.Join(dir, id)
+			writeCgroupEvents(t, p, i%2 == 0)
+			c.assign(20000+i%4, p)
+			_ = c.populated(20000 + i%4)
+			_ = c.paths()
+			s.add(id)
+			s.fire(id)
+			_ = s.get(id)
+		}()
+	}
+	wg.Wait()
 }

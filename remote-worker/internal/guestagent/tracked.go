@@ -2,8 +2,14 @@ package guestagent
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -366,3 +372,215 @@ func (a *uidAllocator) release(uid int) {
 // user is the passwd name of a tracked uid, sbxp<n> for base+n, as the image's passwd
 // lines name them (global constraints).
 func (a *uidAllocator) user(uid int) string { return "sbxp" + strconv.Itoa(uid-a.base) }
+
+// processNameRE is ruling P5-R8's name rule: 1-64 characters of [A-Za-z0-9._-]. It
+// bounds the End frame and keeps a name safe in logs and in `<name> (pid <n>)`.
+var processNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// validateProcessName refuses a name outside ruling P5-R8 with process_name_invalid. An
+// empty name is an unnamed process, which is allowed. A name too long is described, not
+// echoed, so the refusal always fits one frame.
+func validateProcessName(name string) error {
+	if name == "" || processNameRE.MatchString(name) {
+		return nil
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("process_name_invalid: a name of %d bytes: want 1-64 characters of [A-Za-z0-9._-]", len(name))
+	}
+	return fmt.Errorf("process_name_invalid: %q: want 1-64 characters of [A-Za-z0-9._-]", name)
+}
+
+// clip shortens s for an error message, which must fit one frame (MaxFrame).
+func clip(s string) string {
+	const n = 64
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
+// checkRequestKind is ruling P5-R6's kind rule, applied before anything runs: an unset
+// kind or `command` is a command, a process kind needs a lease request, and any other
+// kind is refused, never run as a command. An older agent ignored the field and ran the
+// command, which is why the host sends a process kind only to a snapshot that
+// advertises lease-processes-v1.
+func checkRequestKind(req Request) error {
+	switch req.Kind {
+	case "", RequestKindCommand:
+		return nil
+	case RequestKindProcessStart, RequestKindProcessList, RequestKindProcessLogs,
+		RequestKindProcessStop, RequestKindProcessStopAll:
+		if !req.Lease {
+			return fmt.Errorf("lease_unsupported: %s needs a lease request", req.Kind)
+		}
+		return nil
+	}
+	return fmt.Errorf("lease_unsupported: unknown kind %s", clip(req.Kind))
+}
+
+// displayName is how a tracked process is shown (ruling P5-R6): its name, or p<id> when
+// it has none. The table keeps an unnamed process's name empty, so it never clashes.
+func displayName(p TrackedProcess) string {
+	if p.Name == "" {
+		return "p" + p.ID
+	}
+	return p.Name
+}
+
+// resolveProcessCwd is process_start's cwd: the workspace when cwd is empty, relative
+// paths taken from the workspace. It resolves every symlink and refuses, with
+// process_cwd, anything that does not then lie inside the workspace or is not a
+// directory. The result is symlink-free. This is the tool's contract, not a boundary:
+// the process runs unprivileged and may cd anywhere its uid can reach.
+func resolveProcessCwd(workDir, cwd string) (string, error) {
+	root, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		return "", fmt.Errorf("process_cwd: the workspace: %v", err)
+	}
+	p := cwd
+	switch {
+	case p == "":
+		p = workDir
+	case !filepath.IsAbs(p):
+		p = filepath.Join(workDir, p)
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("process_cwd: %s: no such directory", clip(cwd))
+		}
+		return "", fmt.Errorf("process_cwd: %s: %v", clip(cwd), err)
+	}
+	if real != root && !strings.HasPrefix(real, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("process_cwd: %s: outside the workspace", clip(cwd))
+	}
+	fi, err := os.Stat(real)
+	if err != nil {
+		return "", fmt.Errorf("process_cwd: %s: %v", clip(cwd), err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("process_cwd: %s: not a directory", clip(cwd))
+	}
+	return real, nil
+}
+
+// cgroupPopulated reads a cgroup's cgroup.events. A cgroup that no longer exists is
+// empty; a file without a populated line is an error.
+func cgroupPopulated(path string) (bool, error) {
+	ev, err := os.ReadFile(filepath.Join(path, "cgroup.events"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for line := range bytes.Lines(ev) {
+		switch string(bytes.TrimSpace(line)) {
+		case "populated 0":
+			return false, nil
+		case "populated 1":
+			return true, nil
+		}
+	}
+	return false, fmt.Errorf("%s/cgroup.events: no populated line", path)
+}
+
+// trackedCgroups is ruling P5-R9's map: for every tracked uid ever handed out, the
+// cgroup of the last process that ran under it. It is independent of the trackedTable,
+// which forgets entries (eviction, name replacement) whose cgroups may still hold
+// children, so the uidAllocator's populated is answered from here. Its lock is its own:
+// populated runs under the allocator's lock, so nothing here may call the allocator.
+type trackedCgroups struct {
+	mu    sync.Mutex
+	byUID map[int]string
+}
+
+// populated reports whether uid's cgroup still holds a process. A cgroup that cannot be
+// read counts as populated: the uid is then not reused, which is the safe side.
+func (c *trackedCgroups) populated(uid int) bool {
+	c.mu.Lock()
+	path, ok := c.byUID[uid]
+	c.mu.Unlock()
+	if !ok {
+		return false
+	}
+	p, err := cgroupPopulated(path)
+	return p || err != nil
+}
+
+// assign records path as uid's cgroup. The uid's previous cgroup was empty when take
+// handed the uid out, and nothing enters a tracked cgroup but its own process at clone
+// time, so it is removed and forgotten (a failed rmdir leaves an empty directory).
+func (c *trackedCgroups) assign(uid int, path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byUID == nil {
+		c.byUID = map[int]string{}
+	}
+	if old, ok := c.byUID[uid]; ok && old != path {
+		_ = os.Remove(old)
+	}
+	c.byUID[uid] = path
+}
+
+// paths returns every recorded cgroup, one per uid ever handed out; some may be gone.
+func (c *trackedCgroups) paths() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.byUID))
+	for _, p := range c.byUID {
+		out = append(out, p)
+	}
+	return out
+}
+
+// exitSignals holds, per tracked id, a channel closed once its process has been reaped,
+// so process_stop can wait for the exit status the reaper records.
+type exitSignals struct {
+	mu sync.Mutex
+	ch map[string]chan struct{}
+}
+
+func (s *exitSignals) add(id string) chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ch == nil {
+		s.ch = map[string]chan struct{}{}
+	}
+	ch := make(chan struct{})
+	s.ch[id] = ch
+	return ch
+}
+
+// fire closes id's channel; a second call, or an unknown id, does nothing.
+func (s *exitSignals) fire(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.ch[id]
+	if !ok {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
+// get returns id's channel, or nil.
+func (s *exitSignals) get(id string) chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ch[id]
+}
+
+// retain forgets every id not in keep.
+func (s *exitSignals) retain(keep map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.ch {
+		if !keep[id] {
+			delete(s.ch, id)
+		}
+	}
+}

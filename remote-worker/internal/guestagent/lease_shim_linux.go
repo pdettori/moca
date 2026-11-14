@@ -20,6 +20,11 @@ import (
 // ShimArg is the argv[1] that makes the guest-agent binary act as the lease shim.
 const ShimArg = "lease-shim"
 
+// ShimExecBarrierFD is the descriptor the shim marks close-on-exec just before it execs
+// the command, so a starter that passed a pipe's write end there learns that the exec
+// has happened (or that the shim died) from EOF on the read end.
+const ShimExecBarrierFD = 3
+
 // ShimMain is the lease shim: it turns the root process it starts as into the
 // unprivileged exec identity, then execs the Exec's argv. In lease mode one VM serves
 // many Execs, so an Exec must not be able to defeat its own teardown (escape its cgroup,
@@ -106,7 +111,49 @@ func ShimMain(args []string) {
 	if err != nil {
 		shimFail("lookpath", err)
 	}
+	// An ignored disposition survives fork and execve, so a command started by a
+	// parent that ignores a signal would ignore it too, and process_stop's TERM (or an
+	// Exec's kill -INT) would do nothing. Go keeps an inherited SIG_IGN for HUP and INT
+	// rather than handle them; execve resets only handled signals. Last before the
+	// exec: a signal arriving after it takes its default action, as in the command.
+	if err := resetIgnoredSignals(); err != nil {
+		shimFail("signals", err)
+	}
+	// fd 3, when the starter passes one, is its exec barrier (process_start): close-on-
+	// exec, so the starter's read end sees EOF once the command has replaced the shim,
+	// or the shim has exited. Never inherited by the command either way.
+	syscall.CloseOnExec(ShimExecBarrierFD)
 	shimFail("exec", syscall.Exec(path, sa.argv, shimEnv(os.Environ(), sa.home, sa.user)))
+}
+
+// kernelSigaction is the kernel's struct sigaction on amd64 and arm64, both of which
+// have sa_restorer (as Go's runtime sigactiont).
+type kernelSigaction struct {
+	handler, flags, restorer uintptr
+	mask                     uint64
+}
+
+// resetIgnoredSignals sets every signal this process inherited as ignored (SIG_IGN) to
+// its default action (SIG_DFL). Handled signals are left alone: execve resets them.
+func resetIgnoredSignals() error {
+	const sigIgn = 1
+	for sig := uintptr(1); sig <= 64; sig++ {
+		if sig == uintptr(unix.SIGKILL) || sig == uintptr(unix.SIGSTOP) {
+			continue
+		}
+		var old kernelSigaction
+		if _, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGACTION, sig, 0, uintptr(unsafe.Pointer(&old)), 8, 0, 0); errno != 0 {
+			return fmt.Errorf("rt_sigaction %d: %w", sig, errno)
+		}
+		if old.handler != sigIgn {
+			continue
+		}
+		var dfl kernelSigaction // SIG_DFL is 0
+		if _, _, errno := unix.RawSyscall6(unix.SYS_RT_SIGACTION, sig, uintptr(unsafe.Pointer(&dfl)), 0, 8, 0, 0); errno != 0 {
+			return fmt.Errorf("rt_sigaction %d: %w", sig, errno)
+		}
+	}
+	return nil
 }
 
 func shimFail(step string, err error) {

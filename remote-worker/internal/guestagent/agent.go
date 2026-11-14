@@ -294,6 +294,12 @@ func (a *Agent) ServeConn(rw io.ReadWriteCloser) error {
 		return WriteFrame(rw, KindError, []byte(msg))
 	}
 
+	// Before any dispatch: a kind this agent does not serve must never run as a command
+	// (ruling P5-R6).
+	if err := checkRequestKind(req); err != nil {
+		return WriteFrame(rw, KindError, []byte(err.Error()))
+	}
+
 	capBytes := req.CapBytes
 	if capBytes <= 0 {
 		capBytes = MaxFrame
@@ -302,6 +308,7 @@ func (a *Agent) ServeConn(rw io.ReadWriteCloser) error {
 
 	var end End
 	if req.Lease {
+		// Every lease kind, the process kinds included (lease_linux.go).
 		end, err = a.runLease(req, stdin, w, rw)
 	} else if a.leaseOn.Load() {
 		// The latch. A per-Exec request runs as root on the parked shell, which a lease

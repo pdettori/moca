@@ -35,15 +35,18 @@ const leaseTeardownBound = 5 * time.Second
 // r is an atomic rather than under mu so that Close can stop the reaper while an Exec
 // is still running, instead of blocking until it ends.
 //
-// procs and uids are level 2's: the tracked processes, which outlive the Exec that
-// started them, and the uids they run as (tracked.go).
+// procs, uids, cgroups and exits are level 2's: the tracked processes, which outlive
+// the Exec that started them, the uids they run as, the cgroup of every uid ever handed
+// out, and their exit notifications (tracked.go, tracked_linux.go).
 type leaseRuntime struct {
-	mu    sync.Mutex
-	once  sync.Once
-	r     atomic.Pointer[reaper]
-	seq   uint64
-	procs trackedTable
-	uids  *uidAllocator
+	mu      sync.Mutex
+	once    sync.Once
+	r       atomic.Pointer[reaper]
+	seq     uint64
+	procs   trackedTable
+	uids    *uidAllocator
+	cgroups trackedCgroups
+	exits   exitSignals
 }
 
 // leasePrepare readies the guest for lease mode. NewAgent calls it when CgroupRoot is
@@ -195,19 +198,10 @@ func (a *Agent) stopLease() {
 	}
 }
 
-// runLease runs one lease Exec. Unlike the per-Exec paths, nothing survives it: the
-// command runs as the exec user in a cgroup of its own, and that cgroup is killed and
-// emptied BEFORE End goes out, so a background job cannot outlive its Exec into the
-// next one, and End does not wait on a background job that holds stdout open.
-//
-// Each Exec is a fresh `bash -c` through the shim, never the parked shell: one VM now
-// serves many Execs, so a shell's variables, cwd, aliases and functions would leak
-// from one to the next.
-//
-// conn is the request's connection, already drained of stdin. The host sends nothing
-// more on it, so a read that returns at all means the host closed it: that is how the
-// host aborts an Exec (vmpool's closeConn on ctx.Done), and the Exec is torn down as
-// on a timeout (spec §3.1: killed when it "exits, times out or is aborted").
+// runLease serves one lease request: under the lease mutex, it takes the lease's
+// one-time steps and the workspace normalisation if asked, then runs the request's kind:
+// a command (runLeaseCommand) or a tracked-process kind (tracked_linux.go). Every End it
+// returns carries the tracked-process table, so the host's mirror of it is never stale.
 func (a *Agent) runLease(req Request, stdin []byte, w *frameWriter, conn io.Reader) (End, error) {
 	lo := a.opts.Lease
 	if lo.CgroupRoot == "" {
@@ -248,6 +242,54 @@ func (a *Agent) runLease(req Request, stdin []byte, w *frameWriter, conn io.Read
 	a.leaseOn.Store(true)
 	l.once.Do(func() { l.r.Store(startReaper()) })
 	r := l.r.Load()
+
+	var end End
+	var err error
+	switch req.Kind {
+	case "", RequestKindCommand:
+		end, err = a.runLeaseCommand(req, stdin, w, conn, r, shim)
+	case RequestKindProcessStart:
+		end, err = a.processStart(req, w, r, shim)
+	case RequestKindProcessList:
+		end, err = a.processList(w)
+	case RequestKindProcessLogs:
+		end, err = a.processLogs(req, w)
+	case RequestKindProcessStop:
+		end, err = a.processStop(req, w)
+	case RequestKindProcessStopAll:
+		end, err = a.processStopAll(w)
+	default:
+		// ServeConn refuses an unknown kind first; this is the same rule, kept here so
+		// no path can run one as a command (ruling P5-R6).
+		return End{}, fmt.Errorf("lease_unsupported: unknown kind %s", clip(req.Kind))
+	}
+	if err != nil {
+		return End{}, err
+	}
+	a.pruneTracked()
+	end.Tracked = a.trackedView()
+	return end, nil
+}
+
+// runLeaseCommand runs one lease Exec. Unlike the per-Exec paths, nothing survives it: the
+// command runs as the exec user in a cgroup of its own, and that cgroup is killed and
+// emptied BEFORE End goes out, so a background job cannot outlive its Exec into the
+// next one, and End does not wait on a background job that holds stdout open.
+//
+// Each Exec is a fresh `bash -c` through the shim, never the parked shell: one VM now
+// serves many Execs, so a shell's variables, cwd, aliases and functions would leak
+// from one to the next.
+//
+// conn is the request's connection, already drained of stdin. The host sends nothing
+// more on it, so a read that returns at all means the host closed it: that is how the
+// host aborts an Exec (vmpool's closeConn on ctx.Done), and the Exec is torn down as
+// on a timeout (spec §3.1: killed when it "exits, times out or is aborted").
+//
+// The kill is of this Exec's e<seq> only: a tracked process lives in tracked/p<id>,
+// which no Exec's teardown touches (spec §3.1). runLease holds the lease mutex.
+func (a *Agent) runLeaseCommand(req Request, stdin []byte, w *frameWriter, conn io.Reader, r *reaper, shim string) (End, error) {
+	lo := a.opts.Lease
+	l := &a.lease
 	l.seq++
 
 	c, err := newExecCgroup(lo.CgroupRoot, l.seq)
@@ -348,17 +390,11 @@ func (a *Agent) runLease(req Request, stdin []byte, w *frameWriter, conn io.Read
 		_ = stdinW.Close()
 		wg.Wait()
 		_ = c.dir.Close()
-		msg := "guest-agent: lease teardown failed: " + terr.Error() + "; this agent is dead"
-		a.deadMsg.Store(&msg)
-		a.dead.Store(true)
-		// Always an End, never a KindError, so the host can tell teardown_failed apart
-		// from any other guest error (spec §3.1). A timed-out or aborted command has no
-		// exit code of its own: -1.
+		// A timed-out or aborted command has no exit code of its own: -1.
 		if timedOut || aborted {
 			end.ExitCode = -1
 		}
-		end.TeardownFailed = true
-		return end, nil
+		return a.teardownFailed(end, terr), nil
 	}
 	// Every writer is dead, so both drains reach EOF.
 	wg.Wait()
@@ -386,6 +422,18 @@ func (a *Agent) runLease(req Request, stdin []byte, w *frameWriter, conn io.Read
 		return End{}, errors.New(TimeoutMessage(req.TimeoutS))
 	}
 	return end, nil
+}
+
+// teardownFailed marks the agent dead after a cgroup that would not empty, and returns
+// end with TeardownFailed set. Always an End, never a KindError, so the host can tell
+// teardown_failed apart from any other guest error (spec §3.1): the guest is no longer
+// known to be clean.
+func (a *Agent) teardownFailed(end End, err error) End {
+	msg := "guest-agent: lease teardown failed: " + err.Error() + "; this agent is dead"
+	a.deadMsg.Store(&msg)
+	a.dead.Store(true)
+	end.TeardownFailed = true
+	return end
 }
 
 // waitCgroupEmpty polls cgroup.events until it reports `populated 0`, or fails after
@@ -432,7 +480,8 @@ func drainPipe(f *os.File, emit func([]byte)) {
 	}
 }
 
-// execCgroup is one Exec's cgroup, CgroupRoot/e<seq>. The tree is never delegated: it
+// execCgroup is one Exec's cgroup, CgroupRoot/e<seq>, or a tracked process's,
+// CgroupRoot/tracked/p<id> (tracked_linux.go). The tree is never delegated: it
 // is root-owned, so the exec uid can neither move itself out nor create cgroups. Its
 // memory.max and pids.max (lease_caps.go) are written before anything runs in it; an
 // Exec whose caps cannot be written is refused, never run uncapped.
@@ -442,11 +491,17 @@ type execCgroup struct {
 }
 
 func newExecCgroup(root string, seq uint64) (*execCgroup, error) {
+	return newCappedCgroup(filepath.Join(root, "e"+strconv.FormatUint(seq, 10)))
+}
+
+// newCappedCgroup creates the cgroup at path with an Exec's caps, written before
+// anything runs in it, and opens it for CLONE_INTO_CGROUP. A tracked process's
+// tracked/p<id> is made the same way.
+func newCappedCgroup(path string) (*execCgroup, error) {
 	memMax, err := execMemoryMax()
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(root, "e"+strconv.FormatUint(seq, 10))
 	if err := os.Mkdir(path, 0o755); err != nil {
 		return nil, fmt.Errorf("guest-agent: lease: cgroup: %w", err)
 	}
