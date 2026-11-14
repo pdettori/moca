@@ -236,8 +236,9 @@ func (p *pool) stopTrackedWaiting(key string) (stopped []TrackedProcess, err err
 // returns. At LeaseGraceLimit it cuts the lease with cut instead, and returns once the
 // lease is gone -- if owed(rp), checked under p.mu, still holds there; if not, the
 // caller's work was done under someone else's gate, and it returns without cutting. A
-// starting wait whose lease is not installed yet still cuts it once it is (owed is not
-// asked then). target is the lease live at the call, nil only when starting.
+// starting wait whose lease is not installed at the grace point cuts nothing (owed is not
+// asked), and the wait is the starting Exec's. target is the lease live at the call, nil
+// only when starting.
 func (p *pool) waitLeaseGate(key string, cut LeaseEndReason, starting bool, owed func(*runPool) bool,
 	onGate func(rp *runPool, target *vmLease)) error {
 	p.mu.Lock()
