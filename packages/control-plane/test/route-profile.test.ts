@@ -47,6 +47,8 @@ const SHARED = [
   'POST /v1/hosts/{host}/builds/{build}/report',
   'GET /v1/hosts/{host}/wanted',
   'POST /v1/hosts/{host}/workers/report',
+  // The egress proxy's events into sandboxes' logs.
+  'POST /v1/hosts/{host}/egress',
 ];
 
 const servers: Server[] = [];
@@ -66,6 +68,7 @@ const SANDBOX_ONLY = [
   'createSandbox',
   'deleteSandbox',
   'getSandbox',
+  'getSandboxEgress',
   'janitorSandboxes',
   'listSandboxes',
   'lookupEgressCredential',
@@ -144,6 +147,25 @@ describe('route profiles (SBX0 §4.1)', () => {
     expect(matchRoute('POST', '/v1/sessions', 'sandbox')).toBeNull();
     expect(matchRoute('GET', '/v1/me', 'sandbox')?.route.operationId).toBe('getMe');
     expect(matchRoute('POST', '/v1/sessions')?.route.operationId).toBe('createSession'); // default: harness
+  });
+
+  it('mounts on combined exactly the union of the two profiles, and lists combined on no route', () => {
+    // Combined control plane spec §3.1: one process, both route sets; no route names `combined`.
+    expect(ROUTES.filter((r) => r.profiles.includes('combined')).map(key)).toEqual([]);
+    const on = (p: 'harness' | 'sandbox' | 'combined', egress: boolean) =>
+      ROUTES.filter((r) => matchRoute(r.method, concrete(r.path), p, { egress, testUsers: true }))
+        .map(key)
+        .sort();
+    for (const egress of [false, true]) {
+      const union = [...new Set([...on('harness', egress), ...on('sandbox', egress)])].sort();
+      expect(on('combined', egress)).toEqual(union);
+    }
+    expect(matchRoute('POST', '/v1/sessions', 'combined')?.route.operationId).toBe('createSession');
+    expect(matchRoute('POST', '/v1/sandboxes', 'combined')?.route.operationId).toBe(
+      'createSandbox',
+    );
+    // As on sandbox, the egress-only route needs egress configured.
+    expect(matchRoute('POST', '/v1/egress/credential', 'combined')).toBeNull();
   });
 
   it('answers every harness-only route with the unknown-path 404 under the sandbox profile', async () => {

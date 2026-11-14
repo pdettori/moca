@@ -194,7 +194,8 @@ The control-plane routes are listed in [`docs/api/openapi.yaml`](../api/openapi.
 | Template admin | `POST /v1/templates/{id}/tags`, `DELETE /v1/templates/{id}/tags/{tag}`, `PATCH /v1/templates/{id}` (the owner, or an admin), `PUT /v1/templates/{id}/owner` (an admin): both route profiles (API 1.8.0) |
 | Host agents    | `POST /v1/hosts/{host}/inventory`, `/builds/claim`, `/builds/{build}/log` and `/report`, `GET /v1/hosts/{host}/blobs/{digest}`: a host's own bearer, both route profiles (API 1.10.0)                   |
 | Activation     | `POST /v1/templates/{id}/activate` and `/deactivate` (both route profiles); `GET /v1/hosts/{host}/wanted`, `POST /v1/hosts/{host}/workers/report` (a host's own bearer) (API 1.11.0)                    |
-| Retire         | `POST /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`: both route profiles (API 1.12.0)                                                                                          |
+| Egress records | `GET /v1/sandboxes/{id}/egress` (the owner or an admin; sandbox profile); `POST /v1/hosts/{host}/egress` (a host's own bearer) (API 1.14.0)                                                             |
+| Retire         | `POST /v1/templates/{id}/retire`, `DELETE /v1/templates/{id}/builds/{build}`: both route profiles (API 1.18.0)                                                                                          |
 
 `POST /v1/sessions` takes an optional `model`, and `PATCH /v1/sessions/{id}` with `{"model": ID}` switches it (`null`
 returns the session to the deployment default). A turn already running keeps its model; the next turn uses the new one.
@@ -241,14 +242,19 @@ is 429 `quota_exceeded`. With template hosts configured, a sandbox create on a b
 caller's lease and answers 409 `template_not_active` with `Retry-After` (`activate: false` starts nothing). A template
 imported from `SH_SANDBOX_TEMPLATES` is never gated (the deployment runs its worker) and takes no lease.
 
-Retire came with API 1.12.0. The template's owner, or an admin, retires a whole template (`POST
+Egress records came with API 1.14.0. A sandbox's egress log (`GET /v1/sandboxes/{id}/egress`) holds the KVM host's
+egress proxy events for it, shipped by the host agent; the sandbox's end record names the log's sha256. Paths are logged
+without query, fragment or userinfo, and an injected credential appears by name only, but a secret a guest puts in a URL
+path segment is logged as sent. See the [egress records spec](../specs/2026-11-08-sandbox-egress-records-design.md).
+
+Retire came with API 1.18.0. The template's owner, or an admin, retires a whole template (`POST
 /v1/templates/{id}/retire`, with an optional `reason`) or one build (`DELETE /v1/templates/{id}/builds/{build}`). A
 retired build's leases go and its holding hosts are told to stop its worker; it is never served again: a sandbox create
 or an activation naming it, a tag of it or a template whose every build is retired is 410 `template_retired`. A retire
 is refused 409 `build_in_use` while a live sandbox runs on the build, and is idempotent. Each build retired writes a
 `retire` record naming the caller, the status before and the build's `build` record. A retire cannot be undone: a new
 build of the template is the way back. Each build lists `heldBy`, the hosts still holding its snapshot, and a retired
-build reports `capacity` while its worker still runs (null once its host has stopped it). Since API 1.13.0
+build reports `capacity` while its worker still runs (null once its host has stopped it). Since API 1.19.0
 ([#743](https://github.com/rossoctl/moca/issues/743)) each holding host's agent then removes the build's worker and
 snapshot (the wanted state's `remove`) and reports it, a `retire` record by `host:<id>` with `event: removed`, and
 `heldBy` drops the host. `mocactl sbx templates retire --wait` waits for the stop and for `heldBy` to empty, and

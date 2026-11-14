@@ -3,7 +3,7 @@
 The version is `info.version` in [openapi.yaml](openapi.yaml): the minor is bumped for additive
 changes, the major only with a `/v2` ([change policy](../reference/change-policy.md), decision 5).
 
-## 1.13.0
+## 1.19.0
 
 The host agent removes a retired build's worker and snapshot
 ([#743](https://github.com/rossoctl/moca/issues/743)), per the
@@ -11,7 +11,7 @@ The host agent removes a retired build's worker and snapshot
 Every change is additive.
 
 - GET /v1/hosts/{host}/wanted gains `remove`: the retired builds the host holds with no live sandbox
-  on their worker, each also in `stop`. The agent stops a running worker, then uninstalls it
+  and no pinned session's hold on their worker, each also in `stop`. The agent stops a running worker, then uninstalls it
   (`install-host.sh --uninstall --keep-shared`: its own files only), deletes the snapshot and its template record, and reports it. A
   worker with a live sandbox is in no list, nor is a retired build whose build id or worker a build
   that is not retired shares (in any template): its snapshot or worker is still needed.
@@ -21,7 +21,7 @@ Every change is additive.
   the host's next inventory. A `removed` for a build the wanted state leaves out because a build not
   retired shares it is refused `409 build_in_use`.
 
-## 1.12.0
+## 1.18.0
 
 Retire a template, or one build of it ([#749](https://github.com/rossoctl/moca/issues/749)), per the
 [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §5.1. Every
@@ -51,6 +51,182 @@ change is additive; the routes mount on both route profiles and need `SH_PROVENA
   sandbox, except a `shared` one; and one worker id is never in both `run` and `stop` (two
   registered builds from one image share it); POST /v1/hosts/{host}/workers/report takes `detached` for a retired build. Removing a
   retired build's worker and snapshot from its host is not part of this version.
+
+## 1.17.0
+
+A session's seed from its build, its workspace's patch, its records, and its queued turns on its
+template ([#751](https://github.com/rossoctl/moca/issues/751)), per the
+[session templates spec](../specs/2026-10-30-session-sandbox-templates-design.md) §5-§5.2 and the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §7.1.
+Additive.
+
+- POST /internal/credentials: for a session pinned to a manifest-hash build through the template
+  store, `sandboxSeed` is that build's own `spec.seed` (none when the build has none), and
+  `sandboxSeedSource` (`build` or `declared`) is sent with any seed.
+- POST /internal/turn-credentials returns `sandboxTemplate`, `sandboxSeed`, `sandboxSeedSource` and
+  `sandboxBuildId` as POST /internal/credentials does, so a queued turn of a templated session runs
+  on its template's workers, pinned to its build, and seeded.
+- GET /v1/sessions/{id}/turns/{turnId}: a `responded` result of a templated session carries
+  `workspace` (the patch after the turn) and, with a seed, `seed` (`{source, buildId?}`).
+- With a template store, a session whose template resolved through it writes a `session` record on
+  `template/<id>` at creation (`state: created`, with its build, manifest hash and lease) and at
+  delete (`state: terminated`, `reason: deleted`, `endedAt`).
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.3.0: a templated
+session's turn result (and its terminal `done` and `error` frames) carries `workspace`
+(`TurnWorkspace`: the patch from the seed's baseline commit, whole or refused over
+`SH_TURN_PATCH_MAX_BYTES`, never cut) and `sandbox.seed`; a `/v1/runs` prompt run of a templated
+session runs on its template and its `responded` result carries both too.
+
+## 1.16.0
+
+Sessions and sandboxes from one combined control plane
+([#750](https://github.com/rossoctl/moca/issues/750)), per the
+[combined control plane spec](../specs/2026-11-05-combined-control-plane-design.md). Additive: the
+`harness` and `sandbox` profiles answer as before.
+
+- `SH_ROUTE_PROFILE=combined` mounts every route of both profiles. Its GET /v1/discovery answers
+  `profile: "combined"` with the harness fields plus `execEndpoint` and `execCa`.
+- On `combined` login is open, as on `harness`; the sandbox routes and the template writes need an
+  enrolled subject (`403 not_enrolled` otherwise, test users included), and the template, policy and
+  quota reads take any logged-in subject. Its API tokens carry the harness issuer.
+- With a template store (`SH_PROVENANCE_DIR`), POST /v1/sessions resolves `sandbox.template` through
+  it as POST /v1/sandboxes does: `id`, `id:tag` or `id@sha256:…`, else 400 `unknown_template`; the
+  build is kept for the session's life. `sandbox.activate` (default true) and activation on first
+  use apply: 409 `template_not_active` with Retry-After, or `no_active_slot`,
+  `template_unavailable`. Only a subject enrolled for sandboxes starts an activation; on `combined`
+  another subject waits (409) on one already starting and is refused (`403 not_enrolled`) on a
+  template nobody is starting. The activation is the create's last check, so a create refused for
+  another reason holds no lease.
+- The `Session` view adds `sandboxBuildId` and `templateManifestHash` beside `sandboxTemplate`.
+- POST /internal/credentials returns `sandboxBuildId` for a session pinned to a manifest-hash build.
+  Each exchange of such a session (and of its queued turns) keeps that build's worker running for
+  the hosts' idle limit from the turn, as a live sandbox does (GET /v1/hosts/{host}/wanted leaves it
+  out of `stop`), when the session's subject is enrolled for sandboxes; it starts no worker and
+  takes no lease. A turn of a subject not enrolled runs while the worker is up but extends nothing.
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.2.0: a session pinned
+to a build runs only on workers labelled `moca.dev/build` with it, and its turn is refused (503
+`sandbox_unavailable`) when none is attached.
+
+## 1.15.0
+
+Sandbox templates for agent sessions
+([#731](https://github.com/rossoctl/moca/issues/731)), per the
+[session templates spec](../specs/2026-10-30-session-sandbox-templates-design.md). Additive: a
+deployment that does not set `SH_SANDBOX_TEMPLATES` on the harness profile answers exactly as
+before.
+
+- POST /v1/sessions accepts `sandbox.template`, fixed for the session's life. A non-string is
+  400 `invalid_request`; so is an id the deployment does not declare (the message lists the
+  declared ids), and any template on a deployment that declares none.
+- The `Session` view gains `sandboxTemplate` (null for none) on a deployment that declares
+  templates, and for any session that named one.
+- GET /v1/discovery gains `sandboxTemplates: [{id, description, tools}]`, the declared templates
+  without their seeds; absent when none are declared.
+- POST /internal/credentials returns `sandboxTemplate` and `sandboxSeed` for a session that named a
+  template, and neither otherwise. A template the deployment no longer declares is still returned,
+  without a seed, so its turns are refused rather than run on an untemplated worker.
+
+The data plane's twin, [harness-openapi.yaml](harness-openapi.yaml), goes to 1.1.0: authenticated
+turns take the session's template from the control plane, a failed seed is a 500, and
+`workspace_reset`'s `retiered` also covers a sandbox that now serves another template.
+
+## 1.14.0
+
+Per-sandbox egress records ([#752](https://github.com/rossoctl/moca/issues/752)), per the
+[egress records spec](../specs/2026-11-08-sandbox-egress-records-design.md): what a sandbox reached
+through the KVM host's egress proxy, readable through the API and named in the sandbox's provenance.
+Every change is additive.
+
+- New GET /v1/sandboxes/{id}/egress?after=&limit= (the owner or an admin, as GET /v1/sandboxes/{id})
+  gives `{events, next, summary}`. The events are the proxy's audit events exactly as it wrote them
+  (new `EgressEvent` schema), in arrival order. `summary` (new `EgressSummary` schema) is
+  `{byHost: {host: {count, decisions, bytesUp, bytesDown}}, total, dropped, droppedBy: {proxy, cap,
+budget, invalid}, complete, sealed, sha256}`, on the first page (no `after`); null on the pages
+  after it.
+- `?format=ndjson` gives the whole log as `application/x-ndjson`: each event's canonical JSON, each
+  followed by `\n`. Its sha256 is `summary.sha256`.
+- New POST /v1/hosts/{host}/egress `{events, cursor, oversized?}` (host bearer): the host agent's
+  batches of up to 1000 events and its journal cursor, idempotent by (host, cursor), answering
+  `{accepted, refused, capped, overBudget, invalid, dropped, cursor}`. A log holds at most 10,000
+  events and 4 MiB of lines, and all logs together at most 64 MiB of lines; the rest count as
+  dropped.
+- GET /v1/hosts/{host}/wanted gains `egressSids`, the workspace keys whose events the host ships (the
+  set the egress route accepts); the agent sends no other sandbox's or session's events.
+- The `sandbox` provenance record that ends a sandbox (`state: terminated`) gains
+  `egress: {events, sha256, dropped, droppedBy, complete}`. Events that arrive in the 600 s after the
+  end are still taken; if any did, one more `sandbox` record with `state: egress` names the final
+  log. No record kind is added.
+
+## 1.13.0
+
+Pacing template workers' cold starts ([#745](https://github.com/rossoctl/moca/issues/745)), per the
+[template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md) §6.5: a
+KVM host starts at most `SBX_START_CONCURRENCY` (default 4) workers at once, an activation waiting
+for a start slot says so, and an optional idle grace (`SBX_IDLE_GRACE_S`, default 0, off) keeps a
+released build's worker running for a while. The start limit is the host agent's, so it holds with
+an older control plane too. Every change is additive.
+
+- `GET /v1/hosts/{host}/wanted` gains `starting: [buildId]`: the builds of `run` whose worker is not
+  attached to the relay (its presence, as readiness reads it), in `run`'s order. `run` is now in the
+  wanted order, first leased first. Without `starting` (an older control plane, or the presence
+  unreadable) the agent counts its own starts of the last `SBX_START_WINDOW_S` (default 300). With
+  `starting`, a listed worker counts for `SBX_START_WINDOW_S` at most: one not attached after it is
+  stuck (an error line each run) and holds no start slot.
+- `POST /v1/hosts/{host}/inventory`'s `limits` take optional `startConcurrency`, `startSeconds` (the
+  mean of the agent's last cold starts, start to attach) and `idleGraceSeconds` (0-86400). Without
+  them (an older agent) nothing changes; an older control plane ignores them.
+- A build `activating` on such a host gains `queued` and `queuePosition` (1-based, among its host's
+  placed, wanted builds not attached yet, first leased first); `queued` is true beyond the host's
+  `startConcurrency`.
+- `409 template_not_active`'s Retry-After is `ceil(ceil(queuePosition / startConcurrency) ×
+startSeconds)` when the host reports both; else 30 s, as before. A queued activation stays
+  `activating` longer than before: a client polls with a timeout sized for the host's whole start
+  line.
+- A build whose worker already runs on a holder needs no start: it stays there (1.12.0's sticky
+  placement), whether or not the host reports memory figures; a graced build leased again too.
+- The idle grace runs from the build's last lease end (a release's time, or an expired lease's
+  `until`), for a worker the agent reports running with no live sandbox, while the host has room
+  under `activeLimit` beside the workers it counts (`active.used`: graced ones are counted apart)
+  and its memory headroom (a graced worker counts as running there). A wanted
+  build that needs the slot or the memory displaces the graced worker that ends soonest; the stop is
+  re-checked for a lease, under the activation lock, when the wanted answer is made. The wanted
+  answer gains `graced: [buildId]` for a host with a grace: the graced builds, kept in `run` after
+  the wanted ones (the agent starts none of them).
+- `POST /v1/templates/{id}/deactivate` takes an optional `stopNow: true`: with no lease left, the
+  build skips the grace (stopped at the next poll); the `deactivate` record carries `stopNow: true`.
+- Builds gain `graced: true` and `gracedUntil` (epoch seconds) while in a grace; a create on a
+  graced build takes the caller's lease and is served at once.
+- `GET /v1/templates`' hosts gain `start: {concurrency, seconds, starting, queued}`, only for a host
+  whose agent reports it, and `idleGraceSeconds` and `graced` (a count) for a host whose agent sets
+  a grace.
+
+## 1.12.0
+
+Placement of template workers by host memory ([#744](https://github.com/rossoctl/moca/issues/744)),
+per the [template lifecycle spec](../specs/2026-11-03-template-lifecycle-and-provenance-design.md)
+§6.2: a new worker starts on a host only if the host has the memory for it, whatever its
+`activeLimit` says. Nothing running is evicted. Every change is additive.
+
+- `POST /v1/hosts/{host}/inventory` takes an optional `memory: {memTotalMib, memAvailableMib,
+memFloorMib, memPressureFull10, memPressureLimit, runningWorkers, vmCommittedMib, memfileMismatch}`.
+  Without it (an older agent) the host is placed by `activeLimit` alone, as before; an older control
+  plane ignores it.
+- A build costs its guest RAM (`spec.guest_mb`) plus 128 MiB, or 4096 + 128 with no recorded guest size.
+  A host's headroom is `min(total − floor − used, available − floor − pending starts)`, where `used`
+  counts its running workers, their VMs' committed memory and the builds placed there not started yet.
+  A host whose last inventory is older than 60 s, or whose PSI `full avg10` is above its limit, takes
+  no new start. A build in a host's `memfileMismatch` is never placed there.
+- `409 no_active_slot` gains `reason: memory` when a holder under its active limit lacks the memory
+  (Retry-After unchanged); at the active limit it answers as before, with no `reason`.
+  `409 template_unavailable` gains `reason: memfile_mismatch` when every holder reports the build's
+  memory file wrong. `409 template_not_active` with readiness `unavailable` carries the reason too.
+- Templates and builds gain `readinessReason` (`not_held | no_slot | memory | memfile_mismatch`),
+  present only with readiness `unavailable`; new `ReadinessReason` schema.
+- `GET /v1/templates`' hosts gain `memory: {totalMib, availableMib, floorMib, usedMib, headroomMib,
+pressureFull10, pressureLimit, brake, runningWorkers, memfileMismatch, reportedAt}`, only for a
+  host whose agent reports it; `floorMib` is the effective floor.
 
 ## 1.11.0
 

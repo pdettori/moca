@@ -20,7 +20,7 @@ REPO="$TMP/repo"
 mkdir -p "$REPO/deploy"
 cp -R "$SRC/deploy/sbx" "$REPO/deploy/sbx"
 cp -R "$SRC/deploy/k8s" "$REPO/deploy/k8s"
-rm -rf "$REPO/deploy/sbx/.generated" "$REPO/deploy/k8s/.generated"
+rm -rf "$REPO/deploy/sbx/.generated" "$REPO/deploy/sbx/.generated-"* "$REPO/deploy/k8s/.generated"
 SETUP="$REPO/deploy/sbx/setup.sh"
 GEN="$REPO/deploy/sbx/.generated"
 
@@ -99,6 +99,11 @@ case "$1 $2" in
   jq --argjson p "$patch" '
     .data = ((.data // {}) * ($p.data // {}) | with_entries(select(.value != null))) |
     if (.data // {}) == {} then del(.data) else . end' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+  exit 0 ;;
+'get route')
+  # A Route exists when the test made $MOCK_STATE/route-NAME.exists; MOCK_FAIL_GET=route fails the read.
+  [[ "${MOCK_FAIL_GET:-}" != route ]] || { echo 'Error from server (Forbidden): routes is forbidden' >&2; exit 1; }
+  [[ ! -f "$MOCK_STATE/route-$3.exists" ]] || echo "route.route.openshift.io/$3"
   exit 0 ;;
 'patch route')
   # The last patch of each Route, as given (a --patch-file is read, so its content is never argv).
@@ -198,6 +203,18 @@ refusals=(
   'export SBX_RETENTION_DAYS=91 => SBX_RETENTION_DAYS must be'
   'export SBX_MAX_INFLIGHT=0 => SBX_MAX_INFLIGHT must be 1-8'
   'export SBX_MAX_INFLIGHT=9 => SBX_MAX_INFLIGHT must be 1-8'
+  'export SBX_MODES_ALLOWED=per-exec,bogus => SBX_MODES_ALLOWED must be a comma list of per-exec, lease and lease\+processes'
+  'export SBX_MODES_ALLOWED="per-exec, lease" => SBX_MODES_ALLOWED must be a comma list'
+  'export SBX_MODES_ALLOWED=per-exec, => SBX_MODES_ALLOWED must be a comma list'
+  'export SBX_MODES_ALLOWED=LEASE => SBX_MODES_ALLOWED must be a comma list'
+  'export SBX_IDLE_CEILING_S=20 => SBX_IDLE_CEILING_S must be a whole number of seconds, 300-86400'
+  'export SBX_IDLE_CEILING_S=299 => SBX_IDLE_CEILING_S must be a whole number of seconds, 300-86400'
+  'export SBX_IDLE_CEILING_S=30m => SBX_IDLE_CEILING_S must be'
+  'export SBX_IDLE_CEILING_S=1000000 => SBX_IDLE_CEILING_S must be'
+  'export SBX_IDLE_CEILING_S=86401 => SBX_IDLE_CEILING_S must be a whole number of seconds, 300-86400'
+  'export SBX_MODES_ALLOWED=per-exec,lease SBX_IDLE_CEILING_S=3600 => SBX_JANITOR_WAIT_MINUTES \(3600 s\) must exceed the token lifetime plus the 30 s leeway plus SBX_IDLE_CEILING_S \(4530 s\) when a lease mode is allowed'
+  'export SBX_MODES_ALLOWED=lease+processes SBX_IDLE_CEILING_S=2700 SBX_JANITOR_WAIT_MINUTES=60 => SBX_JANITOR_WAIT_MINUTES \(3600 s\) must exceed .* \(3630 s\)'
+  'export SBX_MODES_ALLOWED=per-exec,lease SBX_TOKEN_TTL_MINUTES=60 => SBX_JANITOR_WAIT_MINUTES \(3900 s\) must exceed .* \(5430 s\)'
   'export SBX_WORKSPACE_IMAGE_MB=-1 => SBX_WORKSPACE_IMAGE_MB must be a positive whole number'
   'export SBX_MAX_TOTAL=999999999 SBX_WORKSPACE_IMAGE_MB=999999999 SBX_WORKSPACE_FS_GIB=999999999 => SBX_MAX_TOTAL must be'
   'export SBX_MAX_TOTAL=1 SBX_WORKSPACE_IMAGE_MB=999999999 SBX_WORKSPACE_FS_GIB=999999999 => SBX_WORKSPACE_IMAGE_MB must be'
@@ -326,6 +343,8 @@ fi
 [[ "$(cm sbx-settings SH_SANDBOX_LIFETIME_SECONDS)" == 604800 ]] || fail 'lifetime'
 [[ "$(cm sbx-settings SH_SANDBOX_MAX_PER_SUBJECT)" == 3 && "$(cm sbx-settings SH_SANDBOX_MAX_TOTAL)" == 40 ]] || fail 'quotas'
 [[ "$(cm sbx-settings SH_SANDBOX_MAX_INFLIGHT)" == 2 ]] || fail 'in-flight cap'
+[[ "$(cm sbx-settings SH_SANDBOX_MODES_ALLOWED)" == per-exec ]] || fail 'lease is not off by default (SH_SANDBOX_MODES_ALLOWED)'
+[[ "$(cm sbx-settings SH_SANDBOX_IDLE_CEILING_S)" == 1800 ]] || fail 'idle ceiling default (1800 s)'
 [[ "$(cm sbx-settings SH_SANDBOX_TOKEN_TTL_SECONDS)" == 900 ]] || fail 'token TTL default (15 min)'
 [[ "$(cm sbx-settings SH_SANDBOX_RETENTION_SECONDS)" == 1209600 ]] || fail 'retention default (14 d)'
 [[ "$(cm sbx-settings SH_SANDBOX_TOKEN_ISSUER)" == sbx-control-plane ]] || fail 'issuer'
@@ -357,6 +376,7 @@ grep -qx 'RELAY_TLS=true' "$W/worker.env" || fail 'worker bundle RELAY_TLS'
 grep -qx "SANDBOX_TOKEN=$(secret_val moca-relay-sandbox-tokens sbx_py312)" "$W/worker.env" || fail 'worker bundle token'
 grep -qx 'SH_WORKSPACE_IDLE=216h' "$W/worker.env" || fail 'worker bundle idle is not lifetime + 2 days'
 grep -qx 'SH_WORKSPACE_IMAGE_MB=2048' "$W/worker.env" || fail 'worker bundle image size'
+grep -qx 'SH_LEASE_IDLE_CEILING_S=1800' "$W/worker.env" || fail 'worker bundle idle ceiling is not the default 1800'
 [[ -f "$W/relay-ca.crt" ]] || fail 'self-signed attach certificate not shipped in the worker bundle'
 [[ "$(stat -c %a "$W/worker.env" 2>/dev/null || stat -f %Lp "$W/worker.env")" == 600 ]] || fail 'worker.env is not 0600'
 pass 'writes 0600 worker bundles in the P6.2 format, with the idle derived from the lifetime and the image size'
@@ -487,6 +507,30 @@ render
 [[ "$(pod_hash moca-control-plane)" == "$cp_hash" ]] || fail 'the hash did not return with the defaults'
 pass 'SBX_TOKEN_TTL_MINUTES and SBX_RETENTION_DAYS reach sbx-settings in seconds, and move the hash'
 
+# 4c'. The lease policy (lease-mode spec §8.1): SBX_MODES_ALLOWED and SBX_IDLE_CEILING_S reach
+# sbx-settings and move the hash; the ceiling also reaches every worker bundle, so the control
+# plane's clamp and the worker's agree.
+run_setup export SBX_MODES_ALLOWED=per-exec,lease,lease+processes SBX_IDLE_CEILING_S=3600 SBX_JANITOR_WAIT_MINUTES=76 ||
+  fail 'a run with a lease policy failed'
+[[ "$(cm sbx-settings SH_SANDBOX_MODES_ALLOWED)" == per-exec,lease,lease+processes ]] || fail 'SBX_MODES_ALLOWED not written'
+[[ "$(cm sbx-settings SH_SANDBOX_IDLE_CEILING_S)" == 3600 ]] || fail 'SBX_IDLE_CEILING_S not written'
+for w in sbx_default sbx_py312; do
+  grep -qx 'SH_LEASE_IDLE_CEILING_S=3600' "$GEN/workers/$w/worker.env" || fail "the $w bundle's idle ceiling is not 3600"
+  [[ "$(grep -c '^SH_LEASE_IDLE_CEILING_S=' "$GEN/workers/$w/worker.env")" == 1 ]] || fail "the $w bundle has the idle ceiling twice"
+done
+render
+[[ "$(pod_hash moca-control-plane)" != "$cp_hash" ]] || fail 'the lease policy is not in the settings hash'
+grep -A4 -- '- name: SH_SANDBOX_MODES_ALLOWED$' "$TMP/render.yaml" | grep -q 'name: sbx-settings' ||
+  fail 'the control plane does not read SH_SANDBOX_MODES_ALLOWED from sbx-settings'
+grep -A4 -- '- name: SH_SANDBOX_IDLE_CEILING_S$' "$TMP/render.yaml" | grep -q 'name: sbx-settings' ||
+  fail 'the control plane does not read SH_SANDBOX_IDLE_CEILING_S from sbx-settings'
+run_setup true || fail 'the run back to the defaults failed'
+[[ "$(cm sbx-settings SH_SANDBOX_MODES_ALLOWED)" == per-exec ]] || fail 'the run back to the defaults left lease on'
+grep -qx 'SH_LEASE_IDLE_CEILING_S=1800' "$GEN/workers/sbx_default/worker.env" || fail 'the bundle ceiling did not return to 1800'
+render
+[[ "$(pod_hash moca-control-plane)" == "$cp_hash" ]] || fail 'the hash did not return with the defaults'
+pass 'SBX_MODES_ALLOWED and SBX_IDLE_CEILING_S reach sbx-settings and move the hash; the ceiling reaches every worker bundle'
+
 # 4d. The janitor's wait (spec §8.1, §8.3): default max(60, TTL + 5) minutes, so the default at the
 # longest token lifetime (60 min) is 65 min, not the refused 60; an explicit one must exceed TTL + 30 s.
 run_setup export SBX_TOKEN_TTL_MINUTES=60 || fail 'the default janitor wait was refused at a 60 min token lifetime'
@@ -496,6 +540,17 @@ grep -qx 'SBX_JANITOR_AGE=3660' "$GEN/janitor/janitor.env" || fail 'SBX_JANITOR_
 run_setup export SBX_JANITOR_WAIT_MINUTES=120 || fail 'a 120 min wait was refused'
 grep -qx 'SBX_JANITOR_AGE=7200' "$GEN/janitor/janitor.env" || fail 'SBX_JANITOR_WAIT_MINUTES=120 is not 7200 s'
 pass 'the janitor wait defaults to max(60, TTL + 5) min (65 at TTL 60), and an explicit one is written in seconds'
+
+# 4d'. The idle ceiling against the janitor (review #4569829097): with a lease mode allowed, a token
+# minted before a delete keeps a lease live for its lifetime plus 30 s plus the idle timeout, so the
+# wait must exceed all three; the defaults (15 min, 1800 s) pass. Per-exec only, the ceiling is unused.
+run_setup export SBX_MODES_ALLOWED=per-exec,lease || fail 'the default wait was refused with lease allowed at the default ceiling'
+run_setup export SBX_MODES_ALLOWED=per-exec,lease SBX_IDLE_CEILING_S=3600 SBX_JANITOR_WAIT_MINUTES=76 ||
+  fail 'a 76 min wait (4560 s > 4530 s) was refused'
+grep -qx 'SBX_JANITOR_AGE=4560' "$GEN/janitor/janitor.env" || fail 'SBX_JANITOR_WAIT_MINUTES=76 is not 4560 s'
+run_setup export SBX_IDLE_CEILING_S=86400 || fail 'the 86400 s ceiling was refused with per-exec only'
+run_setup true || fail 'the run back to the defaults failed'
+pass 'the idle ceiling is at most 86400 s, and with a lease mode the janitor wait must exceed TTL + 30 s + the ceiling'
 
 # 4e. An API CA (SBX_API_CA_FILE) for a Route certificate the host does not trust: bundled, then
 # dropped from the bundle when unset again.
@@ -665,7 +720,8 @@ HASH="$({
   printf '%s\n' 'SH_ALLOWED_SUBJECTS=github:1,github:2' "SH_SANDBOX_TEMPLATES=$(jq -c . "$TMP/templates.json")" \
     'SH_SANDBOX_EXEC_ENDPOINT=sbx-exec.apps.example.invalid:443' 'SH_SANDBOX_TOKEN_ISSUER=sbx-control-plane' \
     'SH_SANDBOX_LIFETIME_SECONDS=604800' 'SH_SANDBOX_TOKEN_TTL_SECONDS=900' 'SH_SANDBOX_RETENTION_SECONDS=1209600' \
-    'SH_SANDBOX_MAX_PER_SUBJECT=3' 'SH_SANDBOX_MAX_TOTAL=40' 'SH_SANDBOX_MAX_INFLIGHT=2' "SH_SANDBOX_EXEC_CA=$(cat "$GEN/exec-ca.crt")"
+    'SH_SANDBOX_MAX_PER_SUBJECT=3' 'SH_SANDBOX_MAX_TOTAL=40' 'SH_SANDBOX_MAX_INFLIGHT=2' \
+    'SH_SANDBOX_MODES_ALLOWED=per-exec' 'SH_SANDBOX_IDLE_CEILING_S=1800' "SH_SANDBOX_EXEC_CA=$(cat "$GEN/exec-ca.crt")"
   raw_val sbx-token-keys PUBLIC_KEYS
   raw_val moca-relay-tls tls.crt
   raw_val sbx-exec-tls tls.crt
@@ -709,7 +765,7 @@ GOLD
 diff <(expected_off_kustomization) "$K" >"$TMP/golden.diff" || { cat "$TMP/golden.diff" >&2; fail 'the generated kustomization.yaml with egress off is not today'"'"'s'; }
 jq -e '.data | keys == ["SH_ADMIN_SUBJECTS","SH_API_TOKEN_TTL_SECONDS","SH_GITHUB_CLIENT_ID","SH_SESSION_TOKEN_TTL_SECONDS"]' \
   "$MOCK_STATE/configmap-moca-settings.json" >/dev/null || fail 'moca-settings keys changed with egress off'
-jq -e '.data | keys == ["SH_ALLOWED_SUBJECTS","SH_SANDBOX_EXEC_CA","SH_SANDBOX_EXEC_ENDPOINT","SH_SANDBOX_LIFETIME_SECONDS","SH_SANDBOX_MAX_INFLIGHT","SH_SANDBOX_MAX_PER_SUBJECT","SH_SANDBOX_MAX_TOTAL","SH_SANDBOX_RETENTION_SECONDS","SH_SANDBOX_TEMPLATES","SH_SANDBOX_TOKEN_ISSUER","SH_SANDBOX_TOKEN_TTL_SECONDS"]' \
+jq -e '.data | keys == ["SH_ALLOWED_SUBJECTS","SH_SANDBOX_EXEC_CA","SH_SANDBOX_EXEC_ENDPOINT","SH_SANDBOX_IDLE_CEILING_S","SH_SANDBOX_LIFETIME_SECONDS","SH_SANDBOX_MAX_INFLIGHT","SH_SANDBOX_MAX_PER_SUBJECT","SH_SANDBOX_MAX_TOTAL","SH_SANDBOX_MODES_ALLOWED","SH_SANDBOX_RETENTION_SECONDS","SH_SANDBOX_TEMPLATES","SH_SANDBOX_TOKEN_ISSUER","SH_SANDBOX_TOKEN_TTL_SECONDS"]' \
   "$MOCK_STATE/configmap-sbx-settings.json" >/dev/null || fail 'sbx-settings keys changed with egress off'
 [[ "$(applied_names)" == 'configmap moca-settings;configmap sbx-settings;secret moca-mu1;secret moca-redis;secret moca-relay;secret moca-relay-sandbox-tokens;secret moca-relay-tls;secret sbx-exec-tls;secret sbx-token-keys;' ]] ||
   fail "the applied object set changed with egress off: $(applied_names)"
@@ -929,7 +985,112 @@ for r in 'export SBX_TEMPLATE_STORE=2 => SBX_TEMPLATE_STORE must be unset, 0 or 
 done
 pass 'refuses a bad store switch, hosts without the store, a bad or repeated host id, before anything is applied'
 
-# 16. SBX_REDIS_IMAGE: Redis 7 for data a Redis 7.4 wrote (Valkey 9 cannot read RDB format 12).
+# 16. SBX_PROFILE=combined (combined control plane design §3.6): the ocp-combined overlay, the
+#     harness's keys beside SBX0's, the harness exec token kept, and nothing else changed when unset.
+reset_state
+run_setup true || fail 'the sandbox-profile run failed'
+cp "$K" "$TMP/profile-sandbox.yaml"
+run_setup export SBX_PROFILE=sandbox || fail 'SBX_PROFILE=sandbox failed'
+cmp -s "$TMP/profile-sandbox.yaml" "$K" || fail 'SBX_PROFILE=sandbox differs from unset'
+reset_state
+# A sandbox namespace's generated folder, which a combined run from the same checkout must leave alone.
+run_setup true || fail 'the sandbox run before the combined one failed'
+SBXGEN="$TMP/sbx-generated-before"; cp -R "$GEN" "$SBXGEN"
+rm -rf "$MOCK_STATE"; mkdir -p "$MOCK_STATE"; : >"$MOCK_LOG" # the mock cluster is not namespaced
+GEN0="$GEN"; GEN="$REPO/deploy/sbx/.generated-moca-sbx-combined-test"
+RW="ghcr.io/example/moca-remote-worker@sha256:$(printf 'a%.0s' {1..64})"
+MI="ghcr.io/example/moca@sha256:$(printf 'b%.0s' {1..64})"
+C=(eval "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_NAMESPACE=moca-sbx-combined-test SBX_SANDBOX_IMAGE=$RW SBX_IMAGE=$MI")
+run_setup "${C[@]}" || fail "the combined run failed: $(cat "$TMP/out")"
+grep -q 'overlays/ocp-combined' "$K" || fail 'the combined run did not render ocp-combined'
+[[ -f "$GEN/kustomization.yaml" && -f "$GEN/moca-ca.crt" ]] || fail 'the combined run did not write .generated-<namespace> (overlay, moca-ca.crt)'
+diff -r "$SBXGEN" "$GEN0" >/dev/null || fail 'the combined run changed the sandbox namespace'"'"'s .generated'
+for k in SH_SESSION_TOKEN_PRIVATE_KEY SH_SESSION_TOKEN_PUBLIC_KEYS SH_CREDENTIAL_KEK SH_EXCHANGE_TOKEN SH_JANITOR_TOKEN; do
+  has_key moca-mu1 "$k" || fail "moca-mu1 has no $k"
+done
+[[ "$(secret_val moca-mu1 SH_SESSION_TOKEN_PUBLIC_KEYS)" == "$(secret_val sbx-token-keys PUBLIC_KEYS)" ]] ||
+  fail 'the supervisor and the relay verify with different public keys'
+[[ "$(secret_val moca-mu1 SH_CREDENTIAL_KEK | base64 --decode | wc -c | tr -d ' ')" == 32 ]] || fail 'the KEK is not 32 bytes'
+[[ "$(secret_val moca-relay MOCA_RELAY_EXEC_TOKEN)" =~ ^[0-9a-f]{64}$ ]] || fail 'moca-relay has no harness exec token'
+[[ "$(secret_val moca-relay-attach SH_RELAY_TOKEN)" == "$(secret_val moca-relay SH_RELAY_TOKEN)" ]] || fail 'moca-relay-attach does not mirror SH_RELAY_TOKEN'
+! grep -q 'MOCA_RELAY_EXEC_TOKEN":null' "$MOCK_LOG" || fail 'the combined run removed the harness exec token'
+[[ -f "$MOCK_STATE/secret-sbx-template-hosts.json" ]] || fail 'the combined run did not turn the template store on'
+[[ -f "$MOCK_STATE/secret-moca-supervisor-tls.json" ]] || fail 'no TLS Secret for the supervisor Route'
+[[ "$(cm moca-settings SH_PUBLIC_HARNESS_URL)" == https://moca.apps.example.invalid ]] || fail 'no SH_PUBLIC_HARNESS_URL'
+[[ "$(cm moca-settings SH_ALLOW_OPERATOR_FALLBACK)" == false ]] || fail 'SH_ALLOW_OPERATOR_FALLBACK is not false'
+render
+grep -q 'host: moca.apps.example.invalid' "$TMP/render.yaml" || fail 'the supervisor Route has the wrong host'
+grep -q 'host: sbx-api.apps.example.invalid' "$TMP/render.yaml" || fail 'the API Route (moca-api) has the wrong host'
+grep -q 'sandbox-relay-exec.moca-sbx-combined-test.svc:9444' "$TMP/render.yaml" || fail 'the supervisor does not reach the relay in this namespace'
+! grep -q 'moca-sbx-combined\.svc\|moca-single' "$TMP/render.yaml" || fail 'an address still names a placeholder namespace'
+grep -q "image: ghcr.io/example/moca-remote-worker@sha256:" "$TMP/render.yaml" || fail 'the container sandbox image is not pinned by digest'
+! grep -q 'moca-remote-worker:latest' "$TMP/render.yaml" || fail 'the container sandbox still runs a tag'
+# Every image in the namespace is pinned by digest: none left on a tag.
+untagged="$(grep -E '^\s+image: ' "$TMP/render.yaml" | grep -v '@sha256:[0-9a-f]\{64\}' || true)"
+[[ -z "$untagged" ]] || fail "images not pinned by digest: $untagged"
+[[ -n "$(pod_hash moca-supervisor)" && "$(pod_hash moca-supervisor)" == "$(pod_hash moca-control-plane)" ]] ||
+  fail 'the supervisor does not roll with the settings'
+grep -q 'rollout status deployment/moca-supervisor' "$MOCK_LOG" || fail 'the combined run did not wait for the supervisor'
+key="$(secret_val moca-mu1 SH_CREDENTIAL_KEK)"; xt="$(secret_val moca-mu1 SH_EXCHANGE_TOKEN)"
+! grep -qF -- "$key" "$MOCK_LOG" "$TMP/out" || fail 'the KEK reached argv or the output'
+! grep -qF -- "$xt" "$MOCK_LOG" "$TMP/out" || fail 'the exchange token reached argv or the output'
+# Kept on a re-run.
+k1="$key" x1="$xt"
+run_setup "${C[@]}" || fail 'the combined re-run failed'
+[[ "$(secret_val moca-mu1 SH_CREDENTIAL_KEK)" == "$k1" && "$(secret_val moca-mu1 SH_EXCHANGE_TOKEN)" == "$x1" ]] || fail 'a re-run rotated the KEK or the exchange token'
+GEN="$GEN0"
+pass 'SBX_PROFILE=combined renders ocp-combined with both profiles'"'"' keys, the harness exec token kept, its own addresses and generated folder, and keeps the keys on a re-run'
+
+refusals=(
+  'export SBX_PROFILE=harness => SBX_PROFILE must be sandbox or combined'
+  'export SBX_PROFILE=combined => SBX_MOCA_HOST is required'
+  'export SBX_PROFILE=combined SBX_MOCA_HOST=$SBX_API_HOST => SBX_MOCA_HOST must differ'
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW SBX_IMAGE=\$MI SBX_EGRESS_CREDENTIALS=1 => not supported with SBX_PROFILE=combined"
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW SBX_IMAGE=\$MI SBX_TEMPLATE_STORE=0 => needs the template store"
+  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid => SBX_SANDBOX_IMAGE is required'
+  'export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=x/rw:latest => pinned by digest'
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW => SBX_IMAGE must be pinned by digest"
+  "export SBX_PROFILE=combined SBX_MOCA_HOST=moca.apps.example.invalid SBX_SANDBOX_IMAGE=\$RW SBX_IMAGE=\$MI SBX_SANDBOX_REPLICAS=10 => SBX_SANDBOX_REPLICAS must be 0-9"
+)
+for r in "${refusals[@]}"; do
+  bad="${r%% => *}" want="${r#* => }"
+  reset_state
+  ! run_setup eval "$bad" || fail "accepted: $bad"
+  grep -Eq -- "$want" "$TMP/out" || fail "refused '$bad', but not with /$want/"
+  ! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail "changed something before refusing: $bad"
+done
+pass 'refuses a bad profile, a missing or clashing SBX_MOCA_HOST, egress, no store and a bad replica count with combined'
+
+# 17. SBX_PROFILE=combined refuses an SBX0 namespace (its moca-mu1, or its sbx-api Route) before
+#     anything is applied, unless SBX_CONVERT_TO_COMBINED=1.
+reset_state
+run_setup true || fail 'the sandbox run before the refusal test failed'
+before_mu1="$(jq -S . "$MOCK_STATE/secret-moca-mu1.json")"
+: >"$MOCK_LOG"
+! run_setup "${C[@]}" || fail 'combined accepted an SBX0 namespace (its moca-mu1)'
+grep -q 'looks like an SBX0 (sandbox profile) namespace: its moca-mu1 holds SH_JANITOR_TOKEN but no SH_EXCHANGE_TOKEN' "$TMP/out" ||
+  fail 'the refusal does not name the moca-mu1 reason'
+! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail 'changed something before refusing an SBX0 namespace'
+[[ "$(jq -S . "$MOCK_STATE/secret-moca-mu1.json")" == "$before_mu1" ]] || fail 'moca-mu1 changed on the refusal'
+reset_state
+: >"$MOCK_STATE/route-sbx-api.exists"
+! run_setup "${C[@]}" || fail 'combined accepted a namespace with the sbx-api Route'
+grep -q 'it has the sbx-api Route' "$TMP/out" || fail 'the refusal does not name the Route'
+! grep -qE 'apply|patch|delete' "$MOCK_LOG" || fail 'changed something before refusing the sbx-api Route'
+reset_state
+! run_setup eval "${C[*]:1}; export MOCK_FAIL_GET=route" || fail 'carried on past a failing read of the Routes'
+grep -q 'could not read the Routes' "$TMP/out" || fail 'a failing Route read is not named'
+! run_setup eval "${C[*]:1}; export SBX_CONVERT_TO_COMBINED=yes" || fail 'accepted SBX_CONVERT_TO_COMBINED=yes'
+grep -q 'SBX_CONVERT_TO_COMBINED must be unset, 0 or 1' "$TMP/out" || fail 'a bad SBX_CONVERT_TO_COMBINED is not named'
+# The override converts on purpose.
+reset_state
+run_setup true || fail 'the sandbox run before the override failed'
+: >"$MOCK_STATE/route-sbx-api.exists"
+run_setup eval "${C[*]:1}; export SBX_CONVERT_TO_COMBINED=1" || fail "SBX_CONVERT_TO_COMBINED=1 was refused: $(cat "$TMP/out")"
+has_key moca-mu1 SH_EXCHANGE_TOKEN || fail 'the override run did not add the exchange token'
+pass 'SBX_PROFILE=combined refuses an SBX0 namespace before applying anything, unless SBX_CONVERT_TO_COMBINED=1'
+
+# 18. SBX_REDIS_IMAGE: Redis 7 for data a Redis 7.4 wrote (Valkey 9 cannot read RDB format 12).
 reset_state
 R7='docker.io/redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499'
 run_setup export SBX_REDIS_IMAGE="$R7" || fail "SBX_REDIS_IMAGE run failed: $(cat "$TMP/out")"

@@ -1,5 +1,5 @@
 import { status } from '@grpc/grpc-js';
-import { OWNER_LABEL, TIER_LABEL, WORKLOAD_LABEL } from '@moca/harness';
+import { OWNER_LABEL, TEMPLATE_LABEL, TIER_LABEL, WORKLOAD_LABEL } from '@moca/harness';
 import type { RecordStore, SandboxRecord } from '@moca/harness';
 import {
   LeaseControlFrame,
@@ -75,7 +75,19 @@ export interface RelayDeps {
   detach?: DetachMarks;
   /** Defaults to the global timers. */
   timers?: RelayTimers;
+  /**
+   * The clock keepalive coalescing reads, in ms (ruling P4-R1). Defaults to performance.now, which
+   * is monotonic: a wall clock stepped back must not hold keepalives off. Tests set one.
+   */
+  now?: () => number;
 }
+
+/**
+ * The least time between two keepalive frames for one workspace on one worker (lease-mode plan 4).
+ * A keepalive only proves the lease is still wanted, so the ones inside the window carry nothing
+ * the worker does not already know: they are answered OK and not written.
+ */
+export const LEASE_KEEPALIVE_COALESCE_MS = 1_000;
 
 interface Parked {
   stream: AttachStream;
@@ -89,6 +101,8 @@ interface Parked {
   cancelExpiry?: () => void;
   // Cancels a pending presence-put retry; set by Hello, called by teardown.
   cancelPresence?: () => void;
+  // When routeKeepalive last wrote a keepalive frame, per workspace key; goes with the session.
+  keepaliveAtMs: Map<string, number>;
   // This stream's teardown, so drain can run it; settles once the remove and the mark have.
   teardown: () => Promise<void>;
 }
@@ -127,7 +141,9 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 /**
  * The labels a parked sandbox's record carries. With an attach binding, its three labels overwrite
  * whatever Hello sent; without one (a shared-pool sandbox on a relay with attach keys), the workload
- * and owner labels are removed, so no sandbox can claim to be someone's by saying so.
+ * and owner labels are removed, so no sandbox can claim to be someone's by saying so. A workload
+ * sandbox (one with a binding) also loses any template label: workload sandboxes are not templated
+ * (session-templates spec §3.2), and a template is not in the signed binding.
  */
 function trustedLabels(
   sent: Record<string, string> | undefined,
@@ -137,6 +153,7 @@ function trustedLabels(
   delete labels[WORKLOAD_LABEL];
   delete labels[OWNER_LABEL];
   if (binding) {
+    delete labels[TEMPLATE_LABEL];
     labels[WORKLOAD_LABEL] = binding.workload;
     labels[OWNER_LABEL] = binding.owner;
     labels[TIER_LABEL] = binding.tier;
@@ -199,8 +216,9 @@ export interface Relay {
   ): Promise<LeaseControlResult>;
   /**
    * Activity on a live lease, without an Exec. Fire-and-forget: a no-op without a live worker, and
-   * a write that fails is logged, not thrown. Throws PERMISSION_DENIED only for a workload sandbox
-   * (the workload check, as routeLeaseControl's).
+   * a write that fails is logged, not thrown. Coalesced: at most one frame per workspace per
+   * LEASE_KEEPALIVE_COALESCE_MS, the rest dropped silently. Throws PERMISSION_DENIED only for a
+   * workload sandbox (the workload check, as routeLeaseControl's).
    */
   routeKeepalive(sandboxId: string, workspaceKey: string): void;
   /**
@@ -220,6 +238,7 @@ function bearer(md?: { get: (k: string) => string[] }): string | undefined {
 export function createRelay(deps: RelayDeps): Relay {
   const sessions = new Map<string, Parked>();
   const timers = deps.timers ?? defaultTimers;
+  const now = deps.now ?? (() => performance.now());
   let draining = false;
   // One ctl_id space for the whole relay, so an id is never reused while any call could hold it.
   let nextCtlId = 0;
@@ -349,6 +368,7 @@ export function createRelay(deps: RelayDeps): Relay {
           stream,
           sinks: new Map(),
           controls: new Map(),
+          keepaliveAtMs: new Map(),
           teardown,
           ...(binding ? { workload: binding.workload } : {}),
         };
@@ -588,10 +608,19 @@ export function createRelay(deps: RelayDeps): Relay {
     if (!parked) return;
     const refused = leaseOnWorkload(sandboxId, parked, 'lease keepalive');
     if (refused) throw refused;
+    const t = now();
+    const last = parked.keepaliveAtMs.get(workspaceKey);
+    if (last !== undefined && t - last < LEASE_KEEPALIVE_COALESCE_MS) return;
     try {
       parked.stream.write({
         keepalive: LeaseKeepaliveFrame.fromPartial({ workspaceKey }),
       } as ServerFrame);
+      // Only a frame written opens a window: after a failed write the next keepalive tries again.
+      // Entries past their window go too, so the map holds only workspaces active in the last one.
+      for (const [k, at] of parked.keepaliveAtMs) {
+        if (t - at >= LEASE_KEEPALIVE_COALESCE_MS) parked.keepaliveAtMs.delete(k);
+      }
+      parked.keepaliveAtMs.set(workspaceKey, t);
     } catch (err) {
       // Fire-and-forget: the caller is answered OK either way, and a stream this broken is torn
       // down by its own end or error event.

@@ -52,28 +52,29 @@ Optional inputs:
 | `SBX_{API,ATTACH,EXEC}_TLS_{CERT,KEY}` | none                | the Route's certificate; otherwise the router's (api) or a self-signed one                                                                                                                                                                                                                                                          |
 | `SBX_JANITOR_WAIT_MINUTES`             | 60                  | how long after a sandbox ends the janitor frees its workspace (below)                                                                                                                                                                                                                                                               |
 | `SBX_API_CA_FILE`                      | none                | a PEM CA the host janitor trusts for the API Route (below)                                                                                                                                                                                                                                                                          |
+| `SBX_PROFILE`                          | sandbox             | `combined`: one control plane for Moca Pi sessions and sandboxes ([below](#one-control-plane-for-sessions-and-sandboxes))                                                                                                                                                                                                           |
 
-**Lease mode (SBX0.3)** has two control-plane settings
-([lease-mode spec](../../docs/specs/2026-11-08-sbx-lease-mode-design.md) §8.1). `setup.sh` does not
-set them yet, so a deployment runs with their defaults:
+**Lease mode (SBX0.3)** has two policy inputs
+([lease-mode spec](../../docs/specs/2026-11-08-sbx-lease-mode-design.md) §8.1). `setup.sh` writes
+them to `sbx-settings`, which the control plane reads:
 
-| Variable                    | Default    | Rule                                                                                                                                                                                                                                                                                      |
-| --------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SH_SANDBOX_MODES_ALLOWED`  | `per-exec` | the modes a user may pick, a comma list of `per-exec`, `lease` and `lease+processes`. `per-exec` is always allowed, listed or not. Keep the default until the lease gate below is passed                                                                                                  |
-| `SH_SANDBOX_IDLE_CEILING_S` | 1800       | the longest lease idle timeout an owner may set, in seconds; at least 30, or the control plane refuses to boot. An owner who sets none gets the worker's default, 300 s. The worker also clamps with its own `SH_LEASE_IDLE_CEILING_S` (default 1800), so raise it together with this one |
+| Variable             | Default    | Rule                                                                                                                                                                                                                                                                                                                                                                               |
+| -------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SBX_MODES_ALLOWED`  | `per-exec` | the modes a user may pick (`SH_SANDBOX_MODES_ALLOWED`), a comma list of `per-exec`, `lease` and `lease+processes`, no spaces. `per-exec` is always allowed, listed or not. Keep the default until the lease gate below is passed                                                                                                                                                   |
+| `SBX_IDLE_CEILING_S` | 1800       | 300-86400: the longest lease idle timeout an owner may set, in seconds (`SH_SANDBOX_IDLE_CEILING_S`). An owner who sets none gets the worker's default, 300 s. It also goes into every worker bundle as `SH_LEASE_IDLE_CEILING_S`, so the workers clamp alike: after a change, re-run `install-host.sh` with the new bundle on every host (a running worker keeps its old ceiling) |
 
 **Lease mode stays off by default.** It stays off until plan 4's live smoke test passes and the
 [SBX security review](../../docs/sbx/security-review.md) has its lease section (lease-mode spec
 §11). A microVM worker serves lease mode on its own once its snapshot advertises `lease-v1`, so the
 control plane's list is the only switch. After that gate, an operator opts in to level 1 with
-`SH_SANDBOX_MODES_ALLOWED=per-exec,lease`. Keep `lease+processes` off until the security review
-covers it.
+`SBX_MODES_ALLOWED=per-exec,lease` and a re-run of `setup.sh`. Keep `lease+processes` off until the
+security review covers it.
 
 Narrowing the policy downgrades existing sandboxes at their next token mint, so the list stays the
-switch for sandboxes created before the change. Remove `lease` from `SH_SANDBOX_MODES_ALLOWED` and
+switch for sandboxes created before the change. Remove `lease` from `SBX_MODES_ALLOWED` and
 the next sandbox token (or `mode-token`) minted for a lease sandbox first sets it to `per-exec` at a
 new epoch, which ends its live lease at the next Exec; the control-plane audit log shows a
-`sandbox_mode_changed` with `reason: mode_not_allowed`. A lowered `SH_SANDBOX_IDLE_CEILING_S` clamps
+`sandbox_mode_changed` with `reason: mode_not_allowed`. A lowered `SBX_IDLE_CEILING_S` clamps
 the idle timeout of every token minted after it, without changing the sandbox's record.
 
 The relay needs nothing new for lease mode: it verifies set-mode tokens with the sandbox token
@@ -150,8 +151,12 @@ in their environment.
 **The janitor's wait** (`SBX_JANITOR_WAIT_MINUTES`) defaults to 60 minutes, or
 `SBX_TOKEN_TTL_MINUTES` + 5 when that is longer. The run refuses a wait that does not exceed the
 token lifetime plus 30 s: a deleted sandbox's last token must have expired before its workspace is
-freed. The janitor calls the API Route from the KVM host. If that Route's certificate is not
-publicly trusted, set `SBX_API_CA_FILE` to its CA, which is shipped in the janitor bundle.
+freed. When `SBX_MODES_ALLOWED` names a lease mode, the wait must also exceed that plus
+`SBX_IDLE_CEILING_S`: each Exec of a still-valid token restarts the lease's idle clock, so a lease
+can stay live that long after the delete. With the defaults (15 min, 1800 s) 60 minutes is enough;
+a longer token lifetime or ceiling needs a longer wait, and the refusal names the minimum. The
+janitor calls the API Route from the KVM host. If that Route's certificate is not publicly trusted,
+set `SBX_API_CA_FILE` to its CA, which is shipped in the janitor bundle.
 Otherwise every janitor run logs `skipped`.
 
 ## 2. KVM host side
@@ -235,6 +240,32 @@ and touches nothing when the control plane is unreachable. Each run logs one JSO
 Uninstalling the last worker leaves the janitor in place. `install-host.sh --uninstall-janitor`
 removes it. Re-run `--janitor` with a new bundle after changing `SBX_JANITOR_WAIT_MINUTES`,
 `SBX_API_HOST` or `SBX_API_CA_FILE`.
+
+### One control plane for sessions and sandboxes
+
+`SBX_PROFILE=combined` deploys `deploy/k8s/overlays/ocp-combined` instead of `ocp-sbx`: the control
+plane on the `combined` route profile, serving Moca Pi sessions (the supervisor and its Route) and
+sandboxes from one template store, so a session and a sandbox can run on the same build under one
+activation lease ([design](../../docs/specs/2026-11-05-combined-control-plane-design.md)). Use a
+namespace of its own, not an SBX0 one: the run refuses, before applying anything, a namespace whose
+`moca-mu1` holds `SH_JANITOR_TOKEN` but no `SH_EXCHANGE_TOKEN`, or that has the `sbx-api` Route,
+unless `SBX_CONVERT_TO_COMBINED=1` says the conversion is meant. It needs, beside the inputs above:
+
+    SBX_PROFILE=combined
+    SBX_MOCA_HOST=<supervisor route host>      # a fourth distinct host; SBX_MOCA_TLS_{CERT,KEY} optional
+    SBX_SANDBOX_IMAGE=<repo>@sha256:<digest>   # the in-cluster container sandbox (SBX_SANDBOX_REPLICAS, default 0)
+    SBX_IMAGE=<repo>@sha256:<digest>           # pinned by digest too
+
+It turns the template store on, adds the harness's keys to `moca-mu1`, and writes its files to
+`deploy/sbx/.generated-<namespace>/`, so an SBX0 namespace's generated files stay as they are.
+Egress credentials are not supported with it yet. On `combined` any GitHub account can log in and use
+sessions; the sandbox routes and template writes still need `SBX_ALLOWED_SUBJECTS` or an admin.
+
+Clients log in once to the API host: `mocactl login --control-plane-url https://<api host>` for
+sessions and `mocactl sbx login --control-plane-url https://<api host>` for sandboxes; later commands
+use the login's control plane. When a Route's certificate is self-signed (`moca-ca.crt` for the
+supervisor Route, in the generated folder) or the router's is not publicly trusted, set
+`NODE_EXTRA_CA_CERTS=<ca.pem>` for `mocactl`.
 
 ## 3. Status
 
