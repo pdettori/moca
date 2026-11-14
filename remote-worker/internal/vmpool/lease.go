@@ -86,6 +86,11 @@ type vmLease struct {
 	// lease End's Tracked (refreshTrackedLocked), never edited in place, so a copy of the
 	// slice header is a snapshot. Lease ends and LeaseStatus list it.
 	tracked []TrackedProcess
+	// stopTracked is set when the lease leaves level 2 (setLeaseLevelLocked): the guest's
+	// tracked processes are stopped by the next holder of the run's gate -- the set_mode
+	// downgrade's wait (stopTrackedWaiting) or a lease Exec (execLease), whichever gets it
+	// first -- before anything else runs in the lease (stopTrackedUnderGate).
+	stopTracked bool
 }
 
 func newVMLease(vm VM) *vmLease { return &vmLease{vm: vm, gone: make(chan struct{})} }
@@ -314,7 +319,12 @@ func (p *pool) cancelled(ctx context.Context, timedOut *atomic.Bool, timeoutS ui
 //
 // A process kind (plan 5) is refused processes_not_enabled unless lease+processes is
 // served, and process_list, process_logs and process_stop with no live lease are answered
-// here without starting one (answerWithoutLease).
+// here without starting one (answerWithoutLease). A lease that has left level 2 -- by this
+// Exec's epoch (ruling R18), or by a set_mode whose own wait this Exec beat to the gate --
+// has its tracked processes stopped first (stopTrackedUnderGate), a refused process kind's
+// Exec included. The Exec then carries the processes_stopped notice in its Result, and
+// when the stop ends the lease (teardown_failed), it starts a fresh one, as after a
+// grace-limit end.
 func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode Mode, out Sink, ph *Phases,
 	timedOut *atomic.Bool, timeoutS uint32, deadline time.Time, extend func() bool) (Result, error) {
 	p.mu.Lock()
@@ -391,6 +401,7 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 			}
 		}
 	}
+	stop := l != nil && rp.lease == l && l.stopTracked // not a lease ended above (per-exec served)
 	p.mu.Unlock()
 	if v != nil {
 		p.destroyLeaseVM(key, v.vm)
@@ -401,8 +412,26 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 	if cut != "" {
 		return Result{}, &LeaseEndedError{Reason: cut}
 	}
+	var notice *LeaseEvent
+	if stop {
+		var sv *leaseVictim
+		notice, sv = p.stopTrackedUnderGate(rp, l)
+		if sv != nil {
+			p.destroyLeaseVM(key, sv.vm)
+			p.mu.Lock()
+			closed, cut = p.closed, l.cut
+			p.mu.Unlock()
+			switch {
+			case closed:
+				return Result{}, ErrClosed
+			case cut != "":
+				return Result{}, &LeaseEndedError{Reason: cut}
+			}
+			l = nil // ended by the stop: this Exec starts a fresh lease
+		}
+	}
 	if processRefused {
-		return Result{}, p.processesNotEnabled(key, e.Kind, served)
+		return Result{ProcessesStopped: notice}, p.processesNotEnabled(key, e.Kind, served)
 	}
 	if perExec {
 		return Result{}, errServePerExec // the deferred receive releases the gate
@@ -427,7 +456,9 @@ func (p *pool) execLease(ctx, runCtx context.Context, key string, e Exec, mode M
 			return Result{}, err
 		}
 	}
-	return p.runLease(ctx, runCtx, rp, vm, e, out, ph, timedOut, timeoutS, deadline, extend)
+	res, err := p.runLease(ctx, runCtx, rp, vm, e, out, ph, timedOut, timeoutS, deadline, extend)
+	res.ProcessesStopped = notice
+	return res, err
 }
 
 // startLease acquires, raises the cgroup of, resumes, normalises (when root_wrote is set)

@@ -1,6 +1,9 @@
 package vmpool
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -10,8 +13,8 @@ import (
 )
 
 // The host-side tracked mirror of a level-2 lease (plan 5): the tracked-process entry, the
-// mirror's refresh from every lease End, its lease_process audit records, and the lease
-// end's audit field.
+// mirror's refresh from every lease End, its lease_process audit records, the lease end's
+// audit field, and the stop of every tracked process when a lease leaves level 2.
 
 // TrackedProcess is one entry of a lease guest's tracked-process table (plan 5), as the
 // guest's End reports it (guestagent.TrackedProcess). State is running, exited or killed;
@@ -81,9 +84,22 @@ func displays(ps []TrackedProcess) []string {
 // alone is not saved: the file is fsynced under p.mu, and a worker_restart end has no use
 // for a footprint. Caller holds p.mu and rp's gate, with l live.
 func (p *pool) refreshTrackedLocked(rp *runPool, l *vmLease, e Exec, next []TrackedProcess) {
+	var stopped map[string]bool
+	if e.Kind == ExecKindProcessStop {
+		if i := findTracked(next, e.Process); i >= 0 {
+			stopped = map[string]bool{next[i].ID: true}
+		}
+	}
+	p.replaceTrackedLocked(rp, l, l.mode, next, stopped)
+}
+
+// replaceTrackedLocked is refreshTrackedLocked's work: the mirror becomes next, the change
+// is audited at mode, as a stop for each entry whose id is in stopped, and saved with the
+// open lease when it changed. Caller holds p.mu and rp's gate, with l live.
+func (p *pool) replaceTrackedLocked(rp *runPool, l *vmLease, mode Mode, next []TrackedProcess, stopped map[string]bool) {
 	prev := l.tracked
 	l.tracked = next
-	if !auditTracked(rp.key, l.mode, e, prev, next) {
+	if !auditTracked(rp.key, mode, stopped, prev, next) {
 		return
 	}
 	s := p.leaseStateLocked(rp)
@@ -102,27 +118,25 @@ func (p *pool) refreshTrackedLocked(rp *runPool, l *vmLease, e Exec, next []Trac
 }
 
 // auditTracked writes the lease_process records (spec §7) for the change from prev to next,
-// the mirror before and after Exec e's End, and reports whether the table changed in
+// the mirror before and after a lease End, and reports whether the table changed in
 // anything but memory. A new entry is a start; an entry that left running is an exit, or
-// the stop when e is the process_stop that named it, which is recorded even when the
-// process had already exited (the stop still signals what its cgroup holds). A running
-// entry that vanished is an exit with state gone (the guest never drops a running one).
-// Each record carries the id, name, mode and workspace key, never the command text.
-func auditTracked(key string, mode Mode, e Exec, prev, next []TrackedProcess) bool {
+// the stop when its id is in stopped (the process_stop that named it, or what a
+// process_stop_all stopped), which is recorded even when the process had already exited
+// (the stop still signals what its cgroup holds). A running entry that vanished is an exit
+// with state gone (the guest never drops a running one), or a stop with state gone when
+// it was stopped (the guest may evict an entry it has just stopped, ruling P5-R5). Each
+// record carries the id, name, mode and workspace key, never the command text.
+func auditTracked(key string, mode Mode, stopped map[string]bool, prev, next []TrackedProcess) bool {
 	rec := func(event string, tp TrackedProcess, state string) {
 		log.Printf("vmpool: lease_process event=%s workspace_key=%q mode=%s id=%s name=%q pid=%d state=%s code=%d",
 			event, key, mode, tp.ID, tp.DisplayName(), tp.PID, state, tp.Code)
-	}
-	stopped := -1
-	if e.Kind == ExecKindProcessStop {
-		stopped = findTracked(next, e.Process)
 	}
 	old := make(map[string]TrackedProcess, len(prev))
 	for _, tp := range prev {
 		old[tp.ID] = tp
 	}
 	changed := len(prev) != len(next)
-	for i, tp := range next {
+	for _, tp := range next {
 		was, ok := old[tp.ID]
 		delete(old, tp.ID)
 		if !ok {
@@ -133,7 +147,7 @@ func auditTracked(key string, mode Mode, e Exec, prev, next []TrackedProcess) bo
 			changed = changed || was != tp
 		}
 		switch {
-		case i == stopped:
+		case stopped[tp.ID]:
 			// A guest that answers the stop before the process
 			// dies leaves it running here, and a later End then writes its exit as well.
 			rec("stop", tp, tp.State)
@@ -144,7 +158,10 @@ func auditTracked(key string, mode Mode, e Exec, prev, next []TrackedProcess) bo
 	for _, tp := range prev {
 		if _, gone := old[tp.ID]; gone {
 			changed = true
-			if tp.running() {
+			switch {
+			case stopped[tp.ID]:
+				rec("stop", tp, "gone")
+			case tp.running():
 				rec("exit", tp, "gone")
 			}
 		}
@@ -187,3 +204,114 @@ func trackedAuditField(ps []TrackedProcess) string {
 	}
 	return " processes=[" + strings.Join(parts, " ") + "]"
 }
+
+// stopTrackedUnderGate stops l's tracked processes once the lease has left level 2 (spec
+// §8.2: "from lease+processes to lease it stops every tracked process"). It sends the
+// host-only process_stop_all, which stops every running tracked process and kills what
+// exited ones left behind, so it is sent even when the mirror shows nothing running.
+//
+// On a clean End the lease is kept: the mirror is refreshed from the End, with a
+// lease_process stop record for each process stopped (at lease+processes, the level they
+// ran at), and notice is the processes_stopped event listing them -- what the guest
+// reports it stopped, its stdout -- or nil when it stopped none. Otherwise the lease ends,
+// and v is its victim, for the caller to destroy before it releases the gate:
+// teardown_failed when the guest's teardown failed or the call itself failed (P5-R19; the
+// end lists what the mirror shows running), mode_change when the guest refused the
+// request (the processes must not outlive the downgrade at level 1), a cut's reason when
+// one cut the stop, and a detach on a pool closed meanwhile.
+//
+// The stop runs under no caller's context: neither an Exec's abort nor its budget cuts it
+// short (runLease's budget check sees the time it took). It gets ProcessKindMinTimeoutS
+// (TERM, 10 s, cgroup.kill and the teardown bound), the host giving up LeaseTimeoutSlack
+// later, and a cut (the sweep's grace limit, endLeaseWaiting's bound) cancels it as it
+// would an Exec. Caller holds rp's gate, not p.mu, with l live and l.stopTracked set.
+func (p *pool) stopTrackedUnderGate(rp *runPool, l *vmLease) (notice *LeaseEvent, v *leaseVictim) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tm := p.clk.AfterFunc(time.Duration(ProcessKindMinTimeoutS)*time.Second+LeaseTimeoutSlack, cancel)
+	defer tm.Stop()
+	p.mu.Lock()
+	if cut := l.cut; cut != "" {
+		// As runLease: a request written on a cancelled context could still reach the guest.
+		v = p.endLeaseLocked(rp, cut)
+		p.mu.Unlock()
+		return nil, v
+	}
+	l.running, l.cancel = true, cancel
+	p.mu.Unlock()
+
+	var out stdoutBuffer
+	res, err := l.vm.Run(ctx, Command{
+		TimeoutS: ProcessKindMinTimeoutS,
+		CapBytes: OutputCapBytes,
+		Lease:    true,
+		Kind:     execKindProcessStopAll,
+	}, &out)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Still rp's lease: only the gate's holder detaches one, and Close skips a held gate.
+	l.running, l.cancel = false, nil
+	l.stopTracked = false
+	var reason LeaseEndReason
+	_, refused := guestKeepsLease(err)
+	switch {
+	case l.cut != "":
+		reason = l.cut
+	case err != nil && refused:
+		reason = LeaseEndModeChange
+	case err != nil:
+		reason = LeaseEndTeardownFailed
+	}
+	if err != nil {
+		log.Printf("vmpool: lease process_stop_all workspace_key=%q vm=%s: %v", rp.key, vmID(l.vm), err)
+	}
+	var stopped []TrackedProcess
+	if reason == "" {
+		var ids map[string]bool
+		if res.TeardownFailed {
+			reason = LeaseEndTeardownFailed
+		} else {
+			stopped = stopAllAnswer(rp.key, out.b.Bytes())
+			ids = make(map[string]bool, len(stopped))
+			for _, tp := range stopped {
+				ids[tp.ID] = true
+			}
+		}
+		// Before the end below, so that it lists what the guest still shows running.
+		p.replaceTrackedLocked(rp, l, ModeLeaseProcesses, res.Tracked, ids)
+	}
+	switch {
+	case reason != "":
+		return nil, p.endLeaseLocked(rp, reason)
+	case p.closed:
+		return nil, p.detachLeaseLocked(rp)
+	}
+	log.Printf("vmpool: lease processes stopped workspace_key=%q vm=%s mode=%s reason=%s%s",
+		rp.key, vmID(l.vm), l.mode, LeaseEndModeChange, trackedAuditField(stopped))
+	if len(stopped) == 0 {
+		return nil, nil
+	}
+	now := p.clk.Now()
+	return &LeaseEvent{State: leaseEventProcessesStopped, Reason: LeaseEndModeChange, At: leaseEventAt(now), Mode: l.mode,
+		Age: now.Sub(l.started), Processes: displays(stopped), Tracked: stopped}, nil
+}
+
+// stopAllAnswer is what a process_stop_all's stdout says it stopped: the final rows of the
+// processes that were running, a JSON array. One that does not parse is logged and lists
+// none; the mirror, refreshed from the End's table, still holds every final state.
+func stopAllAnswer(key string, stdout []byte) []TrackedProcess {
+	var rows []ga.TrackedProcess
+	if err := json.Unmarshal(stdout, &rows); err != nil {
+		log.Printf("vmpool: lease process_stop_all workspace_key=%q: unreadable answer: %v", key, err)
+		return nil
+	}
+	return trackedFromGuest(rows)
+}
+
+// stdoutBuffer is a Sink that keeps stdout and drops stderr. The guest caps each stream at
+// the Command's CapBytes.
+type stdoutBuffer struct{ b bytes.Buffer }
+
+func (s *stdoutBuffer) Stdout(b []byte) { s.b.Write(b) }
+func (s *stdoutBuffer) Stderr([]byte)   {}

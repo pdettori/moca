@@ -74,7 +74,7 @@ func (r Runner) Run(ctx context.Context, s wexec.Spec, sink wexec.Sink) (int32, 
 	// Lease events ride before the result, and before an error too (stale_mode,
 	// lease_ended, a timeout): the client learns the lease ended even when this Exec failed.
 	if mode != ModePerExec {
-		r.deliverLeaseEvents(s.WorkspaceKey, sink)
+		r.deliverLeaseEvents(s.WorkspaceKey, sink, res.ProcessesStopped)
 	}
 
 	switch {
@@ -115,9 +115,12 @@ func specMode(s wexec.Spec) (Mode, error) {
 // wexec.LeaseSink: the pending event, acknowledged only once the sink has queued it (an
 // event not queued stays pending, so the next Exec carries it), and an "expiring" notice
 // while the lease is past its maximum duration: reason max_duration, at_unix_ms when it
-// passed it, ends_by_unix_ms that plus the grace limit (LeaseExpiry). Called for an Exec whose mode is not
-// per-exec only: a client that never asked for a lease never sees an event.
-func (r Runner) deliverLeaseEvents(key string, sink wexec.Sink) {
+// passed it, ends_by_unix_ms that plus the grace limit (LeaseExpiry). Between the two goes
+// stopped, the Exec's own processes_stopped notice, if any (Result.ProcessesStopped):
+// never acknowledged nor stored, it displaces no pending event (ruling P5-R19). Called for
+// an Exec whose mode is not per-exec only: a client that never asked for a lease never
+// sees an event.
+func (r Runner) deliverLeaseEvents(key string, sink wexec.Sink, stopped *LeaseEvent) {
 	ls, ok := sink.(wexec.LeaseSink)
 	if !ok {
 		return
@@ -127,6 +130,9 @@ func (r Runner) deliverLeaseEvents(key string, sink wexec.Sink) {
 		if err := ls.Lease(leaseEventProto(ev)); err == nil {
 			r.Pool.AckLeaseEvent(key, ev.At)
 		}
+	}
+	if stopped != nil {
+		_ = ls.Lease(leaseEventProto(stopped))
 	}
 	if x := info.Expiry; x != nil {
 		// Never acknowledged: it rides on every lease Exec while the lease is expiring.
@@ -167,10 +173,13 @@ func wireError(err error) error {
 // LeaseControl answers the relay's LeaseControl frame (session.LeaseController): status
 // reads the lease, reset and sandbox_deleted end it with that reason (neither takes a mode
 // or an epoch), set_mode applies a verified mode change; each returns the status after the
-// op. Reset, sandbox_deleted and a set_mode downgrade BLOCK until the lease has ended
-// (up to LeaseGraceLimit); the session runs this off its receive loop. ctx is ignored: the
-// Pool's lease calls take none, so an op runs to completion once started.
+// op. Reset, sandbox_deleted and a set_mode downgrade BLOCK until the lease has ended, or
+// for lease+processes -> lease until its tracked processes have stopped (up to
+// LeaseGraceLimit); the session runs this off its receive loop. A set_mode's status lists
+// what its downgrade stopped in stopped, in that answer only (ruling P5-R19). ctx is
+// ignored: the Pool's lease calls take none, so an op runs to completion once started.
 func (r Runner) LeaseControl(_ context.Context, key string, op pb.LeaseOp, mode pb.SandboxMode, epoch uint64) (*pb.LeaseStatus, error) {
+	var stopped []TrackedProcess
 	switch op {
 	case pb.LeaseOp_LEASE_OP_STATUS:
 	case pb.LeaseOp_LEASE_OP_RESET:
@@ -186,13 +195,16 @@ func (r Runner) LeaseControl(_ context.Context, key string, op pb.LeaseOp, mode 
 		if err != nil {
 			return nil, wireError(refusal(RefuseLeaseUnsupported, "SetMode for %q: %v", key, err))
 		}
-		if err := r.Pool.SetMode(key, m, epoch); err != nil {
+		if stopped, err = r.Pool.SetMode(key, m, epoch); err != nil {
 			return nil, wireError(err)
 		}
 	default:
 		return nil, fmt.Errorf("vmpool: unknown lease op %s", op)
 	}
-	return leaseStatusProto(r.Pool.LeaseStatus(key)), nil
+	info := r.Pool.LeaseStatus(key)
+	st := leaseStatusProto(info)
+	st.Stopped = trackedProto(stopped, info.At)
+	return st, nil
 }
 
 // LeaseKeepalive records a keepalive for key's live lease (session.LeaseController). It
@@ -215,8 +227,8 @@ func leaseEventProto(ev *LeaseEvent) *pb.LeaseEvent {
 }
 
 // leaseStatusProto is info on the wire: processes is the live lease's full tracked table,
-// exited entries included, aged at info.At. stopped stays empty here: a set_mode downgrade's stop fills
-// it (plan 5, Task 6).
+// exited entries included, aged at info.At. stopped stays empty here: LeaseControl fills
+// it for a set_mode whose downgrade stopped processes.
 func leaseStatusProto(info LeaseInfo) *pb.LeaseStatus {
 	st := &pb.LeaseStatus{
 		Mode:         info.Mode.Proto(),

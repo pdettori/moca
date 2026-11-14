@@ -54,6 +54,10 @@ const (
 	ExecKindProcessList  ExecKind = ga.RequestKindProcessList
 	ExecKindProcessLogs  ExecKind = ga.RequestKindProcessLogs
 	ExecKindProcessStop  ExecKind = ga.RequestKindProcessStop
+
+	// execKindProcessStopAll is host-only: the pool sends it when a lease leaves level 2
+	// (stopTrackedLocked), and no Exec carries it. Not a process kind (isProcess).
+	execKindProcessStopAll ExecKind = ga.RequestKindProcessStopAll
 )
 
 // String is the kind as the audit lines spell it: the zero value is "command".
@@ -161,8 +165,9 @@ type Pool interface {
 	//
 	// A downgrade to per-exec ends a live lease (mode_change) before SetMode returns, so
 	// it BLOCKS for the Exec in flight: up to LeaseGraceLimit (30 min by default), after
-	// which that Exec is cut, plus its unwind. lease+processes -> lease keeps the lease.
-	SetMode(key string, m Mode, epoch uint64) error
+	// which that Exec is cut, plus its unwind. lease+processes -> lease keeps the lease and
+	// stops its tracked processes under the same wait, returning what it stopped (plan 5).
+	SetMode(key string, m Mode, epoch uint64) (stopped []TrackedProcess, err error)
 	// Keepalive records a keepalive for key's live lease: the keepalive-loss rule then
 	// applies until the lease ends. It never resets the idle clock, and without a live
 	// lease it is a no-op. Spec §4.

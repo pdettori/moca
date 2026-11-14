@@ -196,9 +196,15 @@ func mustExec(t *testing.T, p *pool, key string, e Exec) Result {
 
 func mustSetMode(t *testing.T, p *pool, key string, m Mode, epoch uint64) {
 	t.Helper()
-	if err := p.SetMode(key, m, epoch); err != nil {
+	if err := setModeErr(p, key, m, epoch); err != nil {
 		t.Fatalf("SetMode(%s, %d): %v", m, epoch, err)
 	}
+}
+
+// setModeErr is SetMode's error alone, for a caller with no use for the stopped list.
+func setModeErr(p *pool, key string, m Mode, epoch uint64) error {
+	_, err := p.SetMode(key, m, epoch)
+	return err
 }
 
 func liveLease(p *pool, key string) *vmLease {
@@ -636,7 +642,7 @@ func TestFirstExecOnANewKeyCountsFirstExec(t *testing.T) {
 		setup func(*pool)
 		e     Exec
 	}{
-		{"lease", func(p *pool) { _ = p.SetMode("k", ModeLease, 1) }, leaseExec("one", 1)},
+		{"lease", func(p *pool) { _ = setModeErr(p, "k", ModeLease, 1) }, leaseExec("one", 1)},
 		{"per-exec with epoch", nil, Exec{Command: "one", TimeoutS: 30, Mode: ModePerExec, ModeEpoch: 1}},
 		{"per-exec epoch 0", nil, Exec{Command: "one", TimeoutS: 30}},
 	} {

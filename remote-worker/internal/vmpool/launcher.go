@@ -79,6 +79,10 @@ type Result struct {
 	// Tracked is the guest's End.Tracked: its whole tracked-process table, on every lease
 	// End (plan 5). The lease's mirror is refreshed from it (runLease).
 	Tracked []TrackedProcess
+	// ProcessesStopped is the pool's, never a launcher's: the processes_stopped notice of
+	// a lease Exec before which a downgrade's stop ran (execLease). Runner sends it on
+	// that Exec's response, and nothing acknowledges or stores it (ruling P5-R19).
+	ProcessesStopped *LeaseEvent
 }
 
 // TruncatedStdout is what maps to End.truncated (spec §4.1, and the proto's own note

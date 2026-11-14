@@ -2,6 +2,7 @@ package vmpool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	pb "github.com/rossoctl/moca/gen/go/sandbox/v1"
+	ga "github.com/rossoctl/moca/remote-worker/internal/guestagent"
 )
 
 // Level 2 in the pool (plan 5, Task 5): process-kind routing, the tracked mirror, process
@@ -381,7 +383,7 @@ func TestWorkerRestartEndListsTrackedProcesses(t *testing.T) {
 
 // LeaseStatus carries the live lease's full tracked table, exited entries with their state
 // and code included (P5-R16), and the proto maps it to LeaseStatus.processes with their
-// age; stopped stays empty (Task 6 fills it).
+// age; a status call's stopped is empty (only a set_mode's downgrade fills it).
 func TestLeaseStatusCarriesTracked(t *testing.T) {
 	p, lc, clk := processPool(t)
 	tab := &fakeTable{}
@@ -544,7 +546,7 @@ func TestProcessKindRefusedOnASameEpochDowngradeWithALiveLease(t *testing.T) {
 	recvWithin(t, entered, "the first Exec's Run")
 	vm := vmID(leaseAlive(t, p, "during the first Exec").vm)
 	setMode := make(chan error, 1)
-	go func() { setMode <- p.SetMode("k", ModePerExec, 1) }() // stored at once, then waits for the gate
+	go func() { setMode <- setModeErr(p, "k", ModePerExec, 1) }() // stored at once, then waits for the gate
 	waitFor(t, func() bool { return pinnedCount(p, "k") == 2 })
 
 	_, err := p.Exec(t.Context(), "k", processExec(ExecKindProcessList, ProcessArgs{}, 1), &capturingSink{})
@@ -606,5 +608,390 @@ func TestProcessKindTimeoutFloor(t *testing.T) {
 	}
 	if c := lc.commands(); c[len(c)-1].TimeoutS < ProcessKindMinTimeoutS {
 		t.Fatalf("guest timeout_s = %d, want at least %d", c[len(c)-1].TimeoutS, ProcessKindMinTimeoutS)
+	}
+}
+
+// Task 6: a downgrade from lease+processes stops the tracked processes.
+
+// stopAllGuest makes the fake VM play a level-2 guest: every lease End reports tab, and
+// process_stop_all answers as answerStopAll.
+func stopAllGuest(lc *leaseLauncher, tab *fakeTable) {
+	lc.setRunFn(func(_ *fakeVM, c Command, out Sink) (Result, error) {
+		if c.Kind == execKindProcessStopAll {
+			answerStopAll(tab, out)
+		}
+		return Result{Tracked: tab.get()}, nil
+	})
+}
+
+// answerStopAll is the guest's process_stop_all: each running row of tab is killed by TERM
+// (signal 15), and their final rows go out on stdout as a JSON array, as the guest answers.
+func answerStopAll(tab *fakeTable, out Sink) {
+	rows := tab.get()
+	stopped := make([]ga.TrackedProcess, 0, len(rows))
+	for i := range rows {
+		if rows[i].running() {
+			rows[i].State, rows[i].Code = "killed", 15
+			r := rows[i]
+			stopped = append(stopped, ga.TrackedProcess{ID: r.ID, Name: r.DisplayName(), PID: r.PID, State: r.State,
+				Code: r.Code, StartedUnixMs: r.Started.UnixMilli(), MemoryBytes: r.MemoryBytes})
+		}
+	}
+	tab.set(rows...)
+	b, _ := json.Marshal(stopped)
+	out.Stdout(b)
+}
+
+func commandKinds(lc *leaseLauncher) []ExecKind {
+	var out []ExecKind
+	for _, c := range lc.commands() {
+		out = append(out, c.Kind)
+	}
+	return out
+}
+
+func auditRecords(logs *lockedBuffer, event string) []string {
+	var out []string
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "lease_process event="+event+" ") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// A set_mode downgrade lease+processes -> lease sends process_stop_all to the guest under
+// the gate and keeps the lease, now at level 1. The set_mode's status lists what was
+// stopped in LeaseStatus.stopped, in that answer only (P5-R19); each stopped process gets
+// a lease_process stop record. With nothing running the stop-all is still sent, for what
+// exited processes left, and stopped is empty.
+func TestDowngradeStopsTrackedKeepsLease(t *testing.T) {
+	logs := captureLog(t)
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	stopAllGuest(lc, tab)
+	r := Runner{Pool: p}
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	started := clk.Now()
+	tab.set(running("1", "web", 412, started), running("2", "", 413, started),
+		TrackedProcess{ID: "3", Name: "build", PID: 414, State: "exited", Started: started})
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+	vm := vmID(leaseAlive(t, p, "after the start").vm)
+	clk.Advance(time.Minute)
+
+	st, err := r.LeaseControl(t.Context(), "k", pb.LeaseOp_LEASE_OP_SET_MODE, pb.SandboxMode_SANDBOX_MODE_LEASE, 2)
+	if err != nil {
+		t.Fatalf("LeaseControl set_mode lease: %v", err)
+	}
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, execKindProcessStopAll}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q", got, want)
+	}
+	if c := lc.commands()[1]; !c.Lease || c.TimeoutS < ProcessKindMinTimeoutS {
+		t.Fatalf("stop-all command = %+v, want a lease request with timeout_s >= %d", c, ProcessKindMinTimeoutS)
+	}
+	if len(st.Stopped) != 2 {
+		t.Fatalf("LeaseStatus.stopped = %+v, want web and p2", st.Stopped)
+	}
+	if web := st.Stopped[0]; web.Id != "1" || web.Name != "web" || web.Pid != 412 || web.State != "killed" ||
+		web.Code != 15 || web.AgeMs != 60_000 {
+		t.Fatalf("stopped[0] = %+v, want web, pid 412, killed(15), 60 s old", web)
+	}
+	if anon := st.Stopped[1]; anon.Name != "p2" || anon.State != "killed" {
+		t.Fatalf("stopped[1] = %+v, want p2 killed", anon)
+	}
+	if st.Mode != pb.SandboxMode_SANDBOX_MODE_LEASE || st.State != LeaseActive || len(st.Processes) != 3 {
+		t.Fatalf("status = %+v, want lease, active, the full table of 3", st)
+	}
+
+	l := leaseAlive(t, p, "after the downgrade")
+	if got := vmID(l.vm); got != vm || lc.count("restore ") != 1 {
+		t.Fatalf("lease VM = %s (restores %d), want %s kept", got, lc.count("restore "), vm)
+	}
+	if l.mode != ModeLease {
+		t.Fatalf("lease mode = %s, want lease", l.mode)
+	}
+	if run := runningTracked(leaseAlive(t, p, "the mirror").tracked); run != nil {
+		t.Fatalf("mirror running = %+v, want none: refreshed from the stop-all's End", run)
+	}
+	if s := loadLeaseState(p.cfg.WorkspaceRoot, "k"); s.Open == nil || s.Open.Mode != ModeLease ||
+		len(runningTracked(s.Open.Tracked)) != 0 {
+		t.Fatalf("state file open lease = %+v, want level 1 with nothing running", s.Open)
+	}
+	if ev := p.LeaseStatus("k").Pending; ev == nil || ev.State != leaseEventStart {
+		t.Fatalf("pending = %+v, want the start, no end", ev)
+	}
+	again, err := r.LeaseControl(t.Context(), "k", pb.LeaseOp_LEASE_OP_STATUS, 0, 0)
+	if err != nil {
+		t.Fatalf("LeaseControl status: %v", err)
+	}
+	if len(again.Stopped) != 0 {
+		t.Fatalf("a later status's stopped = %+v, want empty: the list is the set_mode answer's only", again.Stopped)
+	}
+
+	stops := auditRecords(logs, "stop")
+	if len(stops) != 2 {
+		t.Fatalf("stop records = %q, want one each for web and p2", stops)
+	}
+	for i, ws := range [][]string{
+		{"id=1", `name="web"`, "pid=412", "state=killed", "code=15", "mode=lease+processes", `workspace_key="k"`},
+		{"id=2", `name="p2"`, "state=killed"},
+	} {
+		for _, w := range ws {
+			if !strings.Contains(stops[i], w) {
+				t.Fatalf("stop record %q lacks %q", stops[i], w)
+			}
+		}
+	}
+
+	// Back to level 2 (an upgrade, by the next Exec's epoch), nothing running, down again:
+	// the stop-all is still sent, and nothing is listed.
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 3)
+	mustExec(t, p, "k", level2Exec("ls", 3))
+	stopped, err := p.SetMode("k", ModeLease, 4)
+	if err != nil {
+		t.Fatalf("SetMode lease: %v", err)
+	}
+	if len(stopped) != 0 {
+		t.Fatalf("stopped = %+v, want none: nothing was running", stopped)
+	}
+	if n := slices.Index(commandKinds(lc)[2:], execKindProcessStopAll); n < 0 {
+		t.Fatalf("guest requests = %q, want a second process_stop_all", commandKinds(lc))
+	}
+	if got := vmID(leaseAlive(t, p, "after the second downgrade").vm); got != vm {
+		t.Fatalf("lease VM = %s, want %s kept", got, vm)
+	}
+}
+
+// A stop-all whose guest teardown failed, or whose guest call failed outright, ends the
+// lease teardown_failed (P5-R19). The end lists the processes the mirror shows running,
+// and set_mode's status carries no stopped list.
+func TestDowngradeStopAllTeardownFailedEndsLease(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer func(tab *fakeTable) (Result, error)
+	}{
+		{"teardown failed", func(tab *fakeTable) (Result, error) { return Result{TeardownFailed: true, Tracked: tab.get()}, nil }},
+		{"guest call failed", func(*fakeTable) (Result, error) { return Result{}, errors.New("vsock: connection reset by peer") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, lc, clk := processPool(t)
+			tab := &fakeTable{}
+			lc.setRunFn(func(_ *fakeVM, c Command, _ Sink) (Result, error) {
+				if c.Kind == execKindProcessStopAll {
+					return tc.answer(tab)
+				}
+				return Result{Tracked: tab.get()}, nil
+			})
+			mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+			started := clk.Now()
+			tab.set(running("1", "web", 412, started), TrackedProcess{ID: "2", Name: "build", PID: 414, State: "exited", Started: started})
+			mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+
+			st, err := Runner{Pool: p}.LeaseControl(t.Context(), "k", pb.LeaseOp_LEASE_OP_SET_MODE, pb.SandboxMode_SANDBOX_MODE_LEASE, 2)
+			if err != nil {
+				t.Fatalf("LeaseControl set_mode lease: %v", err)
+			}
+			if got := commandKinds(lc); len(got) != 2 || got[1] != execKindProcessStopAll {
+				t.Fatalf("guest requests = %q, want the start, then process_stop_all", got)
+			}
+			leaseEnded(t, p, lc, LeaseEndTeardownFailed)
+			if len(st.Stopped) != 0 {
+				t.Fatalf("LeaseStatus.stopped = %+v, want none", st.Stopped)
+			}
+			ev := st.Pending
+			if ev == nil || ev.State != leaseEventEnd || ev.Reason != string(LeaseEndTeardownFailed) {
+				t.Fatalf("status pending = %+v, want the teardown_failed end", ev)
+			}
+			if want := []string{"web (pid 412)"}; !slices.Equal(ev.Processes, want) || len(ev.Tracked) != 1 || ev.Tracked[0].Id != "1" {
+				t.Fatalf("end processes = %q, tracked %+v; want %q from the mirror", ev.Processes, ev.Tracked, want)
+			}
+			if st.Mode != pb.SandboxMode_SANDBOX_MODE_LEASE || st.State != LeaseNone {
+				t.Fatalf("status = %+v, want mode lease, no lease", st)
+			}
+		})
+	}
+}
+
+// A downgrade whose LeaseControl was lost lands on the next Exec carrying the new epoch
+// (ruling R18): that Exec sends process_stop_all before its own Run, the lease is kept,
+// and its response carries a processes_stopped event listing what was stopped. Like
+// expiring, that event is never acknowledged nor stored as the pending one (P5-R19): the
+// pending start rides beside it and is acknowledged as before, and the next Exec carries
+// no processes_stopped and sends no second stop-all.
+func TestExecRelevelStopsTrackedAndNotifies(t *testing.T) {
+	logs := captureLog(t)
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	stopAllGuest(lc, tab)
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	tab.set(running("1", "web", 412, clk.Now()))
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1)) // the start stays pending
+	vm := vmID(leaseAlive(t, p, "after the start").vm)
+	clk.Advance(2 * time.Minute)
+
+	r := Runner{Pool: p}
+	sink := newLeaseSink()
+	if _, err := r.Run(t.Context(), leaseSpec(1, 2), sink); err != nil { // lease, at the downgrade's epoch 2
+		t.Fatalf("Run: %v", err)
+	}
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, execKindProcessStopAll, ExecKindCommand}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q: the stop-all before the Exec's own Run", got, want)
+	}
+	evs := sink.got()
+	if len(evs) != 2 || evs[0].GetState() != leaseEventStart {
+		t.Fatalf("events = %v, want the pending start, then processes_stopped", evs)
+	}
+	ev := evs[1]
+	if ev.GetState() != "processes_stopped" || ev.GetReason() != string(LeaseEndModeChange) ||
+		ev.GetMode() != pb.SandboxMode_SANDBOX_MODE_LEASE || ev.GetAtUnixMs() != clk.Now().UnixMilli() ||
+		ev.GetAgeMs() != 120_000 {
+		t.Fatalf("event = %+v, want processes_stopped, mode_change, mode lease, now, 2 min old", ev)
+	}
+	if want := []string{"web (pid 412)"}; !slices.Equal(ev.GetProcesses(), want) {
+		t.Fatalf("processes = %q, want %q", ev.GetProcesses(), want)
+	}
+	if tr := ev.GetTracked(); len(tr) != 1 || tr[0].GetId() != "1" || tr[0].GetState() != "killed" || tr[0].GetCode() != 15 {
+		t.Fatalf("tracked = %+v, want web killed(15)", tr)
+	}
+	if got := p.LeaseStatus("k").Pending; got != nil {
+		t.Fatalf("pending = %+v, want none: the start was acknowledged and processes_stopped is never stored", got)
+	}
+	if s := loadLeaseState(p.cfg.WorkspaceRoot, "k"); s.Pending != nil {
+		t.Fatalf("state file pending = %+v, want none", s.Pending)
+	}
+	l := leaseAlive(t, p, "after the relevel")
+	if got := vmID(l.vm); got != vm || l.mode != ModeLease {
+		t.Fatalf("lease = %s at %s, want %s kept at lease", got, l.mode, vm)
+	}
+	if stops := auditRecords(logs, "stop"); len(stops) != 1 || !strings.Contains(stops[0], "id=1") {
+		t.Fatalf("stop records = %q, want one for web", stops)
+	}
+
+	for _, ev := range runLease(t, r, leaseSpec(2, 2)) {
+		if ev.GetState() == "processes_stopped" {
+			t.Fatalf("the next Exec carried %+v: the event is the relevel's Exec's only", ev)
+		}
+	}
+	if n := slices.Index(commandKinds(lc)[2:], execKindProcessStopAll); n >= 0 {
+		t.Fatalf("guest requests = %q, want one process_stop_all only", commandKinds(lc))
+	}
+}
+
+// The set_mode downgrade waits for the Exec in flight, as a downgrade to per-exec does: it
+// takes the run's gate, pinned meanwhile, and sends process_stop_all only once that Exec
+// has returned, so the stop also covers the process the in-flight Exec started.
+func TestDowngradeWaitsForInFlightExec(t *testing.T) {
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	entered, release := make(chan struct{}, 8), make(chan struct{})
+	lc.setRunFn(func(_ *fakeVM, c Command, out Sink) (Result, error) {
+		switch {
+		case c.Kind == execKindProcessStopAll:
+			answerStopAll(tab, out)
+		case c.Command == "long":
+			entered <- struct{}{}
+			select {
+			case <-release:
+			case <-c.ctxDone:
+				return Result{}, ErrAborted
+			}
+			tab.set(append(tab.get(), running("2", "api", 413, clk.Now()))...)
+		}
+		return Result{Tracked: tab.get()}, nil
+	})
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	tab.set(running("1", "web", 412, clk.Now()))
+	mustExec(t, p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+	inFlight := processExec(ExecKindProcessStart, ProcessArgs{Name: "api"}, 1)
+	inFlight.Command = "long"
+	errc := execAsync(p, "k", inFlight)
+	recvWithin(t, entered, "the in-flight Exec's Run")
+
+	type setResult struct {
+		stopped []TrackedProcess
+		err     error
+	}
+	setc := make(chan setResult, 1)
+	go func() {
+		stopped, err := p.SetMode("k", ModeLease, 2)
+		setc <- setResult{stopped, err}
+	}()
+	waitFor(t, func() bool { return pinnedCount(p, "k") == 2 }) // the Exec's pin and the downgrade's
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case r := <-setc:
+		t.Fatalf("SetMode returned (%+v) while the Exec was in flight", r)
+	default:
+	}
+	if slices.Contains(commandKinds(lc), execKindProcessStopAll) {
+		t.Fatal("process_stop_all reached the guest while the Exec was in flight")
+	}
+
+	close(release)
+	if err := recvWithin(t, errc, "the in-flight Exec"); err != nil {
+		t.Fatalf("the in-flight Exec: %v, want its own clean result", err)
+	}
+	res := recvWithin(t, setc, "SetMode")
+	if res.err != nil {
+		t.Fatalf("SetMode: %v", res.err)
+	}
+	if !trackedIDsEqual(res.stopped, "1", "2") {
+		t.Fatalf("stopped = %+v, want web and the api the in-flight Exec started", res.stopped)
+	}
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, ExecKindProcessStart, execKindProcessStopAll}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q", got, want)
+	}
+	leaseAlive(t, p, "after the downgrade")
+	if n := pinnedCount(p, "k"); n != 0 {
+		t.Fatalf("pins at the end = %d, want 0", n)
+	}
+}
+
+// The starting case, as for a downgrade to per-exec (endLeaseWaiting): a lease Exec that
+// passed its checks at lease+processes is still starting its lease (Resume blocked) when
+// the downgrade to lease is stored. Its lease starts at level 2 and its process_start
+// runs, then the downgrade's wait gets the gate, re-levels the lease and stops what the
+// Exec started.
+func TestDowngradeStopsALeaseStartedAtLevel2WhileItWaited(t *testing.T) {
+	p, lc, clk := processPool(t)
+	tab := &fakeTable{}
+	stopAllGuest(lc, tab)
+	mustSetMode(t, p, "k", ModeLeaseProcesses, 1)
+	inResume, resume := make(chan struct{}, 1), make(chan struct{})
+	lc.setResumeFn(func(*fakeVM, context.Context) error {
+		inResume <- struct{}{}
+		<-resume
+		return nil
+	})
+	tab.set(running("1", "web", 412, clk.Now()))
+	errc := execAsync(p, "k", processExec(ExecKindProcessStart, ProcessArgs{Name: "web"}, 1))
+	recvWithin(t, inResume, "the lease start's Resume")
+
+	type setResult struct {
+		stopped []TrackedProcess
+		err     error
+	}
+	setc := make(chan setResult, 1)
+	go func() {
+		stopped, err := p.SetMode("k", ModeLease, 2)
+		setc <- setResult{stopped, err}
+	}()
+	waitFor(t, func() bool { return pinnedCount(p, "k") == 2 })
+	close(resume)
+	if err := recvWithin(t, errc, "the starting Exec"); err != nil {
+		t.Fatalf("the starting Exec: %v", err)
+	}
+	res := recvWithin(t, setc, "SetMode")
+	if res.err != nil || !trackedIDsEqual(res.stopped, "1") {
+		t.Fatalf("SetMode = %+v, %v; want web stopped", res.stopped, res.err)
+	}
+	if got, want := commandKinds(lc), []ExecKind{ExecKindProcessStart, execKindProcessStopAll}; !slices.Equal(got, want) {
+		t.Fatalf("guest requests = %q, want %q", got, want)
+	}
+	if l := leaseAlive(t, p, "after the downgrade"); l.mode != ModeLease {
+		t.Fatalf("lease mode = %s, want lease", l.mode)
+	}
+	if s := loadLeaseState(p.cfg.WorkspaceRoot, "k"); s.Open == nil || s.Open.Mode != ModeLease {
+		t.Fatalf("state file open lease = %+v, want it recorded at lease", s.Open)
 	}
 }
