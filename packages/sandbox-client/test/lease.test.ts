@@ -232,6 +232,10 @@ describe('tracked processes as a client shows them (plan 5, spec §7)', () => {
   it('renders a row as `id name (pid n): state, age, memory`', () => {
     const v = trackedProcessView(tp({ ageMs: 130_400, memoryBytes: 12.5 * 1024 * 1024 }));
     expect(processRow(v)).toBe('p3 web (pid 412): running, 2m10s, 12.5 MiB');
+    // An unnamed process (the guest names it p<id>) shows its id once (ruling P5-R40).
+    expect(processRow({ ...v, id: '4', name: 'p4' })).toBe(
+      'p4 (pid 412): running, 2m10s, 12.5 MiB',
+    );
     // An exited row has no age (final review M6): it counts from the start, not a runtime.
     expect(
       processRow(

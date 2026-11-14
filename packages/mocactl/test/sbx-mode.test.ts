@@ -988,7 +988,7 @@ describe('mocactl sbx get (spec §5, §8.2)', () => {
         'idle timeout  worker default',
         'lease         active (age 42 s)',
         'processes     p3 web (pid 412): running, 2m10s, 12.5 MiB',
-        '              p4 p4 (pid 9): exited(1), 0.0 MiB',
+        '              p4 (pid 9): exited(1), 0.0 MiB',
         // The worker's mirror, refreshed by each call (P5-R38): a status touches no guest.
         '              (as of the last call)',
         '',

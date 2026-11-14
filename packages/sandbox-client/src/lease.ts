@@ -94,14 +94,15 @@ const MIB = 1024 * 1024;
 export const shownProcessId = (id: string): string => `p${id}`;
 
 /**
- * One process as a client lists it (P5-R27): `p<id> name (pid n): state, age, memory`. An exited
+ * One process as a client lists it (P5-R27): `p<id> name (pid n): state, age, memory`, the id alone
+ * for an unnamed one (P5-R40), whose name is its id. An exited
  * or killed row has no age: it counts from the start, so it would read as a runtime (final review
  * M6). The name is the worker's text: a client sanitizes the row before a terminal shows it.
  */
 export function processRow(v: TrackedProcessView): string {
   const age = v.state === 'running' ? `${ageText(v.ageMs)}, ` : '';
   return (
-    `${shownProcessId(v.id)} ${v.name} (pid ${v.pid}): ${processStateText(v)}, ${age}` +
+    `${startedProcessText(v)} (pid ${v.pid}): ${processStateText(v)}, ${age}` +
     `${(v.memoryBytes / MIB).toFixed(1)} MiB`
   );
 }

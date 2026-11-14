@@ -1578,7 +1578,7 @@ describe('level 2: tracked processes (plan 5, spec §7)', () => {
         // The worker's mirror, refreshed by each call (P5-R38): a status touches no guest.
         'tracked processes (as of the last call):',
         '  p3 web (pid 412): running, 2m10s, 12.0 MiB',
-        '  p4 p4 (pid 9): killed(9), 0.0 MiB',
+        '  p4 (pid 9): killed(9), 0.0 MiB',
       ].join('\n'),
     );
   });

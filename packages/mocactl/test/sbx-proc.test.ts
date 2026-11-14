@@ -204,7 +204,7 @@ describe('mocactl sbx proc ls', () => {
     expect(await w.run(['proc', 'ls', SBX])).toBe(0);
     expect(w.calls).toEqual([{ op: 'list', args: {}, signal: true }]);
     expect(w.out()).toBe(
-      'p3 web (pid 412): running, 2m10s, 12.5 MiB\np4 p4 (pid 9): exited(1), 0.0 MiB\n',
+      'p3 web (pid 412): running, 2m10s, 12.5 MiB\np4 (pid 9): exited(1), 0.0 MiB\n',
     );
     expect(await w.run(['proc', 'ls', SBX, '--json'])).toBe(0);
     expect(JSON.parse(w.out())).toEqual(list);

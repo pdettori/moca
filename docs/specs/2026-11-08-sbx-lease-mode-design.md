@@ -613,7 +613,9 @@ be running)`.
   not sync, the end lists what the mirror showed running.
 - **Audit.** The worker writes a `lease_process` line for each start, stop and exit (the
   workspace key, the mode, id, name, pid, state and code), and a lease end's line lists its tracked
-  processes. A stop line may come before the exit line of the same process (P5-R18). The relay's
+  processes as the mirror showed them when the end began: it is written before the end's sync, so a
+  process that exited since the last call is listed there as running and its `exit` line follows. A
+  stop line may come before the exit line of the same process (P5-R18). The relay's
   `sandbox_exec` line gains `kind` and `process` (`p<id>` when an id was given, else the name).
   None of them has command text. A `process_start`'s command shows only in the `cmd` prefix that
   the operator's `SH_SANDBOX_AUDIT_COMMANDS=1` adds to every Exec's line.
