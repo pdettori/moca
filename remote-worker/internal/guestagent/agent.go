@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -206,14 +208,40 @@ func (a *Agent) killShell() {
 // Firecracker documents that listening vsock sockets survive restore with the CID
 // updated, so the parked accept() is documented behaviour rather than a trick
 // (spec §2.4, §5.1).
+//
+// Only a closed listener ends Serve (net.ErrClosed). The agent is PID 1, and main exits
+// when Serve returns, which panics the guest kernel ("Attempted to kill init!"); so any
+// other accept error -- EMFILE from a command exhausting fds, or an accept interrupted
+// by a signal (Task 11's rig run: the SIGCHLD of a tracked process's exit) -- is logged
+// and retried with a backoff, as net/http.Server and EgressForwarder.Serve do.
 func (a *Agent) Serve(ln net.Listener) error {
+	var delay time.Duration
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			return err
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
+			if delay == 0 {
+				delay = 5 * time.Millisecond
+			} else if delay *= 2; delay > time.Second {
+				delay = time.Second
+			}
+			log.Printf("guest-agent: accept: %v; retrying in %v", err, delay)
+			time.Sleep(delay)
+			continue
 		}
+		delay = 0
 		go func() { _ = a.ServeConn(c) }()
 	}
+}
+
+// acceptRetryable reports whether an accept(2) error is one to retry at once: the call
+// was interrupted by a signal (EINTR), or the connection it would have returned was
+// aborted before it was accepted (ECONNABORTED, which net's own accept loop retries). An
+// EAGAIN is not: nothing is pending, so the caller waits for readability instead.
+func acceptRetryable(err error) bool {
+	return errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.ECONNABORTED)
 }
 
 // ServeConn handles exactly one request on rw.
